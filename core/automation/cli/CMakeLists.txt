@@ -65,7 +65,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${ROOT_DIR}/core/automation  # For automation/automation.h
     $<$<BOOL:${ENABLE_LUA_AUTOMATION}>:${ROOT_DIR}/core/automation/lua/src>
     $<$<BOOL:${ENABLE_LUA_AUTOMATION}>:${ROOT_DIR}/core/automation/lua/lib/sol2/sol2-3.5.0/include>
-    $<$<BOOL:${ENABLE_LUA_AUTOMATION}>:${ROOT_DIR}/core/automation/lua/lib/lua/lua-5.4.7/src>
+    $<$<AND:$<BOOL:${ENABLE_LUA_AUTOMATION}>,$<NOT:$<BOOL:${UNREAL_USE_SYSTEM_LIBS}>>>:${ROOT_DIR}/core/automation/lua/lib/lua/lua-5.4.7/src>
     $<$<BOOL:${ENABLE_PYTHON_AUTOMATION}>:${ROOT_DIR}/core/automation/python/src>
     $<$<BOOL:${ENABLE_PYTHON_AUTOMATION}>:${ROOT_DIR}/core/automation/python/3rdparty/pybind11/include>
     $<$<BOOL:${ENABLE_PYTHON_AUTOMATION}>:${Python3_INCLUDE_DIRS}>
@@ -169,3 +169,7 @@ endforeach ()
 
 message(STATUS "</${PROJECT_NAME} diagnostics>")
 # </Diagnostics>
+# Use the same distro Lua headers as the automation module.
+if(UNREAL_USE_SYSTEM_LIBS AND ENABLE_LUA_AUTOMATION)
+    target_link_libraries(${PROJECT_NAME} PRIVATE lua::shared)
+endif()

@@ -44,6 +44,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/MacOSDeploymentTarget.cmake)
 
 project(unreal VERSION 1.0.0)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SystemDependencies.cmake)
+
 # Validate toolchain/dependency compatibility (MSVC+vcpkg OR MinGW+pacman)
 validate_toolchain_dependencies()
 
@@ -650,7 +652,7 @@ if (BUILD_QT_APPS)
     
     # Linux: Combined tarball with all apps and shared resources
     if(UNIX AND NOT APPLE)
-        if(UNREAL_BUNDLE_QT)
+        if(UNREAL_BUNDLE_QT OR UNREAL_USE_SYSTEM_LIBS)
             include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LinuxPackaging.cmake)
         endif()
         set(LINUX_PACKAGE_COMMANDS

@@ -33,7 +33,12 @@ set(CORE_INCLUDE_DIR "${ROOT_DIR}/core/src/include")
 # Add dependencies
 #------------------------------------------------------------------------------
 # Add Lua library
-add_subdirectory(lib/lua)
+if(UNREAL_USE_SYSTEM_LIBS)
+    pkg_check_modules(UNREAL_LUA REQUIRED IMPORTED_TARGET GLOBAL lua5.4>=5.4)
+    add_library(lua::shared ALIAS PkgConfig::UNREAL_LUA)
+else()
+    add_subdirectory(lib/lua)
+endif()
 
 # Define sol2 include directory
 set(SOL2_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/sol2/sol2-3.5.0/single/include")

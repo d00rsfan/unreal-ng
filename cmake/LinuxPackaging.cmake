@@ -1,4 +1,4 @@
-# DEB package with a private Qt runtime (included only with UNREAL_BUNDLE_QT=ON).
+# DEB package with private Qt or distribution-provided shared libraries.
 # Keeping resources alongside the real binaries preserves
 # FileHelper::GetResourcesPath(); launchers live on the user's PATH.
 set(UNREAL_PACKAGE_VERSION "" CACHE STRING "Automatically generated package version")
@@ -14,7 +14,11 @@ if(TARGET unreal-mcp-bridge)
     list(APPEND _suite_targets unreal-mcp-bridge)
 endif()
 install(TARGETS ${_suite_targets} RUNTIME DESTINATION lib/unreal-ng COMPONENT Suite)
-set_target_properties(${_suite_targets} PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
+if(UNREAL_BUNDLE_QT)
+    set_target_properties(${_suite_targets} PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
+else()
+    set_target_properties(${_suite_targets} PROPERTIES INSTALL_RPATH "")
+endif()
 foreach(_app IN LISTS _suite_targets)
     # Relative symlinks also work in a DESTDIR staging tree.
     install(CODE "
@@ -26,6 +30,10 @@ endforeach()
 install(DIRECTORY "${DATA_PATH}/fonts" "${DATA_PATH}/rom" "${DATA_PATH}/midi"
     "${DATA_PATH}/boot" "${DATA_PATH}/configs"
     DESTINATION lib/unreal-ng COMPONENT Suite)
+install(CODE "
+    set(DEST \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/lib/unreal-ng/configs\")
+    include(\"${CMAKE_SOURCE_DIR}/cmake/ExtractConfigImages.cmake\")
+" COMPONENT Suite)
 install(DIRECTORY "${DATA_PATH}/testrom/" DESTINATION lib/unreal-ng/rom COMPONENT Suite)
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/core/automation/webapi/resources/html"
     DESTINATION lib/unreal-ng/resources COMPONENT Suite)
@@ -57,4 +65,10 @@ set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
 set(CPACK_DEB_COMPONENT_INSTALL ON)
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_SECTION "games")
+if(UNREAL_USE_SYSTEM_LIBS)
+    # Qt plugins and miniaudio's ALSA/PulseAudio backends are loaded dynamically;
+    # ELF dependency scanning cannot see them. Unused Qt build modules (such as
+    # Multimedia) are omitted unless the linked binaries actually require them.
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "qt6-qpa-plugins (>= 6.7), qt6-wayland (>= 6.7), qt6-svg-plugins (>= 6.7), libasound2t64, libpulse0")
+endif()
 include(CPack)

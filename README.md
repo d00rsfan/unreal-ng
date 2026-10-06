@@ -71,14 +71,20 @@ packages; pushing a `v*` tag creates a milestone release.
 |----------|------|
 | Linux x86_64, portable (glibc 2.39+) | `UnrealNG-Suite-Linux-x86_64.AppImage` |
 | Linux x86_64, Ubuntu 24.04+ / Debian 13+ | `UnrealNG-Suite-Linux-x86_64.deb` |
+| Ubuntu 26.04 x86_64, system Qt and libraries | `UnrealNG-Suite-Ubuntu-26.04-x86_64.deb` |
 | macOS 12+, Apple Silicon / Intel | `UnrealNG-Suite-macOS-arm64.dmg` / `UnrealNG-Suite-macOS-x86_64.dmg` |
 | Windows x86_64 / ARM64 | `UnrealNG-Suite-Windows-x86_64.zip` / `UnrealNG-Suite-Windows-arm64.zip` |
 | Windows x86_64, MinGW build | `UnrealNG-Suite-Windows-x86_64-MinGW.zip` |
 
-Every package carries its own private Qt (from the cached Qt SDK); all other dependencies
-are vendored and linked statically, so nothing has to be installed on the user's system.
-Release builds disable TLS (`-DTRANTOR_USE_TLS=none -DBUILD_C-ARES=OFF`): the WebAPI
-serves plain HTTP on localhost, so neither OpenSSL nor c-ares is needed.
+The Ubuntu 26.04 DEB uses distribution Qt, OpenSSL, zlib, zstd, liblzma, Lua,
+JsonCpp and the C++ runtime. Install it with
+`sudo apt install ./UnrealNG-Suite-Ubuntu-26.04-x86_64.deb` so apt resolves dependencies.
+It includes host TLS support for emulated devices. See [native DEB packaging](docs/github-release/native-deb.md)
+for the build and verification steps and the remaining project-specific vendored code.
+The two DEBs are alternative builds of the same `unreal-ng` package; they cannot be installed together.
+
+Other packages retain their private Qt runtime and vendored dependencies.
+Their WebAPI TLS setting remains disabled (`-DTRANTOR_USE_TLS=none -DBUILD_C-ARES=OFF`).
 
 The DEB package version is the build time, `YYYYMMDD.HHMMSS` UTC; file names stay stable.
 macOS builds use ad-hoc signing without notarization; Windows builds are unsigned.

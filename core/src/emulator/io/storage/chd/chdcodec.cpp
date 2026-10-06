@@ -9,9 +9,13 @@
 #include <zstd.h>
 
 #include "3rdparty/miniz/miniz.h"
+#ifdef UNREAL_USE_SYSTEM_LIBS
+#include <lzma.h>
+#else
 #include "Alloc.h"
 #include "LzmaDec.h"
 #include "LzmaEnc.h"
+#endif
 #include "emulator/io/storage/chd/chdflac.h"
 #include "emulator/io/storage/chd/chdhuffman.h"
 #include "emulator/io/storage/cd/cdecc.h"
@@ -85,6 +89,65 @@ namespace chd
 
         /// region <lzma>
 
+#ifdef UNREAL_USE_SYSTEM_LIBS
+        class LzmaCodec : public Codec
+        {
+        public:
+            explicit LzmaCodec(uint32_t hunkBytes)
+            {
+                ready = !lzma_lzma_preset(&options, 6);
+                // CHD uses raw LZMA1 with lc/lp/pb = 3/0/2 and no end marker.
+                // Match the SDK's level-6 dictionary reduction to a hunk.
+                options.dict_size = 1U << 25;
+                for (uint32_t shift = 11; shift < 24; ++shift)
+                {
+                    if (hunkBytes <= (2U << shift))
+                    {
+                        options.dict_size = 2U << shift;
+                        break;
+                    }
+                    if (hunkBytes <= (3U << shift))
+                    {
+                        options.dict_size = 3U << shift;
+                        break;
+                    }
+                }
+                options.ext_flags = 0;
+            }
+
+            bool Compress(const uint8_t* src, uint32_t length, uint8_t* dst, uint32_t& written) override
+            {
+                if (!ready)
+                    return false;
+                lzma_filter filters[] = {{LZMA_FILTER_LZMA1EXT, &options}, {LZMA_VLI_UNKNOWN, nullptr}};
+                size_t size = 0;
+                if (lzma_raw_buffer_encode(filters, nullptr, src, length, dst, &size, length) != LZMA_OK || size >= length)
+                    return false;
+                written = static_cast<uint32_t>(size);
+                return true;
+            }
+
+            bool Decompress(const uint8_t* src, uint32_t length, uint8_t* dst, uint32_t dstLength) override
+            {
+                if (!ready)
+                    return false;
+                auto decoderOptions = options;
+                // The SDK decoder also accepts streams with an optional end
+                // marker. Keep that compatibility while encoding without one.
+                decoderOptions.ext_flags = LZMA_LZMA1EXT_ALLOW_EOPM;
+                lzma_set_ext_size(decoderOptions, dstLength);
+                lzma_filter filters[] = {{LZMA_FILTER_LZMA1EXT, &decoderOptions}, {LZMA_VLI_UNKNOWN, nullptr}};
+                size_t consumed = 0;
+                size_t decoded = 0;
+                return lzma_raw_buffer_decode(filters, nullptr, src, &consumed, length, dst, &decoded, dstLength) == LZMA_OK &&
+                       consumed == length && decoded == dstLength;
+            }
+
+        private:
+            lzma_options_lzma options{};
+            bool ready = false;
+        };
+#else
         /// The encoder properties MAME uses (chdcodec.cpp): level 6, the dictionary
         /// cut down to the hunk. The decoder derives the same properties: the
         /// stream itself carries none
@@ -147,6 +210,7 @@ namespace chd
             Byte _decoderProps[LZMA_PROPS_SIZE] = {};
             bool _ready = false;
         };
+#endif
 
         /// endregion </lzma>
 

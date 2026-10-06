@@ -6,10 +6,10 @@
 /// | Tag | Codec | Library |
 /// |---|---|---|
 /// | `zlib` | raw deflate, best compression | miniz (vendored) |
-/// | `lzma` | LZMA, level 6, dictionary sized to the hunk, no end marker | LZMA SDK 19.00 (vendored) |
+/// | `lzma` | LZMA, level 6, dictionary sized to the hunk, no end marker | LZMA SDK 19.00 or system XZ liblzma |
 /// | `huff` | one 8-bit Huffman table per hunk | own (chdhuffman) |
 /// | `flac` | the hunk as 16-bit stereo, `L` / `B` byte order prefix | own (chdflac) |
-/// | `zstd` | a Zstandard frame | zstd 1.5.7 (vendored) |
+/// | `zstd` | a Zstandard frame | vendored or system zstd (1.5.7+) |
 ///
 /// The CD codecs (`cdlz`, `cdzl`, `cdzs`, `cdfl`) read CD-ROM CHDs (hunks of
 /// 2448-byte frames: 2352 bytes of sector data + 96 of subcode; CreateCdCodec).

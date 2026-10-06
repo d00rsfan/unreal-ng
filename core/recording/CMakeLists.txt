@@ -95,7 +95,7 @@ if(APPLE)
     )
 endif()
 
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT UNREAL_USE_SYSTEM_LIBS)
     target_link_libraries(${PROJECT_NAME} PRIVATE -static-libstdc++)
 endif()
 

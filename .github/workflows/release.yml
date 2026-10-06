@@ -23,19 +23,16 @@
 #
 # Packages (one file per platform/architecture, named
 # UnrealNG-Suite-<OS>-<arch>[-<toolchain>].<ext>):
-#   Linux    x86_64   .AppImage (portable) and .deb (Ubuntu 24.04+ / Debian 13+)
+#   Linux    x86_64   .AppImage / bundled .deb, plus native .deb for Ubuntu 26.04
 #   macOS    x86_64, arm64   .dmg (macOS 12+)
 #   Windows  x86_64 (MSVC), x86_64-MinGW, arm64   portable .zip
 #
-# Dependencies: everything except Qt is vendored and linked statically. Qt comes
-# from the Qt SDK - on Linux baked into the project's build image
-# (docker/Dockerfile.universal), on macOS/Windows from the cached install-qt-action -
-# and is shipped inside each package (private copy), so no package relies on
-# libraries of the user's system beyond
-# the OS itself (glibc/X11/GL on Linux, system frameworks on macOS, Win32).
-# The WebAPI has no TLS in release builds (plain HTTP on localhost, no c-ares). The
-# emulated network modules do (UNREAL_HOST_TLS): OpenSSL is linked statically on
-# macOS (built here for the minimum macOS) and comes from the toolchain elsewhere.
+# Portable packages retain their private Qt runtime and vendored libraries.
+# The additional Ubuntu 26.04 DEB uses distribution Qt and shared libraries;
+# apt resolves its runtime dependencies. It also enables host OpenSSL support.
+# The portable release WebAPI serves plain HTTP without TLS or c-ares. Emulated
+# network modules use host TLS: macOS links static OpenSSL built for the minimum
+# macOS, while the other platforms use their toolchain's OpenSSL.
 #
 # ==============================================================================
 
@@ -57,6 +54,11 @@ on:
       - 'cmake/**'
       - '.github/workflows/release.yml'
       - 'tools/package-appimage.sh'
+      - 'tools/build/**'
+      - 'tools/verify-system-deb.sh'
+      - 'docker/linux/Dockerfile.system-deb'
+      - 'core/src/emulator/io/storage/chd/chdcodec.*'
+      - 'core/tests/emulator/io/storage/chd/chdcodec_test.cpp'
       - 'install/**'
       - 'unreal-qt/install/**'
       - 'unreal-videowall/install/**'
@@ -223,6 +225,52 @@ jobs:
           test -f /usr/lib/unreal-ng/configs/pentagon512k/unreal.ini
           test -f /usr/lib/unreal-ng/rom/README-ROMS.md
           test -f /usr/lib/unreal-ng/midi/generaluser-gs.sf2
+          test -s /usr/lib/unreal-ng/configs/ts-conf/wc-zifi.img
+          test ! -e /usr/lib/unreal-ng/configs/ts-conf/wc-zifi.img.7z
+
+  # Native DEB: build against Ubuntu 26.04 packages, then install in a clean OS.
+  build-linux-system-deb:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    env:
+      UNREAL_PACKAGE_VERSION: ${{ needs.metadata.outputs.package-version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Prepare Ubuntu 26.04 build environment
+        run: docker build -f docker/linux/Dockerfile.system-deb -t unreal-ng-system-deb:26.04 docker/linux
+      - name: Build, test and package with distribution libraries
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e UNREAL_PACKAGE_VERSION \
+            unreal-ng-system-deb:26.04 bash -c '
+              git config --global --add safe.directory /src
+              tools/build/system-deb.sh
+            '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: UnrealNG-Suite-Ubuntu-26.04-x86_64.deb
+          path: scratch/system-deb-build/packages/UnrealNG-Suite-Ubuntu-26.04-x86_64.deb
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  verify-linux-system-deb:
+    needs: build-linux-system-deb
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: UnrealNG-Suite-Ubuntu-26.04-x86_64.deb
+          path: packages
+      - name: Install and verify system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends binutils ./packages/*.deb
+          bash tools/verify-system-deb.sh packages/UnrealNG-Suite-Ubuntu-26.04-x86_64.deb
 
   # ========================================
   # Windows MSVC Build (x86_64 and native arm64)
@@ -584,7 +632,7 @@ jobs:
   # - tag push (v*)               → Milestone release (permanent, never deleted)
   #
   release:
-    needs: [metadata, build-linux, verify-linux-deb, build-windows-msvc, build-windows-mingw, build-macos]
+    needs: [metadata, build-linux, verify-linux-deb, build-linux-system-deb, verify-linux-system-deb, build-windows-msvc, build-windows-mingw, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')
 
@@ -622,14 +670,16 @@ jobs:
           |----------|------|
           | Linux x86_64, portable (any distribution with glibc 2.39+) | `UnrealNG-Suite-Linux-x86_64.AppImage` |
           | Linux x86_64, Ubuntu 24.04+ / Debian 13+ | `UnrealNG-Suite-Linux-x86_64.deb` |
+          | Ubuntu 26.04 x86_64, system Qt and libraries | `UnrealNG-Suite-Ubuntu-26.04-x86_64.deb` |
           | macOS 12+, Apple Silicon | `UnrealNG-Suite-macOS-arm64.dmg` |
           | macOS 12+, Intel | `UnrealNG-Suite-macOS-x86_64.dmg` |
           | Windows x86_64 | `UnrealNG-Suite-Windows-x86_64.zip` |
           | Windows x86_64 (MinGW build) | `UnrealNG-Suite-Windows-x86_64-MinGW.zip` |
           | Windows ARM64 | `UnrealNG-Suite-Windows-arm64.zip` |
 
-          Every package carries its own Qt; nothing else needs to be installed.
-          Debug symbols (rolling snapshots only) use the same names with `UnrealNG-Symbols-`.
+          The Ubuntu 26.04 DEB uses system libraries: install it with `sudo apt install ./UnrealNG-Suite-Ubuntu-26.04-x86_64.deb`.
+          The other packages carry their own Qt. The two DEBs are alternative builds of the same package.
+          Debug symbols for the portable builds (rolling snapshots only) use the same names with `UnrealNG-Symbols-`.
 
           ### Verify Downloads
           ```bash
