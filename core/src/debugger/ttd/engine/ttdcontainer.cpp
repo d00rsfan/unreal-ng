@@ -75,7 +75,11 @@ bool TTDMemorySource::ReadAt(uint64_t offset, uint8_t* out, size_t size) const
     return true;
 }
 
-TTDFileSink::TTDFileSink(const std::string& utf8Path) : _file(platform::AppendFile::Create(utf8Path, &_error)) {}
+TTDFileSink::TTDFileSink(const std::string& utf8Path)
+{
+    // _error must be constructed before the file layer can write an error to it.
+    _file = platform::AppendFile::Create(utf8Path, &_error);
+}
 TTDFileSink::~TTDFileSink() = default;
 bool TTDFileSink::Write(const uint8_t* data, size_t size) { return _file && _file->Write(data, size); }
 bool TTDFileSink::Sync() { return _file && _file->Sync(); }
@@ -87,7 +91,10 @@ void TTDFileSink::Close()
     _file.reset();
 }
 
-TTDFileSource::TTDFileSource(const std::string& utf8Path) : _file(platform::RandomAccessFile::Open(utf8Path, &_error)) {}
+TTDFileSource::TTDFileSource(const std::string& utf8Path)
+{
+    _file = platform::RandomAccessFile::Open(utf8Path, &_error);
+}
 TTDFileSource::~TTDFileSource() = default;
 uint64_t TTDFileSource::Size() const { return _file ? _file->Size() : 0; }
 bool TTDFileSource::ReadAt(uint64_t offset, uint8_t* out, size_t size) const

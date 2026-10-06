@@ -187,20 +187,29 @@ else ()
     message(STATUS "[automation_webapi] Using system zlib. Target/Library: ${ZLIB_TARGET_NAME}, Includes: ${ZLIB_INCLUDE_DIRS}")
 endif ()
 
-# Build JsonCpp as a static library
-set(JSONCPP_WITH_TESTS OFF CACHE BOOL "" FORCE)
-set(JSONCPP_WITH_POST_BUILD_UNITTEST OFF CACHE BOOL "" FORCE)
-set(JSONCPP_WITH_WARNING_AS_ERROR OFF CACHE BOOL "" FORCE)
-set(JSONCPP_WITH_CMAKE_PACKAGE OFF CACHE BOOL "" FORCE)
-set(JSONCPP_WITH_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
-set(BUILD_OBJECT_LIBS OFF CACHE BOOL "" FORCE)
+# Keep the target name consumed by our patched Drogon and MCP builds, but use
+# the distribution's shared JsonCpp implementation for native Linux packages.
+if(UNREAL_USE_SYSTEM_LIBS)
+    pkg_check_modules(UNREAL_JSONCPP REQUIRED IMPORTED_TARGET GLOBAL jsoncpp>=1.9.5)
+    add_library(jsoncpp_static INTERFACE IMPORTED GLOBAL)
+    set_target_properties(jsoncpp_static PROPERTIES
+        INTERFACE_LINK_LIBRARIES PkgConfig::UNREAL_JSONCPP)
+else()
+    # Build JsonCpp as a static library
+    set(JSONCPP_WITH_TESTS OFF CACHE BOOL "" FORCE)
+    set(JSONCPP_WITH_POST_BUILD_UNITTEST OFF CACHE BOOL "" FORCE)
+    set(JSONCPP_WITH_WARNING_AS_ERROR OFF CACHE BOOL "" FORCE)
+    set(JSONCPP_WITH_CMAKE_PACKAGE OFF CACHE BOOL "" FORCE)
+    set(JSONCPP_WITH_EXAMPLE OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(BUILD_OBJECT_LIBS OFF CACHE BOOL "" FORCE)
 
-# Add jsoncpp subdirectory
-add_subdirectory("lib/jsoncpp")
+    # Add jsoncpp subdirectory
+    add_subdirectory("lib/jsoncpp")
 
-install(TARGETS jsoncpp_static EXPORT DrogonTargets)
+    install(TARGETS jsoncpp_static EXPORT DrogonTargets)
+endif()
 
 
 
@@ -339,7 +348,7 @@ else () # Called from upper level CMake => build static library
         ${ROOT_DIR}/core/automation  # For automation/automation.h
         $<$<BOOL:${ENABLE_LUA_AUTOMATION}>:${ROOT_DIR}/core/automation/lua/src>
         $<$<BOOL:${ENABLE_LUA_AUTOMATION}>:${ROOT_DIR}/core/automation/lua/lib/sol2/sol2-3.5.0/include>
-        $<$<BOOL:${ENABLE_LUA_AUTOMATION}>:${ROOT_DIR}/core/automation/lua/lib/lua/lua-5.4.7/src>
+        $<$<AND:$<BOOL:${ENABLE_LUA_AUTOMATION}>,$<NOT:$<BOOL:${UNREAL_USE_SYSTEM_LIBS}>>>:${ROOT_DIR}/core/automation/lua/lib/lua/lua-5.4.7/src>
         $<$<BOOL:${ENABLE_PYTHON_AUTOMATION}>:${ROOT_DIR}/core/automation/python/src>
         $<$<BOOL:${ENABLE_PYTHON_AUTOMATION}>:${ROOT_DIR}/core/automation/python/3rdparty/pybind11/include>
         $<$<BOOL:${ENABLE_PYTHON_AUTOMATION}>:${Python3_INCLUDE_DIRS}>
@@ -433,3 +442,7 @@ if (ENABLE_RECORDING)
 endif()
 
 
+# Use the same distro Lua headers as the automation module.
+if(UNREAL_USE_SYSTEM_LIBS AND ENABLE_LUA_AUTOMATION)
+    target_link_libraries(${PROJECT_NAME} PRIVATE lua::shared)
+endif()

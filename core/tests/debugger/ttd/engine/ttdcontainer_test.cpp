@@ -272,6 +272,9 @@ TEST(TTDContainer_Test, RealFile)
     const std::string path = TestPathHelper::GetUniqueTestScratchPath("session-\xc3\xa9t\xc3\xa9.ttd");
     std::error_code ec;
     std::filesystem::remove(FileHelper::ToFsPath(path), ec);
+    TTDFileSource missing(path);
+    ASSERT_FALSE(missing.Valid());
+    EXPECT_FALSE(missing.Error().empty());
     const Written w = Write(true);
     {
         TTDFileSink sink(path);
@@ -282,6 +285,7 @@ TEST(TTDContainer_Test, RealFile)
     }
     TTDFileSink again(path);
     EXPECT_FALSE(again.Valid());
+    EXPECT_FALSE(again.Error().empty());
 
     TTDFileSource source(path);
     ASSERT_TRUE(source.Valid()) << source.Error();

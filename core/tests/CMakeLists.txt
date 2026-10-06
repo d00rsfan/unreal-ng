@@ -190,6 +190,14 @@ if (NOT TARGET ${PROJECT_NAME})
     add_executable(${PROJECT_NAME} EXCLUDE_FROM_ALL ${SOURCES})
     set_target_properties(${PROJECT_NAME} PROPERTIES AUTOMOC OFF)
 
+    if(UNREAL_USE_SYSTEM_LIBS)
+        # Test-only oracle: retain the SDK's own tests and cross-check native
+        # liblzma CHD streams against the original encoder/decoder. The suite
+        # executables themselves link only the distribution's liblzma.
+        add_subdirectory(${CORE_DIR}/3rdparty/liblzma ${CMAKE_CURRENT_BINARY_DIR}/reference-lzma)
+        target_link_libraries(${PROJECT_NAME} lzma)
+    endif()
+
     # Declare _ALWAYS_USE_LOGGING for compiler
     target_compile_definitions(${PROJECT_NAME} PRIVATE _ALWAYS_USE_LOGGING)
 
@@ -242,8 +250,11 @@ if (NOT TARGET ${PROJECT_NAME})
     endif (WIN32 AND MINGW)
 
     if (UNIX AND NOT APPLE)
-        set(CMAKE_CXX_FLAGS " -static-libstdc++")
-        set(common_libraries -static-libstdc++ pthread gtest)
+        set(common_libraries pthread gtest)
+        if(NOT UNREAL_USE_SYSTEM_LIBS)
+            set(CMAKE_CXX_FLAGS " -static-libstdc++")
+            list(APPEND common_libraries -static-libstdc++)
+        endif()
     endif (UNIX AND NOT APPLE)
 
     if (APPLE)

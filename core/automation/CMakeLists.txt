@@ -138,9 +138,9 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         set(common_libraries iconv)
     endif (APPLE)
 
-    if (UNIX AND NOT APPLE)
+    if (UNIX AND NOT APPLE AND NOT UNREAL_USE_SYSTEM_LIBS)
         set(common_libraries -static-libstdc++)
-    endif (UNIX AND NOT APPLE)
+    endif ()
 
     # Conditional pthread linking - only link if webapi is disabled. drogon/trentor adds Threads::Threads linkage
     if (NOT ENABLE_WEBAPI_AUTOMATION)

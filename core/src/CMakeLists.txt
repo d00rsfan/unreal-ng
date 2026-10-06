@@ -50,9 +50,14 @@ set (SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Include CMake helper functions file
 include(${ROOT_DIR}/cmake/func.cmake)
+include(${ROOT_DIR}/cmake/SystemDependencies.cmake)
 
 # liblzma
-add_subdirectory(3rdparty/liblzma)
+if(UNREAL_USE_SYSTEM_LIBS)
+    find_package(LibLZMA 5.4 REQUIRED)
+else()
+    add_subdirectory(3rdparty/liblzma)
+endif()
 
 # zstd v1.5.7 (embedded source — no FetchContent, no find_package).
 # The CMake project in 3rdparty/zstd/ compiles the checked-in source
@@ -73,7 +78,12 @@ add_subdirectory(3rdparty/liblzma)
 # headers, breaking the build. The libzstd_static target propagates its
 # own include dir via INTERFACE_INCLUDE_DIRECTORIES, so we don't need to
 # forward it manually.
-add_subdirectory(3rdparty/zstd)
+if(UNREAL_USE_SYSTEM_LIBS)
+    pkg_check_modules(UNREAL_ZSTD REQUIRED IMPORTED_TARGET GLOBAL libzstd>=1.5.7)
+    add_library(zstd::libzstd ALIAS PkgConfig::UNREAL_ZSTD)
+else()
+    add_subdirectory(3rdparty/zstd)
+endif()
 
 # gif — GIF writer shared by core (ScreenCapture) and the optional recording
 # library; its own target so neither layer owns it (see its CMakeLists.txt).
@@ -256,7 +266,12 @@ target_precompile_headers(${PROJECT_NAME} PRIVATE ${SOURCE_DIR}/stdafx.h)
 
 
 # Link lzma library
-target_link_libraries(${PROJECT_NAME} PRIVATE lzma)
+if(UNREAL_USE_SYSTEM_LIBS)
+    target_link_libraries(${PROJECT_NAME} PRIVATE LibLZMA::LibLZMA)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC UNREAL_USE_SYSTEM_LIBS)
+else()
+    target_link_libraries(${PROJECT_NAME} PRIVATE lzma)
+endif()
 
 # Link zstd (TTD codec)
 # PUBLIC because ttd_compression.h is a public header (included by
@@ -272,7 +287,11 @@ target_link_libraries(${PROJECT_NAME} PUBLIC miniz)
 # module whose server is unreachable. PRIVATE: only hosttls.cpp includes OpenSSL
 option(UNREAL_HOST_TLS "Host-side TLS for emulated TLS clients (needs OpenSSL)" ON)
 if (UNREAL_HOST_TLS)
-    find_package(OpenSSL QUIET)
+    if(UNREAL_USE_SYSTEM_LIBS)
+        find_package(OpenSSL REQUIRED)
+    else()
+        find_package(OpenSSL QUIET)
+    endif()
     if (NOT OpenSSL_FOUND AND APPLE AND EXISTS "/opt/homebrew/opt/openssl")
         set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl")
         find_package(OpenSSL QUIET)
@@ -330,7 +349,7 @@ if (APPLE)
     )
 endif ()
 
-if (UNIX AND NOT APPLE)
+if (UNIX AND NOT APPLE AND NOT UNREAL_USE_SYSTEM_LIBS)
     target_link_libraries(${PROJECT_NAME} PRIVATE -static-libstdc++)
 endif ()
 

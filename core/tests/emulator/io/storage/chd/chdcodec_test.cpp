@@ -7,16 +7,69 @@
 #include <vector>
 
 #include "emulator/io/storage/chd/chdcodec.h"
+#include "3rdparty/liblzma/include/Alloc.h"
+#include "3rdparty/liblzma/include/LzmaDec.h"
+#include "3rdparty/liblzma/include/LzmaEnc.h"
 
 using namespace chd;
+
+class ChdLzmaCompatibility_Test : public ::testing::TestWithParam<uint32_t> {};
+
+TEST_P(ChdLzmaCompatibility_Test, InteroperatesWithSdkRawStreams)
+{
+    const uint32_t hunk = GetParam();
+    std::vector<uint8_t> input(hunk);
+    for (uint32_t i = 0; i < hunk; ++i)
+        input[i] = static_cast<uint8_t>((i % 257) * 37);
+    std::vector<uint8_t> packed(hunk);
+    std::vector<uint8_t> unpacked(hunk);
+
+    CLzmaEncProps props;
+    LzmaEncProps_Init(&props);
+    props.level = 6;
+    props.reduceSize = hunk;
+    LzmaEncProps_Normalize(&props);
+    Byte properties[LZMA_PROPS_SIZE] = {};
+    auto codec = CreateCodec(kCodecLzma, hunk);
+    for (int endMarker : {0, 1})
+    {
+        SCOPED_TRACE(endMarker);
+        SizeT propertiesSize = LZMA_PROPS_SIZE;
+        SizeT packedSize = hunk;
+        ASSERT_EQ(LzmaEncode(packed.data(), &packedSize, input.data(), hunk, &props,
+                            properties, &propertiesSize, endMarker, nullptr, &g_Alloc, &g_BigAlloc), SZ_OK);
+        ASSERT_LT(packedSize, hunk);
+        ASSERT_TRUE(codec->Decompress(packed.data(), static_cast<uint32_t>(packedSize), unpacked.data(), hunk));
+        EXPECT_EQ(unpacked, input);
+        // Cut into the compressed payload, before an optional end marker.
+        EXPECT_FALSE(codec->Decompress(packed.data(), static_cast<uint32_t>(packedSize / 2), unpacked.data(), hunk));
+        packed[packedSize] = 0;
+        EXPECT_FALSE(codec->Decompress(packed.data(), static_cast<uint32_t>(packedSize + 1), unpacked.data(), hunk));
+    }
+
+    // Decode the active backend's output with the independent SDK decoder.
+    uint32_t written = 0;
+    ASSERT_TRUE(codec->Compress(input.data(), hunk, packed.data(), written));
+    SizeT consumed = written;
+    SizeT decoded = hunk;
+    ELzmaStatus status;
+    ASSERT_EQ(LzmaDecode(unpacked.data(), &decoded, packed.data(), &consumed,
+                        properties, LZMA_PROPS_SIZE, LZMA_FINISH_END, &status, &g_Alloc), SZ_OK);
+    EXPECT_EQ(decoded, hunk);
+    EXPECT_EQ(consumed, written);
+    EXPECT_EQ(status, LZMA_STATUS_MAYBE_FINISHED_WITHOUT_MARK);
+    EXPECT_EQ(unpacked, input);
+}
+
+INSTANTIATE_TEST_SUITE_P(HunkSizes, ChdLzmaCompatibility_Test, ::testing::Values(4096U, 6144U, 16384U));
 
 TEST(ChdCodec_Test, EveryCodecRoundTripsAndRefusesToGrow)
 {
     const uint32_t hunk = 4096;
     std::vector<uint8_t> text(hunk);
-    const char* words = "a sector of a hard disk holds five hundred and twelve bytes ";
+    const char words[] = "a sector of a hard disk holds five hundred and twelve bytes ";
     for (uint32_t i = 0; i < hunk; i++)
-        text[i] = static_cast<uint8_t>(words[i % 61]);
+        text[i] = static_cast<uint8_t>(words[i % (sizeof(words) - 1)]);
     std::vector<uint8_t> audio(hunk);
     for (uint32_t i = 0; i < hunk / 2; i++)
     {
