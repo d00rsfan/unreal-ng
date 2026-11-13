@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -18,6 +20,7 @@
 #include "emulator/emulatorcontext.h"
 #include "emulator/memory/calltrace.h"
 #include "emulator/memory/memory.h"
+#include "emulator/memory/memoryaccessfacts.h"
 #include "emulator/platform.h"
 #include "stdafx.h"
 
@@ -38,6 +41,14 @@ enum class TrackingMode : uint8_t
 {
     Z80AddressSpace,  // Track accesses in Z80 64KB address space
     PhysicalMemory    // Track accesses in physical memory pages
+};
+
+/// What the tracker keeps per byte while a memory session captures (the analysis layers' L0,
+/// docs/emulator/analysis/analysis-layers.md). Orthogonal to TrackingMode: the mode picks the address space
+enum class TrackerLevel : uint8_t
+{
+    Counters,  ///< read / write / execute counters (what the tracker always kept)
+    Facts      ///< the counters plus the L0 access facts (MemoryAccessFacts): kinds, last reader / writer, frames, values
 };
 
 // Event types for segmented tracking
@@ -86,7 +97,7 @@ struct MonitoredRegion
 {
     std::string name;           // User-friendly name for the region
     uint16_t startAddress;      // Start address of the region
-    uint16_t length;            // Length of the region in bytes
+    uint32_t length;            // Length of the region in bytes (start + length <= 0x10000)
     MonitoringOptions options;  // Tracking options for this region
     AccessStats stats;          // Access statistics for this region
     TrackingMode mode;          // Tracking mode for this region
@@ -97,8 +108,22 @@ struct MonitoredPort
 {
     std::string name;           // User-friendly name for the port
     uint16_t port;              // Port number
+    uint16_t mask = 0xFFFF;     // Address lines compared: an access counts when (access & mask) == (port & mask)
     MonitoringOptions options;  // Tracking options for this port
     AccessStats stats;          // Access statistics for this port
+};
+
+// A monitored region's or port's totals as the emulation thread published them (PublishWatches)
+struct PublishedWatch
+{
+    std::string name;
+    bool port = false;
+    uint16_t start = 0;      // region: first CPU address; port: the port
+    uint32_t length = 0;     // region only
+    uint16_t mask = 0xFFFF;  // port only
+    uint32_t readCount = 0;
+    uint32_t writeCount = 0;
+    uint32_t executeCount = 0;
 };
 
 // Structure to hold segment information for time-based tracking
@@ -152,19 +177,31 @@ private:
     // Atomic for thread-safe reads from emulator thread
     std::atomic<bool> _isAllocated{false};
 
-    // Mutex to protect allocation/deallocation from concurrent access
-    mutable std::mutex _allocationMutex;
+    // The counters' lifetime: allocation, freeing and a reset take it exclusive; a tool read (a getter, a
+    // CountersView, a save) takes it shared, so a feature switch-off on another thread never frees the buffers under
+    // a read. The emulation thread's Track* never takes it (a feature change holds the CPU instead)
+    mutable std::shared_mutex _allocationMutex;
 
     // Tracking mode
     TrackingMode _currentMode = TrackingMode::Z80AddressSpace;
+
+    // Level: counters only, or the L0 facts on top (allocated with the counters while the level is Facts)
+    TrackerLevel _level = TrackerLevel::Counters;
+    MemoryAccessFacts _facts;
+    // The class of the running instruction (AccessContext), stored by the Z80 while the level is Facts
+    uint8_t _accessContext = 0;
 
     // Monitored regions and ports
     std::vector<MonitoredRegion> _monitoredRegions;
     std::vector<MonitoredPort> _monitoredPorts;
 
-    // Fast lookup maps for regions and ports
+    // The watches' totals for other threads (PublishWatches)
+    mutable std::mutex _publishedMutex;
+    std::vector<PublishedWatch> _publishedWatches;
+    uint64_t _publishedRevision = 0;
+
+    // Fast lookup map for regions (ports are few and partially decoded: a scan of _monitoredPorts)
     std::unordered_map<uint16_t, std::vector<size_t>> _addressToRegionMap;  // address -> indices in _monitoredRegions
-    std::unordered_map<uint16_t, size_t> _portToIndexMap;                   // port -> index in _monitoredPorts
 
     // Segmented tracking
     bool _segmentTrackingEnabled = false;
@@ -192,9 +229,9 @@ private:
     uint8_t _z80BankExecuteMarks = 0;
 
     // Page-level flags
-    ZeroInitBuffer<uint8_t> _pageReadMarks;     // Size: MAX_PAGES / 8
-    ZeroInitBuffer<uint8_t> _pageWriteMarks;    // Size: MAX_PAGES / 8
-    ZeroInitBuffer<uint8_t> _pageExecuteMarks;  // Size: MAX_PAGES / 8
+    std::bitset<MAX_PAGES> _pageReadMarks;     // One bit a page
+    std::bitset<MAX_PAGES> _pageWriteMarks;
+    std::bitset<MAX_PAGES> _pageExecuteMarks;
 
     std::unique_ptr<CallTraceBuffer> _callTraceBuffer;
     std::unique_ptr<Z80Disassembler> _disassembler;
@@ -228,6 +265,34 @@ public:
 
     // Update feature cache (call when features change at runtime)
     void UpdateFeatureCache();
+
+    /// region <Level (L0 access facts)>
+    /// @brief Counters only, or the L0 access facts on top. Facts: allocated now when the counters are (else with
+    /// them), the Z80 told to store the access context; Counters: the facts freed. Call with the CPU held
+    void SetLevel(TrackerLevel level);
+    TrackerLevel GetLevel() const { return _level; }
+    static const char* LevelName(TrackerLevel level);
+
+    /// @brief The facts of a Z80 address (Z80 mode) or of a byte of a physical page (physical mode), copied under the
+    /// counters' lock. False when there are none (another level, not allocated, the page never touched)
+    bool ReadZ80Facts(uint16_t address, ByteFacts& out) const;
+    bool ReadPhysicalFacts(uint16_t page, uint16_t offset, ByteFacts& out) const;
+    /// The kinds (AccessKind bits) of @p count bytes at once, one lock (MemoryAccessFacts::ReadZ80Kinds)
+    bool ReadZ80FactKinds(uint16_t address, size_t count, uint8_t* out) const;
+    bool ReadPhysicalFactKinds(uint16_t page, uint16_t offset, size_t count, uint8_t* out) const;
+
+    struct FactsSummary
+    {
+        bool allocated = false;
+        size_t bytes = 0;                 ///< allocated now
+        size_t z80Touched = 0;            ///< Z80 addresses with a fact
+        std::vector<uint16_t> pages;      ///< physical pages with facts
+    };
+    FactsSummary SummarizeFacts() const;
+
+    /// The byte the Z80 stores the access context into (tests drive it without a CPU)
+    uint8_t* AccessContextSink() { return &_accessContext; }
+    /// endregion </Level (L0 access facts)>
 
     /// region <Session Control - Memory Tracking>
     /// @brief Start a memory tracking session (clears previous data)
@@ -273,18 +338,27 @@ public:
 
     /// @brief Check if call trace is actively capturing
     bool IsCalltraceCapturing() const;
+
+    /// @brief A memory or call trace session is capturing: it needs the debug memory interface, so whoever
+    /// switched debug mode on for its own needs leaves it on
+    bool HasCapturingSession() const;
     /// endregion </Session Control - Call Trace>
     /// endregion </Initialization>
 
     /// region <Region and Port Monitoring>
 public:
-    // Add a monitored memory region with the specified options
-    bool AddMonitoredRegion(const std::string& name, uint16_t startAddress, uint16_t length,
+    // The emulation thread updates the regions' and ports' stats without a lock: add, remove, clear and read them
+    // where nothing executes (paused, stopped, or between frames: MemoryWatch runs them at a coherent moment)
+
+    // Add a monitored memory region with the specified options; false for a taken name, an empty region or one past
+    // 0xFFFF
+    bool AddMonitoredRegion(const std::string& name, uint16_t startAddress, uint32_t length,
                             const MonitoringOptions& options = MonitoringOptions());
 
-    // Add a monitored I/O port with the specified options
+    // Add a monitored I/O port with the specified options; `mask` selects the address lines compared (0x00FF: any
+    // port with the low byte of `port`)
     bool AddMonitoredPort(const std::string& name, uint16_t port,
-                          const MonitoringOptions& options = MonitoringOptions());
+                          const MonitoringOptions& options = MonitoringOptions(), uint16_t mask = 0xFFFF);
 
     // Remove a monitored memory region by name
     bool RemoveMonitoredRegion(const std::string& name);
@@ -297,6 +371,20 @@ public:
 
     // Get statistics for a monitored I/O port
     const AccessStats* GetPortStats(const std::string& name) const;
+
+    // Every monitored region and port with its stats
+    const std::vector<MonitoredRegion>& GetMonitoredRegions() const { return _monitoredRegions; }
+    const std::vector<MonitoredPort>& GetMonitoredPorts() const { return _monitoredPorts; }
+
+    // Remove every monitored region and port
+    void ClearMonitored();
+
+    // Copy every watch's totals for readers on other threads (the debug.watches topic): at a frame's end on the
+    // emulation thread, and after a watch change. Nothing to do while no watch exists and none was published
+    void PublishWatches();
+
+    // The published totals and their revision (grows on every publish)
+    std::vector<PublishedWatch> PublishedWatches(uint64_t* revision = nullptr) const;
     /// endregion </Region and Port Monitoring>
 
     /// region <Segmented Tracking>
@@ -364,33 +452,28 @@ public:
     // Get execute access count for a specific Z80 address
     uint32_t GetZ80AddressExecuteCount(uint16_t address) const;
 
-    // Get direct pointer access to Z80 counter arrays (for bulk rendering)
-    const uint32_t* GetZ80ReadCountersPtr() const
+    /// The three counter arrays for a bulk read (rendering, a WebAPI dump): null while the counters are not
+    /// allocated. The view holds the counters' lock shared for its lifetime, so a feature switch-off on another thread
+    /// waits instead of freeing them under the read; keep it short (copy, then format). It never stops the emulation
+    /// thread, which keeps counting while the view is held
+    class CountersView
     {
-        return _z80ReadCounters.empty() ? nullptr : _z80ReadCounters.data();
-    }
-    const uint32_t* GetZ80WriteCountersPtr() const
-    {
-        return _z80WriteCounters.empty() ? nullptr : _z80WriteCounters.data();
-    }
-    const uint32_t* GetZ80ExecuteCountersPtr() const
-    {
-        return _z80ExecuteCounters.empty() ? nullptr : _z80ExecuteCounters.data();
-    }
+    public:
+        const uint32_t* reads = nullptr;
+        const uint32_t* writes = nullptr;
+        const uint32_t* executes = nullptr;
+        size_t size = 0;  ///< elements in each array
 
-    // Get direct pointer access to physical counter arrays (for bulk rendering)
-    const uint32_t* GetPhysReadCountersPtr() const
-    {
-        return _physReadCounters.empty() ? nullptr : _physReadCounters.data();
-    }
-    const uint32_t* GetPhysWriteCountersPtr() const
-    {
-        return _physWriteCounters.empty() ? nullptr : _physWriteCounters.data();
-    }
-    const uint32_t* GetPhysExecuteCountersPtr() const
-    {
-        return _physExecuteCounters.empty() ? nullptr : _physExecuteCounters.data();
-    }
+    private:
+        friend class MemoryAccessTracker;
+        std::shared_lock<std::shared_mutex> _lock;
+    };
+
+    /// The Z80 address space counters (64K each)
+    CountersView Z80CountersView() const;
+
+    /// The physical counters (PAGE_SIZE * MAX_PAGES each, page N at N * PAGE_SIZE)
+    CountersView PhysCountersView() const;
 
     // Get total access count for a physical memory page
     uint32_t GetPageTotalAccessCount(uint16_t page) const;
@@ -497,10 +580,24 @@ private:
     bool SaveDetailedAccessData(const std::filesystem::path& dirPath, const std::vector<std::string>& filterPages);
     void SaveDetailedAccessData(std::ostream& out, const std::vector<std::string>& filterPages);
     void SaveSinglePageAccessData(std::ostream& out, uint16_t page, const std::string& indent = "");
+
+    // The page counts without the lock (the public getters and the save paths hold it)
+    uint32_t PageReadCountUnlocked(uint16_t page) const;
+    uint32_t PageWriteCountUnlocked(uint16_t page) const;
+    uint32_t PageExecuteCountUnlocked(uint16_t page) const;
+    uint32_t PageTotalCountUnlocked(uint16_t page) const;
     std::string GetBankPageName(uint8_t bank) const;
 
     // Allocate counter vectors (lazy allocation - called when tracking is first enabled)
     void AllocateCounters();
+
+    // Point the Z80's access context store at this tracker (level Facts) or nowhere
+    void AttachAccessContext(bool attach);
+
+    // The facts update of one access (level Facts, capturing); physOffset as the counters computed it
+    void TrackFactsRead(uint16_t address, size_t physOffset, uint8_t value, uint16_t callerAddress);
+    void TrackFactsWrite(uint16_t address, size_t physOffset, uint8_t value, uint16_t callerAddress);
+    void TrackFactsExecute(uint16_t address, size_t physOffset, uint16_t callerAddress);
 
     // Deallocate counter vectors (called when tracking is disabled to free memory)
     void DeallocateCounters();
@@ -528,6 +625,8 @@ public:
     using MemoryAccessTracker::_z80ExecuteCounters;
     using MemoryAccessTracker::_z80ReadCounters;
     using MemoryAccessTracker::_z80WriteCounters;
+    using MemoryAccessTracker::_facts;
+    using MemoryAccessTracker::_accessContext;
 };
 
 #endif  // _CODE_UNDER_TEST

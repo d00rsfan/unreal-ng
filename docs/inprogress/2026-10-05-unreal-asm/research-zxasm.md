@@ -44,7 +44,38 @@ No header, no end marker: the editor's text buffer as is (catalog length = text 
 | `#10`, `#11`, `#18`-`#1F` | control codes inside strings (colours, arrows), kept as U+F700 + byte |
 | other bytes | CP866 text |
 
+ZAsm 3.10 and later save every text with a TR-DOS type letter and the next two characters of its extension in the
+catalog's start field: `ovlib.asm` is type `a` with start "sm", `A315.lbl` type `l` with "bl", `About.txt` type `t`
+with "xt". Its texts therefore come with any type; the detector takes a start made of two such characters as a ZAsm
+start (phase A6).
+
+Every version's editor writes two blanks or more as a run (`#06 #8x`). A file with plain double blanks and neither a
+run nor a keyword was written by another program, whatever its catalog entry: the detector leaves it to the text codec
+(2026-10-21: `isosurf.a` in isosurf.scl, type `a` with "sm", is the CR text of the ALASM source `isosurf.H` on the same
+disk). An image project takes such a text as the text copy of a source of the disk when nine of ten of its code lines
+(comments and blanks aside) are that source's and it reads in that dialect without a warning, whatever its name
+(`lorenz1k.a` next to `LORENZ1K`, `megalz d.a` next to `DEC40`); other text files stay documents.
+
 2.6 and 3.2x and later write an optional first line `;*a,b,c,…` (the editor state); it is an ordinary line.
+
+### 3.1 The settings file (type `s`)
+
+ZAsm 3.15 and later keep their setup in a type `s` file at start `#7465` (`ZAsm3.15 s`, `z33.02 s`, `z33.51 s`, ...),
+written by SaveSet in the setup overlay (source `samples/text/C33_05__setup.a.txt` of the collection, lines 514-528):
+
+| Offset | Meaning |
+|---|---|
+| 0 | the version (`"3"` in 3.3.02) |
+| 1-2 | the length of the block that follows (`FLAGS - SystDisk`, `#0078` in 3.3.02) |
+| 3 | **SystDisk**: the system drive, ASCII `A`-`E` |
+| 4 | **OverDisk**: the overlays drive |
+| 5... | the rest of the RAM block from SystDisk to FLAGS (the default extension `asm`, the monitor `sts6.2 exe`, the font name ...), then W_Size and the windows |
+
+In RAM (3.3.02 `ovldef.a`): SystDisk `#8457`, OverDisk `#8458`, CurDrive `#84EF`, DefDrive `#84F0`; 3.3.51
+`#844B` / `#844C` / `#84E2` / `#84E3`. 3.15 has the drives at offset `#24` (an older layout). Shipped values: 3.15,
+3.3.02, 3.3.51, x64 `DD`; ZXTA34X `AA`; 3.2x lite 1 `A`. The `D` default is the author's own set-up (Shalaev's DOS
+emulator, overlays once on another disk or a RAM disk: his ReadMe files and zx-pk.ru thread 29356); its effect in the
+emulator is in [zxasm.md](../../../.recipe/assemblers/zxasm.md#start-and-the-default-drive).
 
 ## 4. The editor's rules (canonical tokenizer)
 
@@ -88,7 +119,7 @@ newest is chosen. Keywords `#C6`-`#C9` mean Lite or 3.15+, `#CA`-`#CC` mean 3.15
 ### 6.1 Checked in the emulator
 
 `fcnv1` with four lines added (`Test   ld (hl),a:inc hl:djnz Test`, `       LD   A,(IX+5) ;комментарий`,
-`       db "  строка  ",13`, `       chd "b:test"`), written entirely by the codec's rules (no kept bytes) with
+`       db "  строка  ",13`, `       chd "b:test"`; the Russian words mean "comment" and "string"), written entirely by the codec's rules (no kept bytes) with
 `zxasm encode --version 3.15` (type `a`, extension "sm"), opens in ZAsm 3.15 (File > Load) and shows the text line for
 line: keyword case, blank runs, the blank after the opening quote, Russian text, the 3.15-only `CHD`. Own emulator
 instance, TTD recorded; screenshots kept with the research materials.

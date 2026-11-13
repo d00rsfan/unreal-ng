@@ -2,6 +2,7 @@
 
 #include <QMainWindow>
 #include <QPointer>
+#include <QTimer>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -9,6 +10,7 @@
 #include <vector>
 #include <3rdparty/message-center/eventqueue.h>
 #include <common/shmhelper.h>
+#include <emulator/actions/targetstate.h>
 
 class Emulator;
 class TileGrid;
@@ -18,6 +20,10 @@ class EmulatorManager;
 class Automation;
 #endif
 class EmulatorTile;
+namespace guicontrol
+{
+class Host;
+}
 class AppSoundManager;
 
 /**
@@ -72,7 +78,7 @@ public:
     void createNextBatch();
     
     // Single Emulator Sync Mode
-    void setSingleEmulatorSyncMode(bool enable, const std::string& emulatorId = "");
+    void setSingleEmulatorSyncMode(bool enable);
 
     /// Handle GPU acceleration toggle
     void handleGpuAccelerationToggled(bool enabled);
@@ -87,6 +93,8 @@ protected:
 private slots:
     /// Handle tile click for audio binding (toggle)
     void onTileClicked(EmulatorTile* tile);
+    /// The same in GPU mode, by the tile's index
+    void onGpuTileClicked(int index);
 
 private:
     void setupUI();
@@ -126,10 +134,28 @@ private:
     /// Open Video Wall recording dialog (Cmd+R / Ctrl+R)
     void handleVideoRecordingRequested();
 
+    // Screenshots: the core Screenshotter (the same picture the WebAPI / MCP / CLI take), per emulator and for the wall
+    /// The emulator of the tile with the focus; the only one when there is a single tile; null when it is ambiguous
+    std::shared_ptr<Emulator> focusedEmulator() const;
+    /// The focused tile's instance as this window's active instance in TargetState (Stream Deck targeting.md: the
+    /// video wall is one view; a surface following the focus drives its focused tile)
+    void updateSurfaceView();
+    /// Copy the focused tile's frame (whole frame, border included) to the clipboard
+    void handleTileScreenshotToClipboard();
+    /// Save the focused tile's frame to a PNG / GIF file
+    void handleTileScreenshotSaveAs();
+    /// Save every emulator's frame to a folder, one file per emulator
+    void handleAllScreenshotsSave();
+    /// Save the wall as it is on the screen (every tile in its place) to a PNG file
+    void handleWallScreenshotSaveAs();
+    void showScreenshotMessage(const QString& text);
+
     // Helper methods for GPU/CPU mode abstraction
     int tileCount() const;
     std::vector<std::string> allEmulatorIds() const;
     std::shared_ptr<Emulator> emulatorAt(int index) const;
+    /// The tile bound to the sound (a click selects it), -1 none
+    int focusedTile() const;
     void setGridFullscreenMode(bool fullscreen);
     void clearGrid();
     void publishStatus() const;
@@ -151,7 +177,9 @@ private:
 
     // Observer IDs for reliable lambda removal in the destructor
     // (capturing lambdas cannot be matched by value - see RemoveObserverById)
-    std::uint64_t _singleSyncObserverId = 0;
+    actions::ViewHandle _surfaceView;   ///< this window as a view of TargetState
+    std::string _surfaceActive;         ///< the active instance last reported
+    QTimer* _surfaceTimer = nullptr;    ///< focus paths are many: a cheap check every 200 ms besides the direct calls
     std::uint64_t _instanceCreatedObserverId = 0;
     std::uint64_t _instanceDestroyedObserverId = 0;
 
@@ -211,10 +239,16 @@ private:
     // Single sync mode state
     bool _singleSyncMode = false;
 
+    /// The GUI control plane's host (docs/emulator/design/gui-control): the window `main` and its view `tilegrid`
+    /// (focus, single sync, layout); null when it could not listen
+    std::unique_ptr<guicontrol::Host> _guiHost;
+    void startGuiControl();
+    /// The tilegrid view's state (tiles, the focused tile, single sync, layout) to the plane's subscribers
+    void publishGuiState() const;
+
     // Auto-hide menu bar in fullscreen
     QTimer* _menuAutoHideTimer = nullptr;
     static constexpr int MENU_AUTO_HIDE_DELAY_MS = 2000;
     static constexpr int MENU_TRIGGER_ZONE_HEIGHT = 10;  // pixels from top
-    
-    void handleSingleSyncModeMessage(MessagePayload* payload);
+
 };

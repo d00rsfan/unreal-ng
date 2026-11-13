@@ -47,7 +47,7 @@ FdcStatusWidget::FdcStatusWidget(QWidget* parent) : QWidget(parent)
     connect(_deferTimer, SIGNAL(timeout()), this, SLOT(applyPendingState()));
     _sinceLastFlush.start();
 
-    _debuggerWindow = static_cast<DebuggerWindow*>(parent);
+    _debuggerWindow = DebuggerWindow::Of(parent);
 
     renderSnapshot(FdcSnapshot());  // Initial placeholder until the first seed / notification
 }
@@ -191,7 +191,10 @@ void FdcStatusWidget::seedFromContext()
 
     FdcSnapshot snapshot;
 
-    EmulatorContext* context = emulator ? emulator->GetContext() : nullptr;
+    // Leased for the read: an automation thread may remove the instance meanwhile (2026-10-10: the WD1793 read here was
+    // freed by a WebAPI delete); a removal in progress gives no context
+    const Emulator::ContextLease lease = emulator ? emulator->LeaseContext() : Emulator::ContextLease{};
+    EmulatorContext* context = lease.get();
     if (context && context->pBetaDisk)
     {
         const WD1793* fdc = context->pBetaDisk;

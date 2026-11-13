@@ -18,7 +18,7 @@
 #include "debugger/analyzers/analyzermanager.h"
 #include "debugger/analyzers/audiocapture/audiocaptureanalyzer.h"
 #include "debugger/debugmanager.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/memory/memory.h"
 #include "emulator/cpu/core.h"
 #include "emulator/cpu/z80.h"
@@ -185,7 +185,9 @@ TEST_F(SoundChipTurboSound_Test, TonePitchFollowsTheClock)
             device->setHQEnabled(hq);
             _z80->t = 0;
             if (i == 1)
+            {
                 ASSERT_TRUE(device->SetPsgClock(kHiresClock));
+            }
             ProgramChannelA(device, 60);  // 1823 Hz at 1.75 MHz, 1563 Hz at 1.5 MHz
             RenderFrames(device, 4);  // the output DC blocker settles from the level step at the start
             const std::vector<int16_t> stream = RenderFrames(device, 12);
@@ -195,6 +197,43 @@ TEST_F(SoundChipTurboSound_Test, TonePitchFollowsTheClock)
         ASSERT_GT(crossings[0], 700u) << "the tone must render (~880 crossings in 12 frames)";
         const double ratio = double(crossings[1]) / double(crossings[0]);
         EXPECT_NEAR(ratio, 6.0 / 7.0, 0.006) << crossings[1] << " / " << crossings[0];
+    }
+}
+
+/// A chip's own buffer (the mixer plays the per-chip buffers) carries that chip alone, in HQ and LQ alike: what the
+/// other chip plays does not reach it. LQ split the summed average by the chips' current levels - signed past the
+/// DC filter - and two chips cancelling each other drove the share to hundreds of times full scale
+TEST_F(SoundChipTurboSound_Test, ChipBufferCarriesThatChipAlone)
+{
+    for (const bool hq : {true, false})
+    {
+        SCOPED_TRACE(hq ? "HQ" : "LQ");
+        std::vector<int16_t> chip0[2];
+        for (int duet = 0; duet < 2; duet++)
+        {
+            SoundManager sound(_context);
+            SoundChip_TurboSound* device = Device(sound);
+            ASSERT_NE(device, nullptr);
+            device->setHQEnabled(hq);
+            _z80->t = 0;
+            device->portDeviceOutMethod(0xFFFD, 0xFE);  // chip 1
+            ProgramChannelA(device, duet ? 97 : 0);     // a tone against chip 0's, or nothing
+            Poke(device, 8, duet ? 15 : 0);
+            device->portDeviceOutMethod(0xFFFD, 0xFF);  // chip 0
+            ProgramChannelA(device, 60);
+            RenderFrames(device, 2);
+            chip0[duet] = RenderFrames(device, 2);
+            if (duet)
+            {
+                const int16_t* chip1 = device->getChipBuffer(1);
+                ASSERT_TRUE(std::any_of(chip1, chip1 + 200, [](int16_t v) { return std::abs(v) > 1000; }))
+                    << "chip 1 must play in the duet";
+            }
+        }
+        ASSERT_EQ(chip0[0].size(), chip0[1].size());
+        ASSERT_GT(chip0[0].size(), 1000u);
+        for (size_t i = 0; i < chip0[0].size(); i++)
+            ASSERT_EQ(chip0[0][i], chip0[1][i]) << "chip 0 sample " << i << " moved with chip 1";
     }
 }
 
@@ -220,7 +259,9 @@ TEST_F(SoundChipTurboSound_Test, SwitchLandsOnItsTStateWithoutAClick)
         StartFrame(device);
         _z80->t = 30000;
         if (device == switched)
+        {
             ASSERT_TRUE(device->SetPsgClock(kHiresClock));
+        }
         StepTo(device, 20000);
         EXPECT_EQ(device->GetPsgClock(), PSG_CLOCK_RATE) << "rendering has not reached T 30000";
         StepTo(device, 30000);
@@ -719,7 +760,9 @@ TEST_P(SoundChipTurboSoundEvents_Test, ToneAndSamplePhaseSurviveEvent)
     m.Frames(1, false, where);
     m.Frames(3, true, where + " (settle)");
     if (event == Event::CoreRate)
+    {
         ASSERT_EQ(m.Rate(), 48000.0) << where;
+    }
 
     ExpectTone(m, reference, where);
     m.Frames(10, true, where + " (after)");
@@ -756,7 +799,7 @@ TEST(SoundChipTurboSoundEventsTtd_Test, SeekAndReplayKeepTheSamplePhaseAndTheTon
         features->setFeature(Features::kDebugMode, true);
         features->setFeature(Features::kTimeTravel, true);
         m.Context()->pMemory->UpdateFeatureCache();
-        ttd::TimeTravelManager* ttd = m.Context()->pTimeTravelManager;
+        ttd::TimeTravelController* ttd = m.Context()->pTimeTravelController;
         ASSERT_NE(ttd, nullptr);
         const uint64_t& frame = m.Context()->emulatorState.frame_counter;
         const uint32_t frameT = m.Context()->config.frame;
@@ -789,7 +832,9 @@ TEST(SoundChipTurboSoundEventsTtd_Test, SeekAndReplayKeepTheSamplePhaseAndTheTon
                 if (f > 11)
                     m.Frame(true, where);
                 if (f > 11)
+                {
                     EXPECT_EQ(m.Context()->pSoundManager->lastTurboSoundPhase(), livePhase[f - 1]) << where << ", frame " << f;
+                }
             }
             ASSERT_EQ(frame, captureFrame) << where;
             const std::vector<double> replay = m.Capture(lastChip, 0.1, where);

@@ -1,29 +1,26 @@
 /**
  * @file slotswindow.cpp
- * @brief The Slots window: DeviceState::Slots, SlotControl::Catalog, SlotManager::PlanChange, SlotChangeController.
+ * @brief SlotsWindow - simplified slot management UI.
  */
 
 #include "slotswindow.h"
 
-#include <QCheckBox>
-#include <QComboBox>
-#include <QFormLayout>
+#include <map>
+#include <sstream>
+
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
-#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSplitter>
+#include <QTableWidget>
 #include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
-#include <algorithm>
-#include <map>
-#include <sstream>
-
 #include "cardslots/slotchangecontroller.h"
+#include "cardslots/slotconfigdialog.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatorbinding.h"
 #include "emulator/emulatorcontext.h"
@@ -33,7 +30,8 @@
 #include "emulator/state/devicestate.h"
 #include "emulator/state/statenodejson.h"
 
-// Qt defines `slots` as a macro; the code below names the slots namespace
+using ConflictInfo = SlotConfigDialog::ConflictInfo;
+
 #undef slots
 
 namespace
@@ -45,39 +43,7 @@ namespace
 
     std::string Text(const StateNode* node)
     {
-        return node != nullptr && node->kind == StateNode::Kind::String ? node->s : std::string();
-    }
-
-    /// "dip=ym,saa gsRam=1m" -> {dip: [ym, saa], gsRam: [1m]}
-    std::map<std::string, std::vector<std::string>> ParseOptions(const std::string& text)
-    {
-        std::map<std::string, std::vector<std::string>> out;
-        std::istringstream words(text);
-        for (std::string word; words >> word;)
-        {
-            const size_t equals = word.find('=');
-            if (equals == std::string::npos)
-                continue;
-            std::vector<std::string>& values = out[word.substr(0, equals)];
-            std::istringstream list(word.substr(equals + 1));
-            for (std::string value; std::getline(list, value, ',');)
-            {
-                if (!value.empty() && value != "none")
-                    values.push_back(value);
-            }
-        }
-        return out;
-    }
-
-    /// Notes for people next to a card's options
-    QString CardNote(const std::string& card)
-    {
-        if (card == "multisound")
-            return QObject::tr("DIP: which parts of the card answer (YM = TurboSound FM + MIDI, SAA, GS, SD = SounDrive). "
-                               "ctrlMask classic: an unofficial firmware patch (issue #11), pro: the official firmware.");
-        if (card == "gs-lw")
-            return QObject::tr("An emulator-only personality of the General Sound: a player, no card firmware.");
-        return {};
+        return node && node->kind == StateNode::Kind::String ? node->s : std::string();
     }
 }  // namespace
 
@@ -93,70 +59,93 @@ SlotsWindow::SlotsWindow(QWidget* parent) : QWidget(parent)
 void SlotsWindow::buildUi()
 {
     auto* layout = new QVBoxLayout(this);
-    _machine = new QLabel(this);
-    _machine->setWordWrap(true);
-    layout->addWidget(_machine);
+    layout->setSpacing(8);
+
+    _machineLabel = new QLabel(this);
+    _machineLabel->setStyleSheet("font-weight: bold; font-size: 14px;");
+    layout->addWidget(_machineLabel);
 
     auto* splitter = new QSplitter(Qt::Vertical, this);
     layout->addWidget(splitter, 1);
 
-    _tree = new QTreeWidget(splitter);
-    _tree->setColumnCount(5);
-    _tree->setHeaderLabels({tr("Bus / slot"), tr("Card"), tr("Options"), tr("Fit"), tr("State")});
-    _tree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    connect(_tree, &QTreeWidget::itemSelectionChanged, this, &SlotsWindow::onTreeSelection);
+    _infoTree = new QTreeWidget(splitter);
+    _infoTree->setColumnCount(5);
+    _infoTree->setHeaderLabels({tr("Bus / Slot"), tr("Card"), tr("Options"), tr("Fit"), tr("State")});
+    _infoTree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    _infoTree->header()->setStretchLastSection(true);
+    _infoTree->setRootIsDecorated(true);
+    _infoTree->setIndentation(16);
+    _infoTree->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _infoTree->setSelectionMode(QAbstractItemView::NoSelection);
 
-    auto* change = new QGroupBox(tr("Change"), splitter);
-    auto* changeLayout = new QVBoxLayout(change);
-    auto* form = new QFormLayout();
-    _slot = new QComboBox(change);
-    _slot->setEditable(true);
-    _slot->setToolTip(tr("A slot of the machine: ay-socket, zxbus.1, ... or <bus>.next for the next free one"));
-    form->addRow(tr("Slot"), _slot);
-    _card = new QComboBox(change);
-    form->addRow(tr("Card"), _card);
-    _optionsBox = new QWidget(change);
-    _optionsLayout = new QVBoxLayout(_optionsBox);
-    _optionsLayout->setContentsMargins(0, 0, 0, 0);
-    form->addRow(tr("Options"), _optionsBox);
-    _cardNote = new QLabel(change);
-    _cardNote->setWordWrap(true);
-    form->addRow(QString(), _cardNote);
-    changeLayout->addLayout(form);
+    auto* bottomPanel = new QWidget(splitter);
+    auto* bottomLayout = new QVBoxLayout(bottomPanel);
+    bottomLayout->setContentsMargins(0, 8, 0, 0);
+    bottomLayout->setSpacing(8);
 
-    auto* buttons = new QHBoxLayout();
-    _plug = new QPushButton(tr("Plug In"), change);
-    _remove = new QPushButton(tr("Remove"), change);
-    _setOptions = new QPushButton(tr("Set Options"), change);
-    _undo = new QPushButton(tr("Undo"), change);
-    _undo->setEnabled(false);
-    buttons->addWidget(_plug);
-    buttons->addWidget(_remove);
-    buttons->addWidget(_setOptions);
-    buttons->addStretch(1);
-    buttons->addWidget(_undo);
-    changeLayout->addLayout(buttons);
+    _machineSlotsLabel = new QLabel(tr("Board Slots"), bottomPanel);
+    _machineSlotsLabel->setStyleSheet("font-weight: bold;");
+    _machineSlotsLabel->setToolTip(tr("Cards of the machine's own slots, set in its configuration ([ISA]); not changed "
+                                      "from this window"));
+    bottomLayout->addWidget(_machineSlotsLabel);
+    _machineSlotsTree = new QTreeWidget(bottomPanel);
+    _machineSlotsTree->setHeaderHidden(true);
+    _machineSlotsTree->setColumnCount(3);
+    _machineSlotsTree->setRootIsDecorated(false);
+    _machineSlotsTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    _machineSlotsTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    _machineSlotsTree->header()->setStretchLastSection(true);
+    _machineSlotsTree->setMaximumHeight(80);
+    bottomLayout->addWidget(_machineSlotsTree);
+    _machineSlotsLabel->hide();
+    _machineSlotsTree->hide();
 
-    _preview = new QPlainTextEdit(change);
-    _preview->setReadOnly(true);
-    _preview->setPlaceholderText(tr("The plan of the change: what it removes, shadows and releases"));
-    changeLayout->addWidget(_preview, 1);
+    auto* slotsHeader = new QHBoxLayout();
+    auto* slotsLabel = new QLabel(tr("Expansion Slots"), bottomPanel);
+    slotsLabel->setStyleSheet("font-weight: bold;");
+    slotsHeader->addWidget(slotsLabel);
+    slotsHeader->addStretch(1);
+    _addButton = new QPushButton("+", bottomPanel);
+    _addButton->setFixedWidth(30);
+    _addButton->setToolTip(tr("Add a new slot"));
+    _removeButton = new QPushButton("-", bottomPanel);
+    _removeButton->setFixedWidth(30);
+    _removeButton->setToolTip(tr("Remove selected slot"));
+    slotsHeader->addWidget(_addButton);
+    slotsHeader->addWidget(_removeButton);
+    bottomLayout->addLayout(slotsHeader);
 
-    connect(_plug, &QPushButton::clicked, this, &SlotsWindow::plugChosen);
-    connect(_remove, &QPushButton::clicked, this, &SlotsWindow::removeChosen);
-    connect(_setOptions, &QPushButton::clicked, this, &SlotsWindow::setChosenOptions);
-    connect(_undo, &QPushButton::clicked, this, &SlotsWindow::undoLast);
-    connect(_slot, &QComboBox::currentTextChanged, this, [this]() {
-        if (!_loading)
-            updatePreview();
+    _slotsTable = new QTableWidget(bottomPanel);
+    _slotsTable->setColumnCount(3);
+    _slotsTable->setHorizontalHeaderLabels({tr("Slot"), tr("Card"), QString()});
+    _slotsTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    _slotsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    _slotsTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+    _slotsTable->horizontalHeader()->resizeSection(2, 36);
+    _slotsTable->verticalHeader()->setVisible(false);
+    _slotsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    _slotsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    _slotsTable->setAlternatingRowColors(true);
+    _slotsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    bottomLayout->addWidget(_slotsTable, 1);
+
+    auto* buttonRow = new QHBoxLayout();
+    buttonRow->addStretch(1);
+    _undoButton = new QPushButton(tr("Undo"), bottomPanel);
+    _undoButton->setEnabled(false);
+    buttonRow->addWidget(_undoButton);
+    bottomLayout->addLayout(buttonRow);
+
+    splitter->setSizes({300, 200});
+
+    connect(_addButton, &QPushButton::clicked, this, &SlotsWindow::onAddSlot);
+    connect(_removeButton, &QPushButton::clicked, this, &SlotsWindow::onRemoveSlot);
+    connect(_undoButton, &QPushButton::clicked, this, &SlotsWindow::undoLast);
+    connect(_slotsTable, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
+        onConfigureSlot(row);
     });
-    connect(_card, &QComboBox::currentIndexChanged, this, [this]() {
-        if (_loading)
-            return;
-        rebuildOptionEditors();
-        updatePreview();
-    });
-    resize(760, 680);
+
+    resize(760, 600);
 }
 
 void SlotsWindow::setBinding(EmulatorBinding* binding)
@@ -181,8 +170,8 @@ void SlotsWindow::setController(SlotChangeController* controller)
     if (_controller)
     {
         connect(_controller, &SlotChangeController::undoAvailable, this, [this](bool available) {
-            _undo->setEnabled(available);
-            _undo->setToolTip(available ? tr("Undo: %1").arg(_controller->UndoText()) : QString());
+            _undoButton->setEnabled(available);
+            _undoButton->setToolTip(available ? tr("Undo: %1").arg(_controller->UndoText()) : QString());
         });
         connect(_controller, &SlotChangeController::applied, this, [this]() {
             _shownReport.clear();
@@ -225,43 +214,46 @@ void SlotsWindow::refresh()
     _report = report;
 
     const StateNode* available = report.find("available");
-    const bool ok = available != nullptr && available->b;
-    _plug->setEnabled(ok);
-    _remove->setEnabled(ok);
-    _setOptions->setEnabled(ok);
+    const bool ok = available && available->b;
+    _addButton->setEnabled(ok);
+    _removeButton->setEnabled(ok);
+
     if (!ok)
     {
-        _machine->setText(tr("No machine: %1").arg(Q(Text(report.find("description")))));
-        _tree->clear();
-        _card->clear();
-        _slot->clear();
-        _preview->clear();
+        _machineLabel->setText(tr("No machine"));
+        _infoTree->clear();
+        _slotsTable->setRowCount(0);
+        _machineSlotsTree->clear();
+        _machineSlotsLabel->hide();
+        _machineSlotsTree->hide();
         return;
     }
-    _machine->setText(tr("<b>%1</b> - %2; cards from %3")
-                          .arg(Q(Text(report.find("model"))), Q(Text(report.find("board"))), Q(Text(report.find("source")))));
-    fillTree(report);
-    fillSlotChoices(report);
+
+    _machineLabel->setText(Q(Text(report.find("model"))));
+    fillInfoTree(report);
+    fillMachineSlots(report);
+    fillSlots(report);
+
     SlotManager* manager = context->pSlotManager;
-    fillCatalog(manager ? SlotControl::Catalog(manager->Snapshot()) : StateNode::Array());
-    updatePreview();
+    _catalog = manager ? SlotControl::Catalog(manager->Snapshot()) : StateNode::Array();
 }
 
-void SlotsWindow::fillTree(const StateNode& report)
+void SlotsWindow::fillInfoTree(const StateNode& report)
 {
-    _tree->clear();
+    _infoTree->clear();
     std::map<std::string, QTreeWidgetItem*> buses;
+
     if (const StateNode* list = report.find("buses"))
     {
         for (const StateNode& bus : list->items)
         {
-            auto* item = new QTreeWidgetItem(_tree);
+            auto* item = new QTreeWidgetItem(_infoTree);
             const std::string id = Text(bus.find("id"));
             item->setText(0, Q(id));
             item->setText(1, Q(Text(bus.find("kind"))));
             item->setText(4, tr("arbitration %1").arg(Q(Text(bus.find("arbitration")))));
             const StateNode* retrofit = bus.find("retrofit");
-            if (retrofit != nullptr && retrofit->b)
+            if (retrofit && retrofit->b)
             {
                 item->setText(3, tr("retrofitted"));
                 item->setToolTip(0, Q(Text(bus.find("retrofitNote"))));
@@ -270,6 +262,7 @@ void SlotsWindow::fillTree(const StateNode& report)
             buses[id] = item;
         }
     }
+
     if (const StateNode* list = report.find("slots"))
     {
         for (const StateNode& slot : list->items)
@@ -277,7 +270,7 @@ void SlotsWindow::fillTree(const StateNode& report)
             const std::string id = Text(slot.find("slot"));
             const std::string busId = id.substr(0, id.find('.'));
             QTreeWidgetItem* parent = buses.count(busId) ? buses[busId] : nullptr;
-            auto* item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(_tree);
+            auto* item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(_infoTree);
             item->setText(0, Q(id));
             item->setText(1, Q(Text(slot.find("card"))));
             item->setToolTip(1, Q(Text(slot.find("name"))));
@@ -288,10 +281,10 @@ void SlotsWindow::fillTree(const StateNode& report)
             const std::string reason = Text(slot.find("reason"));
             if (!reason.empty())
                 item->setToolTip(4, Q(reason));
-            item->setData(0, Qt::UserRole, Q(id));
         }
     }
-    auto* builtIns = new QTreeWidgetItem(_tree);
+
+    auto* builtIns = new QTreeWidgetItem(_infoTree);
     builtIns->setText(0, tr("Built-in devices"));
     builtIns->setExpanded(true);
     if (const StateNode* list = report.find("builtIns"))
@@ -307,280 +300,230 @@ void SlotsWindow::fillTree(const StateNode& report)
     }
 }
 
-void SlotsWindow::fillSlotChoices(const StateNode& report)
+void SlotsWindow::fillSlots(const StateNode& report)
 {
-    const QString current = _slot->currentText();
-    _loading = true;
-    _slot->clear();
-    QStringList choices;
+    _slotsTable->setRowCount(0);
+
     if (const StateNode* list = report.find("slots"))
     {
         for (const StateNode& slot : list->items)
-            choices << Q(Text(slot.find("slot")));
-    }
-    if (const StateNode* list = report.find("buses"))
-    {
-        for (const StateNode& bus : list->items)
         {
-            const std::string id = Text(bus.find("id"));
-            choices << (id == "ay-socket" ? Q(id) : Q(id + ".next"));
-        }
-    }
-    choices.removeDuplicates();
-    _slot->addItems(choices);
-    _slot->setCurrentText(current.isEmpty() && !choices.isEmpty() ? choices.first() : current);
-    _loading = false;
-}
+            const std::string slotId = Text(slot.find("slot"));
+            const std::string cardId = Text(slot.find("card"));
+            const std::string cardName = Text(slot.find("name"));
+            const std::string options = Text(slot.find("options"));
 
-void SlotsWindow::fillCatalog(const StateNode& cards)
-{
-    const QString current = _card->currentData().toString();
-    _loading = true;
-    _catalog = cards;
-    _card->clear();
-    for (const StateNode& card : cards.items)
-    {
-        const StateNode* here = card.find("thisMachine");
-        const std::string outcome = here ? Text(here->find("outcome")) : std::string();
-        QString label = Q(Text(card.find("id"))) + " - " + Q(Text(card.find("name")));
-        if (outcome == "needs-replace")
-            label += tr("  (replaces cards)");
-        else if (outcome == "refused")
-            label += tr("  (does not fit)");
-        const StateNode* emulated = card.find("emulated");
-        if (emulated != nullptr && !emulated->b)
-            label += tr("  [not emulated]");
-        _card->addItem(label, Q(Text(card.find("id"))));
-        QStringList tip;
-        if (here)
-        {
-            tip << tr("Here: %1 in %2, fit %3").arg(Q(outcome), Q(Text(here->find("slot"))), Q(Text(here->find("fit"))));
-            for (const StateNode& reason : here->find("reasons")->items)
-                tip << Q(reason.s);
-        }
-        _card->setItemData(_card->count() - 1, tip.join("\n"), Qt::ToolTipRole);
-    }
-    const int index = _card->findData(current);
-    _card->setCurrentIndex(index >= 0 ? index : 0);
-    _loading = false;
-    rebuildOptionEditors();
-}
+            const int row = _slotsTable->rowCount();
+            _slotsTable->insertRow(row);
 
-void SlotsWindow::rebuildOptionEditors()
-{
-    while (QLayoutItem* item = _optionsLayout->takeAt(0))
-    {
-        delete item->widget();
-        delete item;
-    }
-    _editors.clear();
-    const std::string cardId = _card->currentData().toString().toStdString();
-    _cardNote->setText(CardNote(cardId));
-    _cardNote->setVisible(!_cardNote->text().isEmpty());
-    const StateNode* card = nullptr;
-    for (const StateNode& c : _catalog.items)
-    {
-        if (Text(c.find("id")) == cardId)
-            card = &c;
-    }
-    if (card == nullptr)
-        return;
-    // The slot's own options when it holds this card, else the defaults
-    std::map<std::string, std::vector<std::string>> given;
-    if (const StateNode* slots = _report.find("slots"))
-    {
-        for (const StateNode& slot : slots->items)
-        {
-            if (Q(Text(slot.find("slot"))) == _slot->currentText() && Text(slot.find("card")) == cardId)
-                given = ParseOptions(Text(slot.find("options")));
-        }
-    }
-    for (const StateNode& option : card->find("options")->items)
-    {
-        OptionEditor editor;
-        editor.name = Text(option.find("name"));
-        editor.set = Text(option.find("kind")) == "set";
-        std::vector<std::string> values = given.count(editor.name) ? given[editor.name] : std::vector<std::string>{};
-        if (!given.count(editor.name))
-        {
-            std::istringstream defaults(Text(option.find("default")));
-            for (std::string value; std::getline(defaults, value, ',');)
-                values.push_back(value);
-        }
-        auto* row = new QWidget(_optionsBox);
-        auto* rowLayout = new QHBoxLayout(row);
-        rowLayout->setContentsMargins(0, 0, 0, 0);
-        auto* label = new QLabel(Q(editor.name), row);
-        label->setToolTip(Q(Text(option.find("description"))));
-        label->setMinimumWidth(70);
-        rowLayout->addWidget(label);
-        if (editor.set)
-        {
-            for (const StateNode& value : option.find("values")->items)
+            auto* slotItem = new QTableWidgetItem(Q(slotId));
+            slotItem->setData(Qt::UserRole, Q(slotId));
+            slotItem->setData(Qt::UserRole + 1, Q(cardId));
+            slotItem->setData(Qt::UserRole + 2, Q(options));
+            _slotsTable->setItem(row, 0, slotItem);
+
+            QString cardText;
+            if (cardId.empty())
             {
-                const std::string id = Text(value.find("id"));
-                auto* box = new QCheckBox(Q(id), row);
-                box->setChecked(std::find(values.begin(), values.end(), id) != values.end());
-                connect(box, &QCheckBox::toggled, this, &SlotsWindow::updatePreview);
-                rowLayout->addWidget(box);
-                editor.boxes.emplace_back(id, box);
+                cardText = tr("(empty)");
             }
-        }
-        else
-        {
-            editor.combo = new QComboBox(row);
-            for (const StateNode& value : option.find("values")->items)
-                editor.combo->addItem(Q(Text(value.find("label"))).remove('`'), Q(Text(value.find("id"))));
-            const int index = values.empty() ? -1 : editor.combo->findData(Q(values.front()));
-            if (index >= 0)
-                editor.combo->setCurrentIndex(index);
-            connect(editor.combo, &QComboBox::currentIndexChanged, this, &SlotsWindow::updatePreview);
-            rowLayout->addWidget(editor.combo);
-        }
-        rowLayout->addStretch(1);
-        _optionsLayout->addWidget(row);
-        _editors.push_back(std::move(editor));
-    }
-}
-
-QString SlotsWindow::optionsText() const
-{
-    QStringList words;
-    for (const OptionEditor& editor : _editors)
-    {
-        QStringList values;
-        if (editor.set)
-        {
-            for (const auto& [id, box] : editor.boxes)
+            else
             {
-                if (box->isChecked())
-                    values << Q(id);
+                cardText = Q(cardName.empty() ? cardId : cardName);
+                const std::string host = Text(slot.find("host"));
+                if (!host.empty())
+                    cardText += tr(" (on %1)").arg(Q(Text(slot.find("bus"))));
             }
-        }
-        else if (editor.combo)
-        {
-            values << editor.combo->currentData().toString();
-        }
-        words << Q(editor.name) + "=" + (values.isEmpty() ? QStringLiteral("none") : values.join(","));
-    }
-    return words.join(" ");
-}
 
-void SlotsWindow::choose(const QString& slot, const QString& card, const QString& options)
-{
-    _slot->setCurrentText(slot);
-    const int index = _card->findData(card);
-    if (index >= 0)
-        _card->setCurrentIndex(index);
-    rebuildOptionEditors();
-    if (!options.isEmpty())
-    {
-        const auto given = ParseOptions(options.toStdString());
-        for (OptionEditor& editor : _editors)
-        {
-            auto it = given.find(editor.name);
-            if (it == given.end())
-                continue;
-            for (auto& [id, box] : editor.boxes)
-                box->setChecked(std::find(it->second.begin(), it->second.end(), id) != it->second.end());
-            if (editor.combo && !it->second.empty())
-                editor.combo->setCurrentIndex(std::max(0, editor.combo->findData(Q(it->second.front()))));
+            auto* cardItem = new QTableWidgetItem(cardText);
+            if (cardId.empty())
+                cardItem->setForeground(QColor(128, 128, 128));
+            if (!options.empty())
+                cardItem->setToolTip(Q(options));
+            _slotsTable->setItem(row, 1, cardItem);
+
+            auto* configBtn = new QPushButton("...", _slotsTable);
+            configBtn->setFixedSize(30, 24);
+            connect(configBtn, &QPushButton::clicked, this, [this, row]() {
+                onConfigureSlot(row);
+            });
+            _slotsTable->setCellWidget(row, 2, configBtn);
         }
     }
-    updatePreview();
 }
 
-QString SlotsWindow::previewText() const
+void SlotsWindow::fillMachineSlots(const StateNode& report)
 {
-    return _preview->toPlainText();
+    _machineSlotsTree->clear();
+    const StateNode* list = report.find("machineSlots");
+    const bool any = list != nullptr && list->size() > 0;
+    _machineSlotsLabel->setVisible(any);
+    _machineSlotsTree->setVisible(any);
+    if (!any)
+        return;
+    for (const StateNode& slot : list->items)
+    {
+        auto* item = new QTreeWidgetItem(_machineSlotsTree);
+        item->setText(0, Q(Text(slot.find("slot"))));
+        item->setText(1, Q(Text(slot.find("name"))));
+        const std::string hosts = Text(slot.find("hostsBus"));
+        const std::string details = Text(slot.find("details"));
+        item->setText(2, !hosts.empty() ? tr("hosts %1: %2").arg(Q(hosts), Q(Text(slot.find("hostedCard"))))
+                                        : Q(details));
+        item->setToolTip(0, tr("from %1").arg(Q(Text(slot.find("source")))));
+    }
 }
 
-void SlotsWindow::updatePreview()
+QString SlotsWindow::slotsText() const
 {
-    Emulator* emulator = _binding ? _binding->emulator() : nullptr;
-    SlotManager* manager = emulator && emulator->GetContext() ? emulator->GetContext()->pSlotManager : nullptr;
-    const std::string cardId = _card->currentData().toString().toStdString();
-    static const slots::SlotPlanner planner;
-    const slots::CardDef* card = planner.FindCard(cardId);
-    if (!manager || !card)
+    QStringList lines;
+    for (int i = 0; i < _slotsTable->rowCount(); i++)
     {
-        _preview->clear();
-        return;
+        const QString slot = _slotsTable->item(i, 0)->text();
+        const QString card = _slotsTable->item(i, 1)->text();
+        lines << slot + ": " + card;
     }
-    // The slot holds this card: the change is its options; else a plug
-    slots::SlotRequest request;
-    request.replaceIfIncompatible = true;   // the GUI replaces (Q1); the plan names what goes
-    request.slot = _slot->currentText().trimmed().toStdString();
-    const SlotManager::Result current = manager->Snapshot();
-    const SlotManager::Slot* fitted = current.FindSlot(request.slot);
-    std::string error;
-    if (fitted != nullptr && fitted->entry.card == cardId)
+    for (int i = 0; i < _machineSlotsTree->topLevelItemCount(); i++)
     {
-        request.op = slots::SlotRequest::Op::SetOptions;
-        request.card = cardId;
+        const QTreeWidgetItem* item = _machineSlotsTree->topLevelItem(i);
+        lines << "board " + item->text(0) + " | " + item->text(1) + " | " + item->text(2);
     }
-    else
-    {
-        request.op = slots::SlotRequest::Op::Plug;
-        request.card = cardId;
-    }
-    if (!slots::ParseCardOptions(*card, optionsText().toStdString(), request.options, &error))
-    {
-        _preview->setPlainText(tr("Options: %1").arg(Q(error)));
-        return;
-    }
-    _preview->setPlainText(SlotChangeController::PlanText(manager->PlanChange(request)).join("\n"));
+    return lines.join('\n');
 }
 
-void SlotsWindow::onTreeSelection()
+void SlotsWindow::onAddSlot()
 {
-    const QList<QTreeWidgetItem*> selected = _tree->selectedItems();
-    if (selected.isEmpty())
+    const std::string slotId = nextFreeSlot();
+    if (slotId.empty())
         return;
-    const QString slot = selected.first()->data(0, Qt::UserRole).toString();
-    if (slot.isEmpty())
-        return;
-    choose(slot, selected.first()->text(1), selected.first()->text(2));
-}
 
-void SlotsWindow::plugChosen()
-{
-    static const slots::SlotPlanner planner;
-    const std::string cardId = _card->currentData().toString().toStdString();
-    const slots::CardDef* card = planner.FindCard(cardId);
-    if (!_controller || !card)
+    if (!_controller)
         return;
+
     slots::SlotRequest request;
     request.op = slots::SlotRequest::Op::Plug;
-    request.slot = _slot->currentText().trimmed().toStdString();
-    request.card = cardId;
-    if (!slots::ParseCardOptions(*card, optionsText().toStdString(), request.options))
+    request.slot = slotId;
+    request.card = "";
+    _controller->Apply(currentEmulatorId(), request, this);
+
+    QTimer::singleShot(200, this, [this]() {
+        refresh();
+        if (_slotsTable->rowCount() > 0)
+        {
+            const int lastRow = _slotsTable->rowCount() - 1;
+            _slotsTable->selectRow(lastRow);
+            onConfigureSlot(lastRow);
+        }
+    });
+}
+
+void SlotsWindow::onRemoveSlot()
+{
+    const int row = _slotsTable->currentRow();
+    if (row < 0 || !_controller)
         return;
+
+    auto* item = _slotsTable->item(row, 0);
+    if (!item)
+        return;
+
+    const std::string slotId = item->data(Qt::UserRole).toString().toStdString();
+    slots::SlotRequest request;
+    request.op = slots::SlotRequest::Op::Remove;
+    request.slot = slotId;
     _controller->Apply(currentEmulatorId(), request, this);
 }
 
-void SlotsWindow::removeChosen()
+void SlotsWindow::onConfigureSlot(int row)
+{
+    if (row < 0 || row >= _slotsTable->rowCount())
+        return;
+
+    auto* item = _slotsTable->item(row, 0);
+    if (!item)
+        return;
+
+    const std::string slotId = item->data(Qt::UserRole).toString().toStdString();
+    const std::string cardId = item->data(Qt::UserRole + 1).toString().toStdString();
+    const std::string options = item->data(Qt::UserRole + 2).toString().toStdString();
+
+    auto* dialog = new SlotConfigDialog(this);
+    dialog->setSlotId(slotId);
+    dialog->setCatalog(_catalog);
+    dialog->setCurrentCard(cardId, options);
+
+    Emulator* emulator = _binding ? _binding->emulator() : nullptr;
+    SlotManager* manager = emulator && emulator->GetContext() ? emulator->GetContext()->pSlotManager : nullptr;
+    if (manager)
+    {
+        dialog->setConflictProvider([manager, slotId](const std::string& cardId) -> SlotConfigDialog::ConflictInfo {
+            SlotConfigDialog::ConflictInfo info;
+            slots::SlotRequest req;
+            req.op = slots::SlotRequest::Op::Plug;
+            req.slot = slotId;
+            req.card = cardId;
+            req.replaceIfIncompatible = true;
+            const SlotManager::ChangePlan plan = manager->PlanChange(req);
+            for (const auto& r : plan.plan.removed)
+                info.removedCards.push_back(r.card + " (" + r.slot + ")");
+            for (const auto& b : plan.plan.builtInSwitchedOff)
+                info.disabledBuiltIns.push_back(b.builtIn);
+            info.needsRestart = true;
+            return info;
+        });
+    }
+
+    connect(dialog, &SlotConfigDialog::accepted, this, &SlotsWindow::onSlotDialogAccepted);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->show();
+}
+
+void SlotsWindow::onSlotDialogAccepted(const std::string& slotId, const std::string& cardId, const std::string& options)
 {
     if (!_controller)
         return;
-    slots::SlotRequest request;
-    request.op = slots::SlotRequest::Op::Remove;
-    request.slot = _slot->currentText().trimmed().toStdString();
-    _controller->Apply(currentEmulatorId(), request, this);
-}
 
-void SlotsWindow::setChosenOptions()
-{
     static const slots::SlotPlanner planner;
-    const slots::CardDef* card = planner.FindCard(_card->currentData().toString().toStdString());
-    if (!_controller || !card)
-        return;
     slots::SlotRequest request;
-    request.op = slots::SlotRequest::Op::SetOptions;
-    request.slot = _slot->currentText().trimmed().toStdString();
-    request.card = card->id;
-    if (!slots::ParseCardOptions(*card, optionsText().toStdString(), request.options))
-        return;
+    request.slot = slotId;
+    request.replaceIfIncompatible = true;
+
+    if (cardId.empty())
+    {
+        request.op = slots::SlotRequest::Op::Remove;
+    }
+    else
+    {
+        const slots::CardDef* card = planner.FindCard(cardId);
+        if (!card)
+            return;
+
+        const StateNode* currentSlot = nullptr;
+        if (const StateNode* slotsNode = _report.find("slots"))
+        {
+            for (const StateNode& s : slotsNode->items)
+            {
+                if (Text(s.find("slot")) == slotId)
+                {
+                    currentSlot = &s;
+                    break;
+                }
+            }
+        }
+
+        if (currentSlot && Text(currentSlot->find("card")) == cardId)
+        {
+            request.op = slots::SlotRequest::Op::SetOptions;
+        }
+        else
+        {
+            request.op = slots::SlotRequest::Op::Plug;
+        }
+
+        request.card = cardId;
+        slots::ParseCardOptions(*card, options, request.options);
+    }
+
     _controller->Apply(currentEmulatorId(), request, this);
 }
 
@@ -588,4 +531,169 @@ void SlotsWindow::undoLast()
 {
     if (_controller)
         _controller->Undo(this);
+}
+
+std::string SlotsWindow::nextFreeSlot() const
+{
+    if (const StateNode* buses = _report.find("buses"))
+    {
+        for (const StateNode& bus : buses->items)
+        {
+            const std::string id = Text(bus.find("id"));
+            // A hosted bus (the ZX-bus adapter's) is reached through its host slot, not as "<bus>.next"
+            if (id != "ay-socket" && Text(bus.find("host")).empty())
+                return id + ".next";
+        }
+    }
+    return "zxbus.next";
+}
+
+void SlotsWindow::choose(const QString& slot, const QString& card, const QString& options)
+{
+    _testSlot = slot;
+    _testCard = card;
+    _testOptions = mergeOptionsWithDefaults(card.toStdString(), options.toStdString());
+}
+
+QString SlotsWindow::previewText() const
+{
+    Emulator* emulator = _binding ? _binding->emulator() : nullptr;
+    SlotManager* manager = emulator && emulator->GetContext() ? emulator->GetContext()->pSlotManager : nullptr;
+    if (!manager || _testCard.isEmpty())
+        return {};
+
+    static const slots::SlotPlanner planner;
+    const slots::CardDef* card = planner.FindCard(_testCard.toStdString());
+    if (!card)
+        return {};
+
+    const SlotManager::Result snapshot = manager->Snapshot();
+    const SlotManager::Slot* fitted = nullptr;
+    for (const SlotManager::Slot& s : snapshot.entries)
+    {
+        if (s.entry.slot == _testSlot.toStdString())
+        {
+            fitted = &s;
+            break;
+        }
+    }
+
+    slots::SlotRequest req;
+    req.replaceIfIncompatible = true;
+    req.slot = _testSlot.toStdString();
+    req.card = _testCard.toStdString();
+    slots::ParseCardOptions(*card, _testOptions.toStdString(), req.options);
+
+    if (fitted && fitted->entry.card == _testCard.toStdString())
+        req.op = slots::SlotRequest::Op::SetOptions;
+    else
+        req.op = slots::SlotRequest::Op::Plug;
+
+    return SlotChangeController::PlanText(manager->PlanChange(req)).join("\n");
+}
+
+QString SlotsWindow::optionsText() const
+{
+    return _testOptions;
+}
+
+void SlotsWindow::plugChosen()
+{
+    if (!_controller || _testCard.isEmpty())
+        return;
+
+    static const slots::SlotPlanner planner;
+    const slots::CardDef* card = planner.FindCard(_testCard.toStdString());
+    if (!card)
+        return;
+
+    slots::SlotRequest req;
+    req.op = slots::SlotRequest::Op::Plug;
+    req.slot = _testSlot.toStdString();
+    req.card = _testCard.toStdString();
+    slots::ParseCardOptions(*card, _testOptions.toStdString(), req.options);
+    _controller->Apply(currentEmulatorId(), req, this);
+}
+
+void SlotsWindow::removeChosen()
+{
+    if (!_controller)
+        return;
+
+    slots::SlotRequest req;
+    req.op = slots::SlotRequest::Op::Remove;
+    req.slot = _testSlot.toStdString();
+    _controller->Apply(currentEmulatorId(), req, this);
+}
+
+void SlotsWindow::setChosenOptions()
+{
+    if (!_controller || _testCard.isEmpty())
+        return;
+
+    static const slots::SlotPlanner planner;
+    const slots::CardDef* card = planner.FindCard(_testCard.toStdString());
+    if (!card)
+        return;
+
+    slots::SlotRequest req;
+    req.op = slots::SlotRequest::Op::SetOptions;
+    req.slot = _testSlot.toStdString();
+    req.card = _testCard.toStdString();
+    slots::ParseCardOptions(*card, _testOptions.toStdString(), req.options);
+    _controller->Apply(currentEmulatorId(), req, this);
+}
+
+QString SlotsWindow::defaultOptionsFor(const std::string& cardId) const
+{
+    for (const StateNode& card : _catalog.items)
+    {
+        if (Text(card.find("id")) != cardId)
+            continue;
+        const StateNode* options = card.find("options");
+        if (!options)
+            return {};
+        QStringList parts;
+        for (const StateNode& opt : options->items)
+        {
+            parts << Q(Text(opt.find("name"))) + "=" + Q(Text(opt.find("default")));
+        }
+        return parts.join(" ");
+    }
+    return {};
+}
+
+QString SlotsWindow::mergeOptionsWithDefaults(const std::string& cardId, const std::string& given) const
+{
+    std::vector<std::pair<std::string, std::string>> merged;
+    for (const StateNode& card : _catalog.items)
+    {
+        if (Text(card.find("id")) != cardId)
+            continue;
+        const StateNode* options = card.find("options");
+        if (!options)
+            break;
+        for (const StateNode& opt : options->items)
+        {
+            const std::string name = Text(opt.find("name"));
+            merged.emplace_back(name, Text(opt.find("default")));
+        }
+        break;
+    }
+    std::map<std::string, std::string> givenMap;
+    std::istringstream words(given);
+    for (std::string word; words >> word;)
+    {
+        const size_t eq = word.find('=');
+        if (eq != std::string::npos)
+            givenMap[word.substr(0, eq)] = word.substr(eq + 1);
+    }
+    QStringList parts;
+    for (auto& [name, value] : merged)
+    {
+        if (givenMap.count(name))
+            value = givenMap[name];
+        parts << Q(name) + "=" + Q(value);
+    }
+    return parts.join(" ");
 }

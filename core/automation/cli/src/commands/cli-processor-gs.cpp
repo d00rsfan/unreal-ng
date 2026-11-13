@@ -2,7 +2,7 @@
 // Same chip getters the WebAPI /state/audio/gs endpoint serves.
 
 #include <emulator/emulator.h>
-#include <debugger/ttd/timetravelmanager.h>
+#include <debugger/ttd/timetravelcontroller.h>
 #include <emulator/emulatorcontext.h>
 #include <emulator/sound/chips/gs/soundchip_gs.h>
 #include <emulator/sound/chips/neogs/neogsmedia.h>
@@ -28,6 +28,7 @@ const char* GsTraceSideName(GSTraceSide side)
         case GSTraceSide::DacFetch: return "DAC";
         case GSTraceSide::Interrupt: return "INT";
         case GSTraceSide::ZxDma: return "ZXDMA";
+        case GSTraceSide::Idle: return "IDLE";
     }
     return "?";
 }
@@ -165,6 +166,8 @@ void CLIProcessor::HandleGSPortTrace(const ClientSession& session, const std::ve
                 ss << " ch=" << std::dec << (int)e.channel;
             if (e.side == GSTraceSide::Interrupt && e.isNmi())
                 ss << " (NMI)";
+            if (e.side == GSTraceSide::Idle)
+                ss << " x" << std::dec << e.iterations;
             ss << std::dec << NEWLINE;
         }
     }
@@ -349,7 +352,7 @@ void CLIProcessor::HandleGS(const ClientSession& session, const std::vector<std:
     else if (sub == "sd_insert" || sub == "sd_eject" || sub == "flash_save")
     {
         // Checked here, carried out on the machine's thread (neogsmedia.h);
-        // insert / eject are refused while a TTD recording runs
+        // insert / eject follow the media rules (while TTD records: an event at the next frame boundary)
         const NeoGSMediaResult result = sub == "sd_insert" ? NeoGSRequestSdInsert(context, args.size() > 1 ? args[1] : std::string())
                                         : sub == "sd_eject" ? NeoGSRequestSdEject(context)
                                                             : NeoGSRequestFlashSave(context);

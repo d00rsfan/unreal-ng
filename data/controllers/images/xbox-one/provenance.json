@@ -1,0 +1,38 @@
+{
+  "family": "xbox-one",
+  "images": [
+    {
+      "view": "front",
+      "title": "Xbox One S Wireless Controller, Robot White",
+      "source": "tools/poc/033-vector-controller-pictures/generate.py",
+      "author": "unreal-ng",
+      "licence": "same as the repository",
+      "terms": "vector drawing from measured dimensions; photos used as references only, nothing traced",
+      "retouch": "none; platform logos left out (D5)",
+      "references": [
+        {
+          "what": "plan 153 x 102 mm, height 61 mm (6.02 x 4.01 x 2.40 in)",
+          "source": "retail listings of the Xbox Wireless Controller (pcrichard.com QAU-00090, nfm.com 64696412)",
+          "retrieved": "2026-10-23"
+        },
+        {
+          "what": "the outline (trace.py, the half mirrored, overlap 0.985) and the control positions and sizes, scaled to 153 mm: the plus-shaped D-pad, no Share, the top plate's crease round Guide, the trigger tips over the bumpers",
+          "source": "https://commons.wikimedia.org/wiki/File:Xbox_One_Controller_Recon_Tech_Special_Edition.jpg",
+          "author": "Spritekollision",
+          "licence": "CC BY-SA 4.0",
+          "use": "measured geometry only (trace.py outline, positions); not traced into the picture",
+          "retrieved": "2026-11-01",
+          "note": "a straight top view of a model 1708; about 0.7 mm"
+        },
+        {
+          "what": "the Robot White colours: white shell, black sticks, D-pad and face buttons",
+          "source": "https://commons.wikimedia.org/wiki/File:Xbox_One_S_controller_(cropped).jpg",
+          "author": "Ratianidze",
+          "licence": "CC BY-SA 3.0",
+          "use": "reference only, not traced",
+          "retrieved": "2026-10-23"
+        }
+      ]
+    }
+  ]
+}

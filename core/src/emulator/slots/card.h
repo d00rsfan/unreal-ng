@@ -31,11 +31,15 @@
 #include <vector>
 
 #include "debugger/ttd/ttdserializable.h"
+#include "emulator/io/controllers/controllertypes.h"
 #include "emulator/ports/portdecoder.h"
 #include "emulator/slots/slotplanner.h"
 #include "emulator/sound/audiodeviceinfo.h"
+#include "emulator/sound/mixerchannel.h"
+#include "emulator/sound/cardaudio.h"
 
 class EmulatorContext;
+class GeneralSoundCard;
 namespace ttd
 {
 class ITTDRegionSource;
@@ -50,27 +54,25 @@ struct CardContext
     slots::CardOptions options;             ///< as planned
 };
 
-/// One mixer row a card contributes to SoundManager
-struct CardMixerRow
-{
-    AudioSourceType type = AudioSourceType::Custom;
-    std::string name;
-    /// An AY / SSG row: SoundManager runs it through the AY / SSG tone voicing ([SOUND] AYVoicing), exactly like the
-    /// AY socket's chips (the card hands the row over writable through VoicedMixerBuffer)
-    bool ssgVoicing = false;
-};
-
 /// One time-travel device of a card (a card may carry several modules, each with its own blob)
 struct CardTtdDevice
 {
-    ttd::PeripheralId id = ttd::PeripheralId::Count;
-    ttd::TTDSerializable* device = nullptr;          ///< owned by the card
+    ttd::TTDSerializable* device = nullptr;          ///< owned by the card; its type is its own (TTDDescribe)
     std::string instance;                            ///< the engine's instance name: "<slot>.<card>[.<module>]"
     ttd::ITTDRegionSource* regions = nullptr;        ///< memory the engine records as regions (a GS RAM); may be null
 };
 
+/// A joystick socket a card brings (controller manager retro-devices.md §1): ControllerManager::Rebuild lists it while
+/// the card is fitted, with the card as its owner (ControllerManager::OwnedState)
+struct CardConnector
+{
+    std::string id;  ///< "fuller"; a second card of the kind gets ".2" appended
+    controllers::ConnectorKind kind = controllers::ConnectorKind::Fuller;
+    controllers::RetroDeviceKind device = controllers::RetroDeviceKind::None;  ///< fixed: the card's own device
+};
+
 /// A running card (architecture.md §3.2). Every call comes from the emulation thread
-class ICard : public PortDevice
+class ICard : public PortDevice, public ICardAudio
 {
 public:
     explicit ICard(const CardContext& context) : _def(context.def), _slot(context.slot), _options(context.options)
@@ -101,10 +103,7 @@ public:
     /// data bus alone
     virtual uint8_t Peek(uint16_t port, bool& drives) const = 0;
 
-    /// Bus /RESET (the machine's reset)
-    virtual void BusReset()
-    {
-    }
+    /// Bus /RESET: ICardAudio::BusReset
     /// endregion </Bus>
 
     /// A host MIDI panic (the TTD input MidiPanic, applied at an instruction boundary): the card's MIDI synthesizer
@@ -114,67 +113,25 @@ public:
         return false;
     }
 
-    /// region <Frames and audio (SoundManager)>
-    virtual void FrameStart()
+    /// The General Sound the card carries (the MultiSound's): the debugger's `ms` CPU (gs-debugger design §3.1);
+    /// nullptr for a card without one
+    virtual GeneralSoundCard* DebugGeneralSound()
     {
+        return nullptr;
     }
-    /// The frame ended: samples = the output frames SoundManager mixes this frame (0: none are mixed, the card still
-    /// runs to the frame's end)
-    virtual void FrameEnd(size_t samples)
-    {
-        (void)samples;
-    }
-    /// The mixer's core rate changed (frame boundary)
-    virtual void SetOutputRate(uint32_t rate)
-    {
-        (void)rate;
-    }
-    /// The card's mixer rows, in display order
-    virtual void MixerRows(std::vector<CardMixerRow>& out) const
+
+    /// Frames and audio: ICardAudio (emulator/sound/cardaudio.h)
+
+    /// region <Controllers>
+    /// The joystick sockets of the card (none by default)
+    virtual void Connectors(std::vector<CardConnector>& out) const
     {
         (void)out;
     }
-    /// A row's interleaved stereo int16 buffer of the last FrameEnd (the frames SoundManager asked for); nullptr for
-    /// a type the card does not own
-    virtual const int16_t* MixerBuffer(AudioSourceType type) const
-    {
-        (void)type;
-        return nullptr;
-    }
-    /// The writable buffer of a row declared ssgVoicing (the same one MixerBuffer returns), voiced in place by
-    /// SoundManager after FrameEnd; nullptr for any other row
-    virtual int16_t* VoicedMixerBuffer(AudioSourceType type)
-    {
-        (void)type;
-        return nullptr;
-    }
-    /// Changes whenever the card restarted its render layers (a TTD restore: its rows no longer continue the audio
-    /// before): the host's processing of the rows (the SSG voicing) restarts with them
-    virtual uint64_t RenderEpoch() const
-    {
-        return 0;
-    }
-    /// Full-scale sources: the mixer sums on its wide float bus with the master limiter while the card is fitted
-    virtual bool WantsWideMix() const
-    {
-        return false;
-    }
-    /// YM2203 FM loudness trim in dB ([SOUND] TSFM_FmTrimDb, the audio settings' FM trim) for a card with YM2203 FM;
-    /// false: the card has none
-    virtual bool SetFmTrimDb(double db)
-    {
-        (void)db;
-        return false;
-    }
-    virtual bool FmTrimDb(double& db) const
-    {
-        (void)db;
-        return false;
-    }
-    /// endregion </Frames and audio (SoundManager)>
+    /// endregion </Controllers>
 
     /// region <Time travel (ZX-bus slots architecture.md §8; MultiSound MS-5)>
-    /// Every device the card's state is in, each under the id its CardType declares (CardType::ttdIds), named by
+    /// Every device the card's state is in, each of a type its CardType declares (CardType::ttdTypes), named by
     /// slot. A card registers all of them or recording is refused naming its slot (SlotManager::TtdDevicesMatchPlan)
     virtual void CollectTtdDevices(std::vector<CardTtdDevice>& out)
     {
@@ -186,12 +143,11 @@ public:
     {
         (void)out;
     }
-    /// The session-load guard's part for this card: the session's baseline blobs (by id) against this card. False
-    /// with the reason, naming the slot
-    virtual bool TtdSessionMatches(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs,
-                                   std::string& why) const
+    /// The session-load guard's part for this card: the session's baseline device states (by device) against this
+    /// card. False with the reason, naming the slot
+    virtual bool TtdSessionMatches(const ttd::TTDDeviceStates& states, std::string& why) const
     {
-        (void)blobs;
+        (void)states;
         (void)why;
         return true;
     }
@@ -208,9 +164,9 @@ struct CardType
 {
     const char* id = "";
     std::unique_ptr<ICard> (*create)(const CardContext& context) = nullptr;
-    /// The time-travel ids the card's devices register under (CollectTtdDevices), the card's own first. Empty: the
-    /// card has no time-travel state yet - recording on a machine with it is refused, naming the slot
-    std::span<const ttd::PeripheralId> ttdIds{};
+    /// The time-travel types of the card's devices (CollectTtdDevices), the card's own first. Empty: the card has no
+    /// time-travel state yet - recording on a machine with it is refused, naming the slot
+    std::span<const ttd::TTDDeviceType> ttdTypes{};
 };
 
 /// Every registered card type

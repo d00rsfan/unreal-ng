@@ -5,6 +5,7 @@
 #include "../emulator_api.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <drogon/HttpResponse.h>
 #include <base/featuremanager.h>
@@ -14,6 +15,8 @@
 #include <emulator/sound/soundcharactersettings.h>
 #include <emulator/sound/soundmanager.h>
 #include <json/json.h>
+
+#include <cstdlib>
 
 using namespace drogon;
 using namespace api::v1;
@@ -32,8 +35,12 @@ namespace
 Json::Value SoundCharacterJson(const SoundManager& sound, const SoundCharacterSettings::Descriptor& d)
 {
     const std::string value = SoundCharacterSettings::Get(sound, d.name);
+    if (value == "unavailable")
+        return Json::Value();  // the machine has no such part (no YM2203 FM, no Covox): null
     if (d.isBool)
         return Json::Value(value == "on");
+    if (d.isNumber)
+        return Json::Value(std::strtod(value.c_str(), nullptr));
     return Json::Value(value);
 }
 
@@ -94,14 +101,16 @@ void EmulatorAPI::getSettings(const HttpRequestPtr& req, std::function<void(cons
     io_accel["fast_disk"] = featureManager && featureManager->isEnabled(Features::kFastDisk);
     settings["io_acceleration"] = io_accel;
 
-    // Turbo (max speed) mode - also FeatureManager-backed, forced off and blocked
-    // from re-enabling while TTD recording is active (same gate as io_acceleration)
+    // Turbo (max speed) mode - also FeatureManager-backed; a TTD recording keeps it
     settings["turbo_mode"] = featureManager && featureManager->isEnabled(Features::kTurboMode);
     // Host speed control, and whether the engine runs unthrottled right now
-    // (turbo_mode, or turbo tape warping a load); both locked while TTD records
+    // (turbo_mode, or turbo tape warping a load); the speed is locked while TTD records
     settings["speed"]        = static_cast<unsigned>(context->pCore ? context->pCore->GetHostSpeedMultiplier() : 1);
-    settings["turbo_active"] = config.turbo_mode;
-    settings["turbo_audio"]  = config.turbo_mode_audio;
+    settings["turbo_active"] = config.turbo_mode.Get();
+    // Host speed x the machine's own hardware turbo (TS-Conf 7/14 MHz...): the CPU clock the guest sees.
+    // Only "speed" is locked while TTD records; a guest switching its hardware turbo moves this one
+    settings["effective_speed"] = static_cast<unsigned>(context->pCore ? context->pCore->GetSpeedMultiplier() : 1);
+    settings["turbo_audio"]  = config.turbo_mode_audio.Get();
 
     // Disk Interface settings
     Json::Value disk_if(Json::objectValue);
@@ -207,7 +216,7 @@ void EmulatorAPI::getSetting(const HttpRequestPtr& req, std::function<void(const
         FeatureManager* featureManager = context->pFeatureManager;
         ret["name"] = "turbo_mode";
         ret["value"] = featureManager && featureManager->isEnabled(Features::kTurboMode);
-        ret["description"] = "Turbo (max speed) mode. Forced off and blocked from re-enabling while TTD recording is active.";
+        ret["description"] = "Turbo (max speed) mode. A TTD recording keeps it.";
     }
     else if (name == "speed")
     {
@@ -219,17 +228,25 @@ void EmulatorAPI::getSetting(const HttpRequestPtr& req, std::function<void(const
         ret["description"] = "Host speed multiplier (the emulated machine runs N times faster). Only 1 while TTD "
                              "records; a change on a stopped TTD session drops it.";
     }
+    else if (name == "effective_speed")
+    {
+        ret["name"] = "effective_speed";
+        ret["value"] = static_cast<unsigned>(context->pCore ? context->pCore->GetSpeedMultiplier() : 1);
+        ret["read_only"] = true;
+        ret["description"] = "Host speed x the machine's hardware turbo (the CPU clock multiplier in effect). A guest "
+                             "can raise it while TTD records; the host speed stays 1.";
+    }
     else if (name == "turbo_active")
     {
         ret["name"] = "turbo_active";
-        ret["value"] = config.turbo_mode;
+        ret["value"] = config.turbo_mode.Get();
         ret["read_only"] = true;
         ret["description"] = "Whether emulation runs unthrottled right now: turbo_mode, or turbo tape warping a load";
     }
     else if (name == "turbo_audio")
     {
         ret["name"] = "turbo_audio";
-        ret["value"] = config.turbo_mode_audio;
+        ret["value"] = config.turbo_mode_audio.Get();
         ret["description"] = "Keep generating audio (at raised pitch) while in turbo mode";
     }
     else if (name == "trdos_present")
@@ -359,10 +376,12 @@ void EmulatorAPI::setSetting(const HttpRequestPtr& req, std::function<void(const
             text = value.asBool() ? "on" : "off";
         else if (value.isString())
             text = value.asString();
+        else if (soundSetting->isNumber && value.isNumeric())
+            text = std::to_string(value.asDouble());
         else
         {
             badRequest(std::string("Invalid ") + soundSetting->name + " value: expected a string" +
-                       (soundSetting->isBool ? " or a bool" : ""));
+                       (soundSetting->isBool ? " or a bool" : soundSetting->isNumber ? " or a number" : ""));
             return;
         }
 
@@ -401,6 +420,12 @@ void EmulatorAPI::setSetting(const HttpRequestPtr& req, std::function<void(const
               "turbo_active is read-only (switch turbo with turbo_mode)");
         return;
     }
+    if (name == "effective_speed")
+    {
+        reply(HttpStatusCode::k400BadRequest, "Bad Request",
+              "effective_speed is read-only (host speed x the machine's hardware turbo; set the host part with speed)");
+        return;
+    }
 
     // Host speed multiplier (same switch as CLI 'setting speed N'): 1, 2, 4, 8 or 16
     if (name == "speed")
@@ -414,7 +439,9 @@ void EmulatorAPI::setSetting(const HttpRequestPtr& req, std::function<void(const
         }
         if (!emulator->SetSpeedMultiplier(static_cast<uint8_t>(multiplier)))
         {
-            reply(HttpStatusCode::k409Conflict, "Conflict", "Cannot change the speed while TTD recording is active (only 1)");
+            const std::string why = emulator->SpeedLockReason();
+            reply(HttpStatusCode::k409Conflict, "Conflict",
+                  why.empty() ? "Cannot change the speed while TTD recording is active (only 1)" : why);
             return;
         }
         Json::Value ret;
@@ -507,6 +534,19 @@ void EmulatorAPI::setSetting(const HttpRequestPtr& req, std::function<void(const
         ret["emulator_id"] = id;
 
         auto resp = HttpResponse::newHttpJsonResponse(ret);
+        addCorsHeaders(resp);
+        callback(resp);
+        return;
+    }
+
+    // asBool() throws on a string/array/object value, which surfaced as a 500 with an empty body
+    if (!(*json)["value"].isBool())
+    {
+        Json::Value error;
+        error["error"] = "Bad Request";
+        error["message"] = "Invalid " + name + " value: expected a bool";
+        auto resp = HttpResponse::newHttpJsonResponse(error);
+        resp->setStatusCode(HttpStatusCode::k400BadRequest);
         addCorsHeaders(resp);
         callback(resp);
         return;

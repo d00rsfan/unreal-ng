@@ -7,13 +7,15 @@
 //   tools/list, tools/call, resources/list, resources/read,
 //   prompts/list (empty), prompts/get (error)
 // Batch arrays are rejected with -32600 (batching was removed in the
-// 2025-03-26 spec revision). Notifications produce a null response —
+// 2025-03-26 spec revision, kept in 2025-06-18). Notifications produce a null response —
 // the HTTP adapter maps that to 202 + empty body.
 
 #include "mcp-tools.h"
 
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 
 namespace mcp
 {
@@ -43,8 +45,19 @@ public:
 
     const ToolRegistry& GetRegistry() const { return *_registry; }
 
+    /// Sees every tools/call of a known tool: its name and its "action" argument (empty when it has none). The host
+    /// counts the calls with it (monitoring::ClientStats, `host.clients.mcp.tools`); this library knows nothing of the
+    /// core. Set it before the first request: it is read without a lock
+    using ToolCallObserver = std::function<void(const std::string& tool, const std::string& action)>;
+    void SetToolCallObserver(ToolCallObserver observer) { _toolCallObserver = std::move(observer); }
+
 private:
     std::unique_ptr<ToolRegistry> _registry;
+    ToolCallObserver _toolCallObserver;
+    /// The client's name from initialize (clientInfo: "claude-code 2.1"): an automation session it opens without a
+    /// name of its own shows the user this
+    mutable std::mutex _clientMutex;
+    mutable std::string _clientName;
 };
 
 /// endregion </McpDispatcher>

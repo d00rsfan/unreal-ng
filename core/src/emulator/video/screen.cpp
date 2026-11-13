@@ -1,9 +1,11 @@
 #include "screen.h"
 #include "ulacontention.h"
+#include "emulator/readoutschanged.h"
 
 #include <common/image/imagehelper.h>
 
 #include <cassert>
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -16,10 +18,12 @@
 #include "emulator/video/screendigest.h"
 #include "emulator/video/atm/atmgeometry.h"
 #include "emulator/video/atm/screenatm.h"
+#include "emulator/video/gmx/gmxgeometry.h"
 #include "emulator/cpu/core.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/emulator.h"
 #include "emulator/notifications.h"
+#include "emulator/ports/models/profiboard.h"
 #include "emulator/sound/soundmanager.h"
 #include "stdafx.h"
 
@@ -66,8 +70,8 @@ Screen::Screen(EmulatorContext* context)
     // opaque. The previous 0x00RRGGBB defaults were transparent AND R/B-swapped,
     // which showed as green-only garbage (green survives both errors).
     // ATM extended modes render through the programmable palette held in
-    // EmulatorState.atmPalette (port #FF writes; defaults equal this ZX table,
-    // see InitAtmPalette), so they stay reprogrammable exactly like hardware.
+    // EmulatorState::atm.palette (port #FF writes; defaults equal this ZX table,
+    // see AtmState::InitPalette), so they stay reprogrammable exactly like hardware.
     static const uint32_t defaultPalette[16] = {
         0xFF000000,  // 0: Black
         0xFFC72200,  // 1: Blue
@@ -159,12 +163,36 @@ void Screen::InitFrame()
     InitMemoryCounters();
 }
 
+void Screen::InitRaster()
+{
+    if (_rasterDeferrals > 0)
+    {
+        _rasterDeferred = true;
+        return;
+    }
+    DetectRaster();
+}
+
+Screen::RasterDeferral::RasterDeferral(Screen* screen) : _screen(screen)
+{
+    if (_screen)
+        _screen->_rasterDeferrals++;
+}
+
+Screen::RasterDeferral::~RasterDeferral()
+{
+    if (!_screen || --_screen->_rasterDeferrals > 0 || !_screen->_rasterDeferred)
+        return;
+    _screen->_rasterDeferred = false;
+    _screen->DetectRaster();
+}
+
 //
 // Set appropriate video mode based on ports for current platform.
 // Routing only: the per-model detection logic lives in the DetectMode*
 // methods below (routed through DetectVideoMode), one per machine family.
 //
-void Screen::InitRaster()
+void Screen::DetectRaster()
 {
     // Check for null pointers before proceeding
     if (!_context || !_state)
@@ -250,6 +278,8 @@ Screen::ModeSelection Screen::DetectVideoMode(MEM_MODEL model) const
         case MM_PLUS2A:
         case MM_PLUS3:
             return DetectModeZX128(state);
+        case MM_NEXT:
+            return { M_NEXT, R_256_192 };
         case MM_PENTAGON:
             return DetectModePentagon(state);
         case MM_ATM450:
@@ -340,7 +370,7 @@ Screen::ModeSelection Screen::DetectModeATM1(const EmulatorState& state) const
     VideoModeEnum mode = M_ZX48;
     RasterModeEnum rasterMode = R_256_192;
 
-    const uint8_t atmMode = (state.aFE >> 5) & 3;
+    const uint8_t atmMode = (state.atm.aFE >> 5) & 3;
     if (atmMode != FF77_ZX)
     {
         rasterMode = R_320_200;
@@ -436,14 +466,18 @@ Screen::ModeSelection Screen::DetectModeProfi(const EmulatorState& state) const
     return { M_PROFI, R_256_192 };
 }
 
-// GMX: 7EFD bit 3 selects the extended 320x200 mode; without it the model
-// keeps its current/legacy mode selection
+// GMX: #7EFD bit 3 selects the card's 640x200 extended mode (GMX design 2.5); without it the host Scorpion's raster
 Screen::ModeSelection Screen::DetectModeGMX(const EmulatorState& state) const
 {
-    if (state.p7EFD & 0x08)
+    if (state.scorpion.p7EFD & 0x08)
         return { M_GMX, R_320_200 };
 
-    return { _vid.mode, R_256_192 };
+    // #00 bit 7 (ST/PENT): the Pentagon frame, 320 lines with 80 from INT to the active screen and the border
+    // without strobing (GMX manual, the Pentagon scheme): the Pentagon 128 raster
+    if (state.gmx.p00 & 0x80)
+        return { M_PENTAGON128K, R_256_192 };
+
+    return DetectModeScorpion(state);
 }
 
 // Unknown/legacy models: keep the current mode, standard ZX raster
@@ -563,6 +597,7 @@ void Screen::SetVideoMode(VideoModeEnum mode)
         case M_SCORPION:  // Scorpion ZS-256 - discrete-logic ULA, contention-free
         case M_PROFI:     // Profi - discrete-logic ULA, no contention
         case M_PROFIHR:
+        case M_GMX:       // the GMX extended mode on the Scorpion board
             _rasterState.borderUpdateTStates = 1;
             _rasterState.contentionEnabled = false;
             _rasterState.fetchType = ULA_DISCRETE_LOGIC;
@@ -575,8 +610,10 @@ void Screen::SetVideoMode(VideoModeEnum mode)
             // ZX-compatible or extended mode (ATM ZX mode is M_ZX48) keep their
             // discrete, contention-free video logic.
             const MEM_MODEL model = _context ? _context->config.mem_model : MM_SPECTRUM48;
-            const bool ferranti = model == MM_SPECTRUM48 || model == MM_SPECTRUM128 || model == MM_PLUS2 ||
-                                  model == MM_PLUS2A || model == MM_PLUS3;
+            const bool ferranti = (model == MM_SPECTRUM48 || model == MM_SPECTRUM128 || model == MM_PLUS2 ||
+                                   model == MM_PLUS2A || model == MM_PLUS3 || model == MM_NEXT) &&
+                                  !_context->emulatorState.hw_contention_disabled &&
+                                  !(model == MM_NEXT && _context->emulatorState.ula_timing_class == 4);  // the Pentagon family has none
             _rasterState.borderUpdateTStates = ferranti ? 4 : 1;
             _rasterState.contentionEnabled = ferranti;
             _rasterState.fetchType = ferranti ? ULA_FERRANTI : ULA_DISCRETE_LOGIC;
@@ -602,7 +639,8 @@ void Screen::SetVideoMode(VideoModeEnum mode)
         // +2A/+3: the Amstrad gate array, not the Ferranti ULA (its own pattern, contended pages 4-7 in any
         // slot, no I/O contention, #0FFD floating bus). The slots were mapped before this rule was known
         const MEM_MODEL model = _context->config.mem_model;
-        _context->pUlaContention->SetGateArray(model == MM_PLUS3 || model == MM_PLUS2A);
+        _context->pUlaContention->SetGateArray(model == MM_PLUS3 || model == MM_PLUS2A ||
+                                               (model == MM_NEXT && _context->emulatorState.ula_timing_class == 3));
         if (_context->pMemory)
             _context->pMemory->RefreshSlotContention();
 
@@ -700,10 +738,12 @@ videomap::VideoLatches Screen::CaptureVideoLatches() const
         l.pEFF7 = _state->pEFF7;
         l.pFF77 = _state->pFF77;
         l.pDFFD = _state->pDFFD;
-        l.aFE = _state->aFE;
+        l.aFE = _state->atm.aFE;
         l.pFE = _state->pFE;
         l.borderAttr = _state->border_attr;
-        l.atmBorderBright = _state->atmBorderBright;
+        l.atmBorderBright = _state->atm.borderBright;
+        if (_context->config.mem_model == MM_GMX)
+            l.scrollStart = static_cast<uint16_t>(GmxGeometry::ScrollStart(_state->gmx.p7AFD, _state->gmx.p7CFD));
     }
     CaptureFamilyLatches(l);
     return l;
@@ -741,6 +781,13 @@ uint8_t Screen::GetActiveScreen()
 uint8_t Screen::GetBorderColor()
 {
     return _borderColor;
+}
+
+void Screen::SetPrevTstate(uint32_t tstate)
+{
+    _prevTstate = tstate;
+    if (_context && _context->pCore && _context->pCore->GetZ80())
+        _stepEndCpuT = _context->pCore->GetZ80()->t;
 }
 
 uint32_t Screen::GetCurrentTstate()
@@ -885,14 +932,6 @@ static void ClearFramebufferOpaque(uint8_t* buffer, size_t sizeBytes)
 
 void Screen::AllocateFramebuffer(VideoModeEnum mode)
 {
-    // Apply the configured A/V sync video delay (auto -1 = 2 frames: the
-    // audio path's ring target + HW buffer expressed in frame periods)
-    if (_context)
-    {
-        const int cfg = _context->config.videoPresentDelayFrames;
-        SetPresentDelayFrames(cfg < 0 ? 2 : static_cast<uint8_t>(cfg));
-    }
-
     // Buffer already allocated for the selected video mode
     if (_framebuffer.memoryBuffer != nullptr && _framebuffer.videoMode == mode)
     {
@@ -926,7 +965,8 @@ void Screen::AllocateFramebuffer(VideoModeEnum mode)
             // The present queue holds the external picture while one is shown
             if (IsExternalPictureActive())
                 return;
-            std::lock_guard<std::mutex> lock(_presentMutex);
+            std::unique_lock<std::mutex> lock(_presentMutex);
+            WaitSlotUnpinnedLocked(lock, PRESENT_SLOTS);
             for (size_t i = 0; i < PRESENT_SLOTS; i++)
             {
                 if (_presentSlots[i])
@@ -956,11 +996,14 @@ void Screen::AllocateFramebuffer(VideoModeEnum mode)
         case M_ATMTL:   // ATM3 Linear Text
         case M_PROFI:   // Profi standard / hi-res
         case M_PROFIHR:
+        case M_GMX:     // GMX 640x200 (ScreenGmx)
+        case M_SCORPION:  // Scorpion ZS-256 (reached with a new size when the GMX leaves its 640x200 mode)
         case M_TS16:    // TS-Conf (ScreenTSConf)
         case M_TS256:
         case M_TSTX:
         case M_TSZX:
         case M_SPRINTER:  // Sprinter (ScreenSprinter)
+        case M_NEXT:      // ZX Spectrum Next (ScreenNext)
             break;
         default:
             MLOGWARNING("AllocateFramebuffer: Unknown video mode");
@@ -995,8 +1038,8 @@ void Screen::AllocateFramebuffer(VideoModeEnum mode)
         // (not while an external picture is shown: the queue is sized for it)
         if (!IsExternalPictureActive())
         {
-            std::lock_guard<std::mutex> lock(_presentMutex);
-            ResizePresentSlotsLocked(_framebuffer.memoryBufferSize);
+            std::unique_lock<std::mutex> lock(_presentMutex);
+            ResizePresentSlotsLocked(lock, _framebuffer.memoryBufferSize);
         }
 
 #ifdef _DEBUG
@@ -1024,7 +1067,8 @@ void Screen::DeallocateFramebuffer()
     }
 
     {
-        std::lock_guard<std::mutex> lock(_presentMutex);
+        std::unique_lock<std::mutex> lock(_presentMutex);
+        WaitSlotUnpinnedLocked(lock, PRESENT_SLOTS);
         for (size_t i = 0; i < PRESENT_SLOTS; i++)
         {
             delete[] _presentSlots[i];
@@ -1036,8 +1080,9 @@ void Screen::DeallocateFramebuffer()
     }
 }
 
-void Screen::ResizePresentSlotsLocked(size_t size)
+void Screen::ResizePresentSlotsLocked(std::unique_lock<std::mutex>& lock, size_t size)
 {
+    WaitSlotUnpinnedLocked(lock, PRESENT_SLOTS);
     for (size_t i = 0; i < PRESENT_SLOTS; i++)
     {
         delete[] _presentSlots[i];
@@ -1049,9 +1094,11 @@ void Screen::ResizePresentSlotsLocked(size_t size)
         _presentSlotShown[i] = false;
         _presentSlotReport[i] = zxdlss::FrameReport{};
         _presentSlotGeometry[i] = PictureGeometry{};
+        ResetSlotTimingLocked(i);
     }
     _presentBufferSize = size;
     _presentLatchCounter = 0;
+    _frameClockResetPending.store(true, std::memory_order_release);
 }
 
 /// region <Frame geometry>
@@ -1081,6 +1128,7 @@ PictureGeometry Screen::DescribeNativeFrame() const
     g.height = _framebuffer.height;
     g.stride = static_cast<uint32_t>(g.width) * RGBA_SIZE;
     g.screenWindow = WorkingWindow();
+    g.contentWindow = ContentWindow();
     g.videoMode = _framebuffer.videoMode;
     g.source = FrameSource::Native;
     g.frameNumber = _context ? _context->emulatorState.frame_counter : 0;
@@ -1189,9 +1237,16 @@ void Screen::SetExternalPicture(uint8_t* buffer, uint16_t width, uint16_t height
     const size_t size = static_cast<size_t>(width) * height * RGBA_SIZE;
     bool changed = false;
     {
-        std::lock_guard<std::mutex> lock(_presentMutex);
+        std::unique_lock<std::mutex> lock(_presentMutex);
         changed = !IsExternalPictureActive() || _external.memoryBuffer != buffer || _external.width != width ||
                   _external.height != height;
+        if (changed)
+        {
+            // The slots are made anew: no reader copies one
+            WaitSlotUnpinnedLocked(lock, PRESENT_SLOTS);
+            changed = !IsExternalPictureActive() || _external.memoryBuffer != buffer || _external.width != width ||
+                      _external.height != height;
+        }
         _external.videoMode = M_NUL;  // no raster descriptor of the machine: consumers take the whole picture
         _external.width = width;
         _external.height = height;
@@ -1199,7 +1254,7 @@ void Screen::SetExternalPicture(uint8_t* buffer, uint16_t width, uint16_t height
         _external.memoryBufferSize = size;
         _externalFramePeriodUs = framePeriodUs;
         if (changed)
-            ResizePresentSlotsLocked(size);
+            ResizePresentSlotsLocked(lock, size);
         _externalActive.store(true, std::memory_order_release);
     }
     if (changed)
@@ -1211,10 +1266,11 @@ void Screen::ClearExternalPicture()
     if (!IsExternalPictureActive())
         return;
     {
-        std::lock_guard<std::mutex> lock(_presentMutex);
+        std::unique_lock<std::mutex> lock(_presentMutex);
+        WaitSlotUnpinnedLocked(lock, PRESENT_SLOTS);
         _externalActive.store(false, std::memory_order_release);
         _external = FramebufferDescriptor{};
-        ResizePresentSlotsLocked(_framebuffer.memoryBufferSize);
+        ResizePresentSlotsLocked(lock, _framebuffer.memoryBufferSize);
     }
     PostVideoModeChanged();
 }
@@ -1233,7 +1289,9 @@ void Screen::LatchExternalFrame()
     if (!IsExternalPictureActive() || _external.memoryBuffer == nullptr)
         return;
 
-    std::lock_guard<std::mutex> lock(_presentMutex);
+    std::unique_lock<std::mutex> lock(_presentMutex);
+    while (_presentSlotPins[_presentLatchCounter % PRESENT_SLOTS] != 0)  // a reader copies the slot to be written
+        WaitSlotUnpinnedLocked(lock, _presentLatchCounter % PRESENT_SLOTS);
     if (_presentSlots[0] == nullptr || _presentBufferSize != _external.memoryBufferSize)
         return;
     const size_t index = _presentLatchCounter % PRESENT_SLOTS;
@@ -1246,9 +1304,16 @@ void Screen::LatchExternalFrame()
     _presentSlotShown[index] = false;
     _presentSlotReport[index] = zxdlss::FrameReport{};
     _presentLatchCounter++;
-    _lastLatchTimestampUs.store(std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now().time_since_epoch())
-                                    .count(),
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    ResetSlotTimingLocked(index);
+    _presentSlotTiming[index].latchNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    // The card's frame is complete here, inside the machine's frame: its sound ends at this fraction of the frame's
+    if (_context && _context->pCore && _context->config.frame)
+    {
+        const double fraction = static_cast<double>(_context->pCore->GetZ80()->t) / _context->config.frame;
+        _presentSlotTiming[index].fraction = static_cast<float>(std::clamp(fraction, 0.0, 1.0));
+    }
+    _lastLatchTimestampUs.store(std::chrono::duration_cast<std::chrono::microseconds>(now).count(),
                                 std::memory_order_release);
 }
 
@@ -1262,7 +1327,9 @@ void Screen::LatchFramebuffer()
     if (IsExternalPictureActive())
         return;
 
-    std::lock_guard<std::mutex> lock(_presentMutex);
+    std::unique_lock<std::mutex> lock(_presentMutex);
+    while (_presentSlotPins[_presentLatchCounter % PRESENT_SLOTS] != 0)  // a reader copies the slot to be written
+        WaitSlotUnpinnedLocked(lock, _presentLatchCounter % PRESENT_SLOTS);
     if (_presentSlots[0] && _presentBufferSize == _framebuffer.memoryBufferSize)
     {
         const size_t index = _presentLatchCounter % PRESENT_SLOTS;
@@ -1278,6 +1345,10 @@ void Screen::LatchFramebuffer()
         _presentSlotShown[index] = false;
         _presentSlotReport[index] = zxdlss::FrameReport{};
         _presentLatchCounter++;
+        ResetSlotTimingLocked(index);
+        _presentSlotTiming[index].latchNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
 
         // Temporal effect: the worker processes this frame and writes an older
         // one back (WriteTemporalOutput takes _presentMutex: Submit must not)
@@ -1309,30 +1380,45 @@ void Screen::LatchFramebuffer()
 
 void Screen::FlushAndPresentFramebuffer()
 {
-    if (_framebuffer.memoryBuffer == nullptr)
+    // What the monitor shows: the external picture (VDAC2's FT812) while one is active
+    const bool external = IsExternalPictureActive();
+    const FramebufferDescriptor& shown = external ? _external : _framebuffer;
+    if (shown.memoryBuffer == nullptr)
         return;
 
-    std::lock_guard<std::mutex> lock(_presentMutex);
-    if (_presentSlots[0] == nullptr || _presentBufferSize != _framebuffer.memoryBufferSize)
+    std::unique_lock<std::mutex> lock(_presentMutex);
+    WaitSlotUnpinnedLocked(lock, 0);
+    if (_presentSlots[0] == nullptr || _presentBufferSize != shown.memoryBufferSize)
         return;
 
     // Empty the delay line, then make the freshly rendered frame its only
-    // content. With the counter reset, CopyPresentedFramebuffer clamps the
-    // configured delay to what exists (zero) and serves this frame; once
+    // content, due at once: CopyPresentedFramebuffer serves it; once
     // playback resumes the queue refills on its own.
     _presentLatchCounter = 0;
-    VideoUtils::CopyFrameBuffer(_presentSlots[0], _framebuffer.memoryBuffer, _presentBufferSize);
-    if (_planeBEnabled)
+    VideoUtils::CopyFrameBuffer(_presentSlots[0], shown.memoryBuffer, _presentBufferSize);
+    if (_planeBEnabled && !external)   // plane B belongs to the ZX raster
         _presentPlaneB[0].assign(_planeB.begin(), _planeB.end());
     else
         _presentPlaneB[0].clear();
-    _presentSlotGeometry[0] = DescribeNativeFrame();
+    _presentSlotGeometry[0] = external ? DescribeExternalFrame() : DescribeNativeFrame();
     _presentSlotSerial[0] = ++_presentSerial;
     _presentSlotWindow[0] = TemporalWindow{};  // never submitted: the effect restarts below
     _presentSlotProcessed[0] = false;
     _presentSlotShown[0] = false;
     _presentSlotReport[0] = zxdlss::FrameReport{};
     _presentLatchCounter = 1;
+    // Shown at once: the sequence broke, the frame clock starts over with the next frame
+    ResetSlotTimingLocked(0);
+    {
+        const int64_t now =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        _presentSlotTiming[0].latchNs = now;
+        _presentSlotTiming[0].targetNs = now;
+        _presentSlotTiming[0].timed = true;
+        _presentSlotTiming[0].source = FrameClockSource::Latch;
+    }
+    _frameClockResetPending.store(true, std::memory_order_release);
 
     // The frame sequence broke: the temporal effect restarts, this frame shows raw
     if (_temporal)
@@ -1344,7 +1430,393 @@ void Screen::FlushAndPresentFramebuffer()
         std::memory_order_release);
 }
 
+/// region <Frames by time>
+
+void Screen::ResetSlotTimingLocked(size_t index)
+{
+    _presentSlotTiming[index] = PresentSlotTiming{};
+}
+
+void Screen::StampPresentTiming(const FrameStampInput& in)
+{
+    // The audio clock, when this instance's sound reaches a device
+    const AudioDeviceDescriptor* device =
+        _context ? _context->pAudioDeviceDescriptor.load(std::memory_order_acquire) : nullptr;
+    const int64_t offsetNs = _context ? static_cast<int64_t>(_context->config.lipSyncOffsetMs) * 1'000'000 : 0;
+    const int64_t period = in.periodNs > 0 ? in.periodNs : static_cast<int64_t>(NativeFramePeriodUs()) * 1000;
+
+    std::lock_guard<std::mutex> lock(_presentMutex);
+    _stampingActive = true;
+    if (_frameClockResetPending.exchange(false, std::memory_order_acq_rel))
+    {
+        _frameClock.Reset();
+        _haveLastStamp = false;
+    }
+
+    // Where the last frame end was: the start of this frame's sound and time
+    const bool prevAudio = _haveLastStamp && _lastStampHadAudio && in.haveAudio;
+    const uint64_t audioBegin =
+        prevAudio ? _lastStampAudioEnd
+                  : in.audioEndStreamFrame - std::min<uint64_t>(in.audioEndStreamFrame, in.audioFramesPerFrame);
+    const bool prevEmulated = _haveLastStamp && _lastStampHadEmulated && in.haveEmulated;
+    const int64_t emulatedBegin = prevEmulated ? _lastStampEmulatedEnd : in.emulatedEndNs - period;
+
+    // The video delay without the audio clock: one frame, or the temporal effect's look-ahead. A run not paced to
+    // real time (turbo, stepping) has no sound to wait for: the look-ahead only
+    const int64_t temporal = _temporalDelayFrames.load(std::memory_order_acquire);
+    const int64_t emulatedDelay = (temporal > 1 ? temporal : 1) * period;
+    const int64_t latchDelay = temporal * period;
+
+    // The untimed frames latched since the last stamp, oldest first (one per machine frame; an external picture
+    // at its own rate may give none or several)
+    size_t indices[PRESENT_SLOTS];
+    const size_t count = EligibleSlotsLocked(indices);
+    for (size_t k = 0; k < count; k++)
+    {
+        const size_t i = indices[k];
+        PresentSlotTiming& timing = _presentSlotTiming[i];
+        if (timing.timed || _presentSlotSerial[i] <= _lastStampedSerial)
+            continue;
+        const double f = timing.fraction;
+        const bool external = _presentSlotGeometry[i].source == FrameSource::External;
+
+        FrameTimingInput input;
+        input.latchNs = timing.latchNs;
+        input.periodNs = external && _externalFramePeriodUs ? static_cast<int64_t>(_externalFramePeriodUs) * 1000
+                                                            : period;
+        input.offsetNs = offsetNs;
+        input.emulatedDelayNs = emulatedDelay;
+        input.latchDelayNs = latchDelay;
+        input.maxDelayNs = static_cast<int64_t>(kMaxVideoDelayFrames) * input.periodNs;
+        if (in.haveAudio && device)
+        {
+            const uint64_t streamFrame =
+                audioBegin + static_cast<uint64_t>(f * static_cast<double>(in.audioEndStreamFrame - audioBegin));
+            int64_t heard = 0;
+            if (device->clock.TimeOfStreamFrame(streamFrame, in.nowNs, &heard))
+            {
+                input.haveAudio = true;
+                input.audioNs = heard;
+            }
+        }
+        if (in.haveEmulated)
+        {
+            input.haveEmulated = true;
+            input.emulatedNs = emulatedBegin + static_cast<int64_t>(f * static_cast<double>(in.emulatedEndNs - emulatedBegin));
+        }
+
+        const FrameTimingResult result = _frameClock.Next(input);
+        timing.targetNs = result.targetNs;
+        timing.source = result.source;
+        timing.periodNs = input.periodNs;
+        timing.timed = true;
+        _lastStampedSerial = _presentSlotSerial[i];
+    }
+
+    _haveLastStamp = true;
+    _lastStampHadAudio = in.haveAudio;
+    _lastStampAudioEnd = in.audioEndStreamFrame;
+    _lastStampHadEmulated = in.haveEmulated;
+    _lastStampEmulatedEnd = in.emulatedEndNs;
+}
+
+size_t Screen::EligibleSlotsLocked(size_t* indices) const
+{
+    if (_presentSlots[0] == nullptr || _presentBufferSize == 0 || _presentLatchCounter == 0)
+        return 0;
+    const uint64_t held = std::min<uint64_t>(_presentLatchCounter, PRESENT_SLOTS);
+    size_t count = 0;
+    for (uint64_t k = held; k > 0; k--)
+    {
+        const size_t index = static_cast<size_t>((_presentLatchCounter - k) % PRESENT_SLOTS);
+        const PictureGeometry& g = _presentSlotGeometry[index];
+        if (_presentSlotSerial[index] == 0 || g.width == 0 || g.height == 0 ||
+            static_cast<size_t>(g.stride) * g.height != _presentBufferSize)
+            continue;
+        indices[count++] = index;
+    }
+    return count;
+}
+
+int64_t Screen::SlotTargetLocked(size_t index) const
+{
+    const PresentSlotTiming& timing = _presentSlotTiming[index];
+    if (timing.timed)
+        return timing.targetNs;
+    // No frame clock runs for this screen (no MainLoop): the latch time is the best there is. With one running, an
+    // untimed frame waits for its stamp
+    return _stampingActive ? INT64_MAX : timing.latchNs;
+}
+
+void Screen::MarkServedLocked(size_t index) const
+{
+    _presentSlotShown[index] = true;
+    _showingProcessed.store(_presentSlotProcessed[index], std::memory_order_relaxed);
+    _shownReport = _presentSlotReport[index];
+}
+
+void Screen::MarkShownLocked(size_t index) const
+{
+    MarkServedLocked(index);
+    _shownSerial = _presentSlotSerial[index];
+    const PresentSlotTiming& timing = _presentSlotTiming[index];
+    const int64_t target = timing.timed ? timing.targetNs : timing.latchNs;
+    _shownDelayNs = target > timing.latchNs ? target - timing.latchNs : 0;
+}
+
+bool Screen::ChooseSlotLocked(int64_t hostNs, size_t* chosen, size_t* next, bool* early) const
+{
+    size_t indices[PRESENT_SLOTS];
+    size_t count = EligibleSlotsLocked(indices);
+    if (count == 0)
+        return false;
+    // A temporal effect writes its output into a frame once its look-ahead has arrived: the newest frames are not
+    // served before (a stopped machine's frames are all due, SettlePresentTiming). An external picture has none
+    const size_t temporal = _temporalDelayFrames.load(std::memory_order_acquire);
+    if (temporal > 0 && !IsExternalPictureActive())
+        count = count > temporal ? count - temporal : 1;
+
+    // Oldest first: the newest frame due by hostNs, and the first one after it
+    *chosen = PRESENT_SLOTS;
+    *next = PRESENT_SLOTS;
+    size_t oldest = PRESENT_SLOTS;
+    for (size_t k = 0; k < count; k++)
+    {
+        const int64_t target = SlotTargetLocked(indices[k]);
+        if (target == INT64_MAX)
+            continue;
+        if (oldest == PRESENT_SLOTS)
+            oldest = indices[k];
+        if (target <= hostNs)
+        {
+            *chosen = indices[k];
+            *next = PRESENT_SLOTS;
+        }
+        else if (*next == PRESENT_SLOTS)
+        {
+            *next = indices[k];
+        }
+    }
+    *early = *chosen == PRESENT_SLOTS;
+    if (*early)
+    {
+        // Every frame's target is later (start up): the oldest; nothing timed yet (the first frame's sound not
+        // delivered): the oldest latched
+        *chosen = oldest != PRESENT_SLOTS ? oldest : indices[0];
+        *next = PRESENT_SLOTS;
+    }
+    return true;
+}
+
+void Screen::WaitSlotUnpinnedLocked(std::unique_lock<std::mutex>& lock, size_t index)
+{
+    const auto unpinned = [this, index] {
+        if (index < PRESENT_SLOTS)
+            return _presentSlotPins[index] == 0;
+        for (uint32_t pins : _presentSlotPins)
+            if (pins != 0)
+                return false;
+        return true;
+    };
+    if (unpinned())
+        return;
+    _presentPinWaiters++;
+    _presentSlotUnpinned.wait(lock, unpinned);
+    _presentPinWaiters--;
+}
+
+void Screen::UnpinSlots(size_t first, size_t second)
+{
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(_presentMutex);
+        for (size_t index : {first, second})
+            if (index < PRESENT_SLOTS && --_presentSlotPins[index] == 0 && _presentPinWaiters > 0)
+                wake = true;
+    }
+    if (wake)
+        _presentSlotUnpinned.notify_all();
+}
+
+bool Screen::CopyFrameAt(int64_t hostNs, uint8_t* dst, size_t dstSize, PresentFrameInfo* info, uint8_t* nextDst)
+{
+    if (dst == nullptr)
+        return false;
+    size_t chosen = PRESENT_SLOTS;
+    size_t next = PRESENT_SLOTS;
+    const uint8_t* source = nullptr;
+    const uint8_t* nextSource = nullptr;
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lock(_presentMutex);
+        if (dstSize < _presentBufferSize)
+            return false;
+        bool early = false;
+        if (!ChooseSlotLocked(hostNs, &chosen, &next, &early) || SlotTargetLocked(chosen) == INT64_MAX)
+            return false;
+        MarkShownLocked(chosen);
+        _earlyServed += early ? 1 : 0;
+        if (info)
+        {
+            *info = PresentFrameInfo{};
+            info->serial = _presentSlotSerial[chosen];
+            info->targetNs = SlotTargetLocked(chosen);
+            info->latchNs = _presentSlotTiming[chosen].latchNs;
+            info->source = _presentSlotTiming[chosen].source;
+            info->periodNs = _presentSlotTiming[chosen].periodNs;
+            info->geometry = _presentSlotGeometry[chosen];
+            info->early = early;
+            if (next != PRESENT_SLOTS)
+            {
+                info->nextSerial = _presentSlotSerial[next];
+                info->nextTargetNs = SlotTargetLocked(next);
+                const int64_t span = info->nextTargetNs - info->targetNs;
+                if (span > 0)
+                    info->blend = static_cast<float>(std::clamp(
+                        static_cast<double>(hostNs - info->targetNs) / static_cast<double>(span), 0.0, 1.0));
+            }
+        }
+        if (!nextDst)
+            next = PRESENT_SLOTS;
+        // Pinned: copied below, outside the lock; their writers wait for the copy (WaitSlotUnpinnedLocked)
+        _presentSlotPins[chosen]++;
+        source = _presentSlots[chosen];
+        if (next != PRESENT_SLOTS)
+        {
+            _presentSlotPins[next]++;
+            nextSource = _presentSlots[next];
+        }
+        size = _presentBufferSize;
+    }
+    VideoUtils::CopyFrameBuffer(dst, source, size);
+    if (nextSource)
+        VideoUtils::CopyFrameBuffer(nextDst, nextSource, size);
+    UnpinSlots(chosen, next);
+    return true;
+}
+
+bool Screen::CopyNextFrame(uint64_t afterSerial, uint8_t* dst, size_t dstSize, PresentFrameInfo* info, bool markShown)
+{
+    if (dst == nullptr)
+        return false;
+    size_t found = PRESENT_SLOTS;
+    const uint8_t* source = nullptr;
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lock(_presentMutex);
+        if (dstSize < _presentBufferSize)
+            return false;
+        size_t indices[PRESENT_SLOTS];
+        size_t count = EligibleSlotsLocked(indices);
+        // A temporal effect's newest frames are not written yet (see ChooseSlotLocked)
+        const size_t temporal = _temporalDelayFrames.load(std::memory_order_acquire);
+        if (temporal > 0 && !IsExternalPictureActive())
+            count = count > temporal ? count - temporal : 0;
+        for (size_t k = 0; k < count; k++)
+        {
+            const size_t index = indices[k];
+            if (_presentSlotSerial[index] > afterSerial && SlotTargetLocked(index) != INT64_MAX)
+            {
+                found = index;
+                break;
+            }
+        }
+        if (found == PRESENT_SLOTS)
+            return false;
+        if (markShown)
+            MarkShownLocked(found);
+        if (info)
+        {
+            *info = PresentFrameInfo{};
+            info->serial = _presentSlotSerial[found];
+            info->targetNs = SlotTargetLocked(found);
+            info->latchNs = _presentSlotTiming[found].latchNs;
+            info->source = _presentSlotTiming[found].source;
+            info->periodNs = _presentSlotTiming[found].periodNs;
+            info->geometry = _presentSlotGeometry[found];
+        }
+        _presentSlotPins[found]++;  // copied outside the lock (CopyFrameAt)
+        source = _presentSlots[found];
+        size = _presentBufferSize;
+    }
+    VideoUtils::CopyFrameBuffer(dst, source, size);
+    UnpinSlots(found, PRESENT_SLOTS);
+    return true;
+}
+
+void Screen::SettlePresentTiming()
+{
+    const int64_t now =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard<std::mutex> lock(_presentMutex);
+    for (size_t i = 0; i < PRESENT_SLOTS; i++)
+    {
+        PresentSlotTiming& timing = _presentSlotTiming[i];
+        if (_presentSlotSerial[i] == 0)
+            continue;
+        // A frame whose sound was not delivered yet (the stop came between its latch and its stamp) is due as well
+        if (!timing.timed || timing.targetNs > now)
+        {
+            timing.targetNs = std::min(timing.timed ? timing.targetNs : now, now);
+            timing.timed = true;
+            if (timing.source == FrameClockSource::None)
+                timing.source = FrameClockSource::Latch;
+        }
+    }
+    _lastStampedSerial = _presentSerial;
+    _frameClockResetPending.store(true, std::memory_order_release);
+}
+
+uint32_t Screen::GetPresentDelayUs()
+{
+    {
+        std::lock_guard<std::mutex> lock(_presentMutex);
+        if (_shownSerial != 0)
+            return static_cast<uint32_t>(std::min<int64_t>(_shownDelayNs / 1000, UINT32_MAX));
+    }
+    const uint64_t period = IsExternalPictureActive() && _externalFramePeriodUs ? _externalFramePeriodUs
+                                                                                : NativeFramePeriodUs();
+    return static_cast<uint32_t>(GetEffectivePresentDelayFrames() * period);
+}
+
+uint32_t Screen::GetShownDelayFrames()
+{
+    std::lock_guard<std::mutex> lock(_presentMutex);
+    return _shownSerial != 0 && _presentSerial > _shownSerial ? static_cast<uint32_t>(_presentSerial - _shownSerial)
+                                                              : 0;
+}
+
+PresentTimingStats Screen::GetPresentTimingStats()
+{
+    std::lock_guard<std::mutex> lock(_presentMutex);
+    const FrameClock::Stats& clock = _frameClock.GetStats();
+    PresentTimingStats out;
+    out.source = clock.source;
+    out.carried = clock.carried;
+    out.cuts = clock.cuts;
+    out.carryNs = clock.carryNs;
+    out.delayClamped = clock.lastClamped;
+    out.clampedFrames = clock.clamped;
+    out.early = _earlyServed;
+    // At the period of the frame timed last
+    int64_t period = 0;
+    for (size_t i = 0; i < PRESENT_SLOTS; i++)
+        if (_presentSlotSerial[i] == _lastStampedSerial && _presentSlotTiming[i].timed)
+            period = _presentSlotTiming[i].periodNs;
+    if (period <= 0)
+        period = static_cast<int64_t>(NativeFramePeriodUs()) * 1000;
+    out.maxDelayNs = static_cast<int64_t>(kMaxVideoDelayFrames) * period;
+    return out;
+}
+
+/// endregion </Frames by time>
+
 bool Screen::CopyPresentedFramebuffer(uint8_t* dst, size_t dstSize)
+{
+    return CopyPresentedFramebuffer(dst, dstSize, nullptr);
+}
+
+bool Screen::CopyPresentedFramebuffer(uint8_t* dst, size_t dstSize, PictureGeometry* geometry)
 {
     if (dst == nullptr)
         return false;
@@ -1353,13 +1825,23 @@ bool Screen::CopyPresentedFramebuffer(uint8_t* dst, size_t dstSize)
     // mutex: _framebuffer.memoryBufferSize is published outside the lock
     // during mode-switch reallocation, and trusting it here could overread
     // a present buffer from the previous video mode
-    std::lock_guard<std::mutex> lock(_presentMutex);
-    if (dstSize < _presentBufferSize)
-        return false;
-    const uint8_t* slot = PresentedSlotLocked(nullptr);
-    if (!slot)
-        return false;
-    VideoUtils::CopyFrameBuffer(dst, slot, _presentBufferSize);
+    size_t index = 0;
+    const uint8_t* slot = nullptr;
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lock(_presentMutex);
+        if (dstSize < _presentBufferSize)
+            return false;
+        slot = PresentedSlotLocked(&index);
+        if (!slot)
+            return false;
+        if (geometry != nullptr)
+            *geometry = _presentSlotGeometry[index];
+        _presentSlotPins[index]++;  // copied outside the lock (CopyFrameAt)
+        size = _presentBufferSize;
+    }
+    VideoUtils::CopyFrameBuffer(dst, slot, size);
+    UnpinSlots(index, PRESENT_SLOTS);
     return true;
 }
 
@@ -1378,22 +1860,20 @@ const uint8_t* Screen::PresentedSlotLocked(size_t* index) const
         return _presentSlots[0];
     }
 
-    // A/V sync: present the frame latched _presentDelayFrames ago so video
-    // trails by the same constant latency as the audio path. During the
-    // first frames after start/reset the delay is clamped to what exists -
-    // the queue "fills" naturally, exactly the 1-2 frame startup buffering.
-    const uint64_t newest = _presentLatchCounter - 1;
-    uint64_t delay = GetEffectivePresentDelayFrames();
-    if (delay > newest)
-        delay = newest;
-
-    const size_t slot = (newest - delay) % PRESENT_SLOTS;
+    // A/V sync: the frame whose sound is heard now (CopyFrameAt)
+    const int64_t now =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    size_t chosen = PRESENT_SLOTS;
+    size_t next = PRESENT_SLOTS;
+    bool early = false;
+    // No slot holds a whole frame of this buffer's size (a mode switch is under way): the newest latched
+    if (!ChooseSlotLocked(now, &chosen, &next, &early))
+        chosen = static_cast<size_t>((_presentLatchCounter - 1) % PRESENT_SLOTS);
     if (index)
-        *index = slot;
-    _presentSlotShown[slot] = true;
-    _showingProcessed.store(_presentSlotProcessed[slot], std::memory_order_relaxed);
-    _shownReport = _presentSlotReport[slot];
-    return _presentSlots[slot];
+        *index = chosen;
+    // A screenshot or a capture: the temporal effect's marks, not the window's shown frame
+    MarkServedLocked(chosen);
+    return _presentSlots[chosen];
 }
 
 bool Screen::SetTemporalAlgorithm(const std::string& name)
@@ -1437,6 +1917,7 @@ bool Screen::SetTemporalAlgorithm(const std::string& name)
         }
         _temporalRestoreScreenHQ = _temporalRestoreZXDLSS = false;
     }
+    NotifyReadoutsChanged(_context, "video.temporal");
     return true;
 }
 
@@ -1466,7 +1947,7 @@ TemporalEffects::WriteResult Screen::WriteTemporalOutput(uint64_t serial, const 
                                                         const zxdlss::FrameReport& report)
 {
     using Result = TemporalEffects::WriteResult;
-    std::lock_guard<std::mutex> lock(_presentMutex);
+    std::unique_lock<std::mutex> lock(_presentMutex);
     const int fbWidth = static_cast<int>(_framebuffer.width);
     const int fbHeight = static_cast<int>(_framebuffer.height);
     if (_presentSlots[0] == nullptr || _presentBufferSize != static_cast<size_t>(fbWidth) * fbHeight * RGBA_SIZE)
@@ -1475,6 +1956,17 @@ TemporalEffects::WriteResult Screen::WriteTemporalOutput(uint64_t serial, const 
     {
         if (_presentSlotSerial[i] != serial)
             continue;
+        if (_presentSlotPins[i] != 0)
+        {
+            // A reader copies the frame: it gets it raw; the output goes in once the copy is done (the slot may hold
+            // another frame by then: look again)
+            WaitSlotUnpinnedLocked(lock, i);
+            if (_presentSlots[0] == nullptr ||
+                _presentBufferSize != static_cast<size_t>(fbWidth) * fbHeight * RGBA_SIZE)
+                return Result::Gone;
+            i = static_cast<size_t>(-1);
+            continue;
+        }
         // The ZX frame's place in this slot's framebuffer (recorded at its latch)
         const TemporalWindow& w = _presentSlotWindow[i];
         if (w.width != width || w.height != height || w.scaleX < 1 || w.x0 < 0 || w.y0 < 0 ||
@@ -1545,7 +2037,7 @@ void Screen::TemporalInput(TemporalFrame& frame)
 /// A/V delay (the temporal effect's look-ahead), so picture and sound stay in sync
 void Screen::UpdateAudioDelay()
 {
-    const int base = _presentDelayFrames.load(std::memory_order_acquire);
+    const int base = IsExternalPictureActive() ? ExternalDelayFrames(kAudioPathDelayFrames) : kAudioPathDelayFrames;
     const int effective = GetEffectivePresentDelayFrames();
     const int extra = effective > base ? effective - base : 0;
     if (extra == _audioExtraDelayFrames || !_context || !_context->pSoundManager)
@@ -1587,7 +2079,17 @@ void Screen::GetRGBAPalette16(uint32_t* colors)
 
 void Screen::SetDisplayViewport(const DisplayViewport& viewport)
 {
+    const bool changed = viewport.cropLeft != _displayViewport.cropLeft ||
+                         viewport.cropRight != _displayViewport.cropRight ||
+                         viewport.cropTop != _displayViewport.cropTop ||
+                         viewport.cropBottom != _displayViewport.cropBottom;
     _displayViewport = viewport;
+    // A front end crops its own picture: it follows a change made elsewhere (the WebAPI, a catalogue action)
+    if (changed && _context && _context->pEmulator)
+    {
+        MessageCenter& messageCenter = MessageCenter::DefaultMessageCenter();
+        messageCenter.Post(NC_VIDEO_VIEWPORT_CHANGED, new EmulatorFramePayload(_context->pEmulator->GetUUID(), 0));
+    }
 }
 
 const DisplayViewport& Screen::GetDisplayViewport() const
@@ -1605,6 +2107,11 @@ uint16_t Screen::GetDisplayHeight() const
     return _displayViewport.GetDisplayHeight(_framebuffer.height);
 }
 
+DisplayGeometry::Size Screen::GetDisplayGeometry() const
+{
+    return DisplayGeometry::Compute(GetDisplayWidth(), GetDisplayHeight());
+}
+
 /// endregion </Display viewport>
 
 uint16_t Screen::FirstStoredRasterLine() const
@@ -1619,6 +2126,20 @@ const RasterDescriptor& Screen::GetTimingDescriptor(VideoModeEnum mode) const
                                 _context != nullptr && _context->config.mem_model == MM_ATM3;
     if (mode == M_P384)
         return rasterDescriptors[M_PENTAGON128K];
+    if (mode == M_NEXT)
+    {
+        // the beam runs the frame family NR #03 chose (EmulatorState::ula_timing_class): 1 = 48K, 4 = Pentagon, else 128K
+        const uint8_t family = _state ? _state->ula_timing_class : 2;
+        if (_state && _state->ula_sixty_hz && family != 4)
+        {
+            // 60 Hz (zxula_timing.vhd): 264 lines, 8 blank (vc 0-7) + the 256 of the Next's grid; the paper at line 40 is 32 lines into
+            // the grid. The frame starts at vc 0, so the grid's first line is the first after the blank ones
+            static const RasterDescriptor sixty48 = {352, 256, 256, 192, 48, 32, 448, 64, 32, 4, 4};
+            static const RasterDescriptor sixty128 = {352, 256, 256, 192, 48, 32, 456, 64, 32, 4, 4};
+            return family == 1 ? sixty48 : sixty128;
+        }
+        return rasterDescriptors[family == 1 ? M_ZX48 : (family == 4 ? M_PENTAGON128K : M_ZX128)];
+    }
 
     // ATM Turbo 2 v4.50: 308-line raster, the 4 missing lines are vertical blank before the
     // visible area (frame and window placement unchanged). Inferred from the system ROM's
@@ -1711,6 +2232,11 @@ LineGeometry Screen::GetLineGeometry(VideoModeEnum mode, const RasterDescriptor&
         case M_SPRINTER:
             return {0, 184, 184, 4};
 
+        // GMX 640x200: the ZX paper window at 5 px/T, borders at 2 px/T (gmxgeometry.h)
+        case M_GMX:
+            return {static_cast<uint16_t>(GmxGeometry::kPaperStartT), static_cast<uint16_t>(GmxGeometry::kPaperTStates),
+                    static_cast<uint16_t>(GmxGeometry::kVisibleEndT), static_cast<uint8_t>(GmxGeometry::kPixelsPerT)};
+
         // Profi 512x240: the ZX paper window at 4 px/T, borders at 2 px/T
         case M_PROFIHR:
         {
@@ -1732,6 +2258,7 @@ const VideoModeInfo& Screen::GetVideoModeInfo(VideoModeEnum mode)
     static const VideoModeInfo pmc{"1 bpp bitmap + attribute per 8x1 cell", 16, 1, "8x1 pixels", 0, 0, 0, 6144, 6144, 12288};
     static const VideoModeInfo phr{"1 bpp (monochrome)", 2, 1, nullptr, 0, 0, 0, 0, 0, 0};
     static const VideoModeInfo p384{"2 colors per attribute block", 16, 1, "8x8 pixels", 0, 0, 0, 6144, 768, 6912};
+    static const VideoModeInfo gmx{"1 bpp bitmap + attribute per 8x1 cell", 16, 1, "8x1 pixels", 0, 0, 0, 16000, 16000, 32000};
     static const VideoModeInfo profiHr{"1 bpp, per-pixel palette (16 entries)", 16, 1, "8x1 pixels", 0, 0, 0, 0, 0, 0};
     static const VideoModeInfo atm16{"4 bpp (16 colors per pixel)", 16, 4, "per pixel pair (bit-planar)", 0, 0, 4, 16000, 0, 16000};
     static const VideoModeInfo atmHr{"1 bpp bitmap + attribute per 8x1 cell", 16, 1, "8x1 pixels", 0, 0, 0, 16000, 16000, 32000};
@@ -1748,11 +2275,13 @@ const VideoModeInfo& Screen::GetVideoModeInfo(VideoModeEnum mode)
         case M_PHR:     return phr;
         case M_P384:    return p384;
         case M_PROFIHR: return profiHr;
+        case M_GMX:     return gmx;
         case M_ATM16:   return atm16;
         case M_ATMHR:   return atmHr;
         case M_ATMTX:
         case M_ATMTL:   return atmText;
         case M_SPRINTER: return sprinter;
+        case M_NEXT: return zx;
         // ZX-layout modes; TSConf / GMX / Timex are not emulated yet and report
         // the ZX format until their renderers define one
         default:        return zx;
@@ -1780,7 +2309,7 @@ ScreenState Screen::DescribeScreenState() const
     s.pEFF7 = state.pEFF7;
     s.pDFFD = state.pDFFD;
     s.pFF77 = state.pFF77;
-    s.aFE = state.aFE;
+    s.aFE = state.atm.aFE;
     s.shadowScreenCapable = HasShadowScreen(s.model);
     s.activeRamPage = GetVideoRAMPage(s.model, s.p7FFD);
     s.activeScreen = s.activeRamPage == 7 ? 1 : 0;
@@ -1790,6 +2319,58 @@ ScreenState Screen::DescribeScreenState() const
     s.flashInverted = (state.frame_counter & 0x10) != 0;
     s.framesUntilFlashToggle = static_cast<uint8_t>(16 - (state.frame_counter % 16));
     return s;
+}
+
+void Screen::DescribeDisplayedMemory(std::vector<ScreenMemorySpan>& out) const
+{
+    // What each family's renderer reads (ScreenAtm, ScreenAlco, ScreenProfi, ScreenZX), as bytes of RAM pages. The
+    // palettes live in device state, not counted here
+    out.clear();
+    const uint8_t p7FFD = _context->emulatorState.p7FFD;
+    const uint32_t video = (p7FFD & 0x08) ? 7u : 5u;
+    auto page = [&](uint32_t p, uint32_t offset, uint32_t bytes) { out.push_back({nullptr, p * 0x4000u + offset, bytes}); };
+    switch (_mode)
+    {
+        case M_ATM16:   // the four bit-planes at {vp - 4, vp} + {0, #2000}
+        case M_ATMHR:   // pixels in vp, attributes in vp - 4, both halves
+            for (const uint32_t p : {video, video - 4})
+            {
+                page(p, 0x0000, 8000);   // 40 bytes x 200 lines a plane
+                page(p, 0x2000, 8000);
+            }
+            break;
+        case M_ATMTX:   // 25 rows of 64 bytes from #01C0 in both halves of vp; attributes from #01C0 and #21C0 of vp - 4
+            for (const uint32_t p : {video, video - 4})
+            {
+                page(p, 0x01C0, 0x0629);   // the attributes of vp - 4 run one byte further (#01C1 + index)
+                page(p, 0x21C0, 0x0629);
+            }
+            out.push_back({"device.EvoFontRam", 0, 4096});   // a ZX-Evo program may load its own font
+            break;
+        case M_ATMTL:   // ZX-Evo text linear: codes and attributes of one page, 8 or 10
+            page((p7FFD & 0x08) ? 10u : 8u, 0, 0x4000);
+            out.push_back({"device.EvoFontRam", 0, 4096});
+            break;
+        case M_P16:     // AlCo 16 colours: the ZX pixel layout in both halves of the video page and its pair
+            for (const uint32_t p : {video, video ^ 1u})
+            {
+                page(p, 0x0000, 0x1800);
+                page(p, 0x2000, 0x1800);
+            }
+            break;
+        case M_PMC:     // hardware multicolour: pixels, and 8 x 1 attributes at #2000, in the video page
+            page(video, 0x0000, 0x1800);
+            page(video, 0x2000, 0x1800);
+            break;
+        case M_PROFIHR: // pixels in page 4 / 6; attributes in page #38 / #3A unless the board has no palette chips
+            page((p7FFD & 0x08) ? 6u : 4u, 0, 0x4000);
+            if (!ProfiMonochromeHires(_context->config) && _context->pMemory)
+                page(((p7FFD & 0x08) ? 0x3Au : 0x38u) & _context->pMemory->GetRamMask(), 0, 0x4000);
+            break;
+        default:        // the ZX layout: 6,912 bytes of page 5, or 7 on a machine with a shadow screen
+            page(GetVideoRAMPage(_context->config.mem_model, p7FFD), 0, 6912);
+            break;
+    }
 }
 
 std::vector<uint16_t> Screen::GetDisplayedRAMPages(VideoModeEnum mode, MEM_MODEL model, uint8_t p7FFD)
@@ -1804,6 +2385,7 @@ std::vector<uint16_t> Screen::GetDisplayedRAMPages(VideoModeEnum mode, MEM_MODEL
         case M_P16:
         case M_PMC:
         case M_PROFIHR:
+        case M_GMX:
             return GetActiveSurfaceRAMPages(mode, effective7FFD, true);
         default:
             return {GetVideoRAMPage(model, p7FFD)};
@@ -1847,8 +2429,12 @@ std::vector<uint16_t> Screen::GetActiveSurfaceRAMPages(VideoModeEnum mode, uint8
         case M_PROFIHR:
             return (p7FFD & 0x08) ? std::vector<uint16_t>{6, 0x3A} : std::vector<uint16_t>{4, 0x38};
 
+        // GMX 640x200: pixel page #39 (#3B with 7FFD.3), attribute page 64 above it (gmxgeometry.h)
+        case M_GMX:
+            return {GmxGeometry::PixelPage(p7FFD), GmxGeometry::AttrPage(p7FFD)};
+
         // ZX family and every other mode: fall back to the classic surface
-        // (Profi/GMX/TS renderers are stubbed on master until they define one)
+        // (TS renderers are stubbed on master until they define one)
         default:
         {
             if (bankedZX)
@@ -1932,6 +2518,9 @@ std::string Screen::GetVideoModeName(VideoModeEnum mode)
             break;
         case M_SPRINTER:
             result = "Sprinter";
+            break;
+        case M_NEXT:
+            result = "Next";
             break;
         default:
             result = "Unknown";
@@ -2022,7 +2611,13 @@ void Screen::DrawPeriod(uint32_t fromTstate, uint32_t toTstate)
         }
     }
 
-    if (fromTstate >= maxFrameDuration || toTstate >= maxFrameDuration)
+    // A step that ends far past the frame end (the TS-Conf arbiter holding the CPU while DMA owns the bus, a long
+    // wait) still had the beam draw the frame's tail: draw up to the end, not nothing (the renderers stop at their
+    // own frame end)
+    if (fromTstate < maxFrameDuration && toTstate >= maxFrameDuration)
+        toTstate = maxFrameDuration - 1;
+
+    if (fromTstate >= maxFrameDuration)
     {
         MLOGERROR("Screen::DrawPeriod - Incorrect fromTstate: %d and/or toTstate: %d. MAX_FRAME_DURATION: %d. Skipping period.",
                   fromTstate, toTstate, maxFrameDuration);
@@ -2465,6 +3060,7 @@ std::string Screen::GetVideoVideoModeName(VideoModeEnum mode)
         "Profi 512x240",        // M_PROFIHR
         "TSConf ZX",            // M_TSZX
         "Sprinter",             // M_SPRINTER
+        "ZX Spectrum Next",     // M_NEXT
     };
     static_assert(std::size(videoModeName) == M_MAX, "videoModeName array size mismatch with VideoModeEnum");
 

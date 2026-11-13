@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <vector>
 
 #include "common/filehelper.h"
@@ -24,6 +25,7 @@
 #include "emulator/sound/chips/soundchip_ay8910.h"
 #include "emulator/sound/soundmanager.h"
 #include "emulator/video/screen.h"
+#include "loaders/snapshot/snapshotcapture.h"
 #include "loaders/snapshot/szx/szxreader.h"
 #include "loaders/snapshot/szx/szxwriter.h"
 
@@ -59,14 +61,18 @@ namespace
     }
 
     /// The running machine can hold the snapshot's machine
-    bool MachineFits(EmulatorContext* context, const Machine& machine, Report& report)
+    bool MachineFits(MEM_MODEL running, uint32_t ramKb, const Machine& machine, Report& report)
     {
-        const MEM_MODEL running = context->config.mem_model;
-        const uint32_t ramKb = context->config.ramsize;
         if (machine.model == MM_SCORP && running == MM_PROFSCORP)
         {
             report.warnings.push_back("Scorpion ZS-256 snapshot loaded on a Scorpion with ProfROM (the configured ROM stays)");
             return ramKb >= machine.ramKb;
+        }
+        if (machine.model == MM_SCORP && running == MM_GMX)
+        {
+            report.warnings.push_back("Scorpion ZS-256 snapshot loaded on a Scorpion with the GMX card (its Scorpion "
+                                      "scheme, ROM plane 4)");
+            return true;
         }
         if (running != machine.model)
             return false;
@@ -301,6 +307,12 @@ bool LoaderSZX::save()
     return true;
 }
 
+bool LoaderSZX::Suits(MEM_MODEL runningModel, uint32_t runningRamKb, const Machine& machine)
+{
+    Report ignored;
+    return MachineFits(runningModel, runningRamKb, machine, ignored);
+}
+
 bool LoaderSZX::ProbeMachine(const std::string& path, Machine& machine, std::string& error)
 {
     uint8_t header[kHeaderSize] = {};
@@ -347,7 +359,7 @@ bool LoaderSZX::CommitImage(EmulatorContext* context, const snapshot::Image& ima
         return false;
     if (!machine.note.empty())
         report.warnings.push_back(machine.note);
-    if (!MachineFits(context, machine, report))
+    if (!MachineFits(context->config.mem_model, context->config.ramsize, machine, report))
     {
         error = "the snapshot was saved on a " + DescribeModel(machine.model, machine.ramKb) +
                 ", the running machine is a " + DescribeModel(context->config.mem_model, context->config.ramsize) +
@@ -364,7 +376,10 @@ bool LoaderSZX::CommitImage(EmulatorContext* context, const snapshot::Image& ima
 
     Core& core = *context->pCore;
     Memory& memory = *context->pMemory;
+    // The video mode the image's ports select is set up once, before the picture: the reset's on the way is not built
+    std::optional<Screen::RasterDeferral> raster(std::in_place, context->pScreen);
     core.Reset();
+    memory.ClearModelRAM();  // the pages the image does not carry keep nothing of the program before it
 
     // RAM: the machine's pages; a page outside its RAM is reported. A 48K
     // keeps its three pages under their 128K numbers 5, 2 and 0
@@ -449,6 +464,7 @@ bool LoaderSZX::CommitImage(EmulatorContext* context, const snapshot::Image& ima
     state.pFE = version >= 0x0101 ? static_cast<uint8_t>((image.portFE.value_or(0) & 0xF8) | border)
                                   : static_cast<uint8_t>((state.pFE & 0xF8) | border);
     state.border_attr = border;
+    raster.reset();
     if (context->pScreen)
     {
         context->pScreen->FillBorderWithColor(border);
@@ -470,6 +486,10 @@ void LoaderSZX::ApplyPaging(EmulatorContext* context, const snapshot::Image& ima
     // The TR-DOS session comes from the snapshot, not from what the machine
     // was doing before the load (the SNA loader's rule)
     state.flags &= ~CF_TRDOS;
+    // The GMX card's latches are not in the SZX: the machine leaves its loader plane for the Scorpion scheme first.
+    // Other models restore their own extensions from the snapshot's blocks (the Pentagon 1024's #EFF7 included)
+    if (context->config.mem_model == MM_GMX)
+        ports.EnterSpectrum128Paging(pc);
     memory.UpdateZ80Banks();
 
     if (image.memoryModel == snapshot::MemoryModel::Mem48k)   // HasAy(machine id): the 128K family
@@ -598,9 +618,10 @@ namespace
             candidates.push_back(Utf8(base / storedPath.filename()));
         }
         candidates.push_back(normalized);
+        // in the native form: a link taken on another platform reads as the same path as one inserted here
         for (const std::string& candidate : candidates)
             if (FileHelper::FileExists(candidate))
-                return candidate;
+                return FileHelper::NormalizePath(candidate);
         return {};
     }
 
@@ -1024,7 +1045,14 @@ bool LoaderSZX::Capture(EmulatorContext* context, Stage& stage, std::string& err
         error = "no machine to save";
         return false;
     }
-    const std::optional<uint8_t> id = IdFor(context->config.mem_model, context->config.ramsize);
+    // What the snapshot shows of the machine: its 128K view (a Sprinter in its Pentagon 128 mode is a Pentagon 128 here)
+    const snapshot::MachineView view = snapshot::ExamineView(*context);
+    if (!view.available)
+    {
+        error = view.reason;
+        return false;
+    }
+    const std::optional<uint8_t> id = IdFor(view.model, view.ramKb);
     if (!id)
     {
         error = "this model has no SZX machine id; save it as .z80 or .sna";
@@ -1074,17 +1102,16 @@ bool LoaderSZX::Capture(EmulatorContext* context, Stage& stage, std::string& err
     const EmulatorState& state = context->emulatorState;
     SpecRegs spec;
     spec.border = static_cast<uint8_t>(state.border_attr & 0x07);
-    spec.port7FFD = HasAy(*id) ? state.p7FFD : 0;
-    spec.port1FFDorEFF7 = HasPort1FFD(*id) ? state.p1FFD : (HasPortEFF7(*id) ? state.pEFF7 : 0);
+    spec.port7FFD = HasAy(*id) ? view.p7FFD : 0;
+    spec.port1FFDorEFF7 = HasPort1FFD(*id) ? view.p1FFD.value_or(0) : (HasPortEFF7(*id) ? view.pEFF7.value_or(0) : 0);
     spec.portFE = state.pFE;
     stage.spec = spec;
 
-    Memory& memory = *context->pMemory;
     for (uint8_t page : PagesOf(*id))
     {
-        const uint8_t* bytes = memory.RAMPageAddress(page);
-        if (bytes)
-            stage.pages[page] = std::vector<uint8_t>(bytes, bytes + kPageSize);
+        const auto bank = view.banks.find(page);
+        if (bank != view.banks.end())
+            stage.pages[page] = std::vector<uint8_t>(bank->second, bank->second + kPageSize);
     }
 
     SoundChip_AY8910* ay = (HasAy(*id) && context->pSoundManager) ? context->pSoundManager->getAYChip(0) : nullptr;

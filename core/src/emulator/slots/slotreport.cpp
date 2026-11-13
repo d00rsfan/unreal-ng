@@ -46,6 +46,24 @@ bool Applies(const CardDef& card, const CardOptions& options, const When& when)
     return when.option == Opt::None || (OptionBits(card, options, when.option) & when.anyOf) != 0;
 }
 
+/// One port claim: the range as text and as numbers (a front end that attributes a port access to its device tests
+/// (port & mask) == match), the direction, the IORQGE and the gate; `port` the documented port when the claim names one
+StateNode PortNode(const PortClaim& claim)
+{
+    StateNode port = StateNode::Object();
+    port["range"] = FormatPortRange(claim.mask, claim.match);
+    port["mask"] = static_cast<int>(claim.mask);
+    port["match"] = static_cast<int>(claim.match & claim.mask);
+    if (claim.port != 0)
+    {
+        port["port"] = static_cast<int>(claim.port);
+    }
+    port["direction"] = DirName(claim.dir);
+    port["iorqge"] = Describe(claim.iorqge).id;
+    port["gate"] = Describe(claim.gate).id;
+    return port;
+}
+
 /// `networkOff`: the runtime feature `network` is off - a power switch of the network devices (owner decision
 /// 2026-10-05): a fitted ZX-bus network card stays in its slot, unpowered, and its state says so
 StateNode SlotNode(const SlotManager::Slot& slot, const SlotPlanner& planner, bool networkOff)
@@ -57,13 +75,33 @@ StateNode SlotNode(const SlotManager::Slot& slot, const SlotPlanner& planner, bo
     if (card != nullptr)
     {
         node["name"] = card->name;
+        node["label"] = PlainLabel(card->name);
         node["options"] = FormatCardOptions(*card, slot.entry.options);
     }
     else if (slot.entry.card == kEmptySocket)
     {
         node["name"] = "empty AY socket";
+        node["label"] = "empty AY socket";
     }
     node["adapter"] = slot.entry.adapter;
+    // The bus the card sits on: the slot's bus, or - behind an adapter - the adapter's own bus, hosted by the slot
+    // (the Sprinter's ISA to ZX-bus adapter: `isa.1 = neogs` is on the ZX-bus `isa.1.zxbus`, SL-8)
+    const AdapterDef* adapter = slot.entry.adapter.empty() ? nullptr : planner.FindAdapter(slot.entry.adapter);
+    if (adapter != nullptr)
+    {
+        node["bus"] = slot.entry.slot + "." + Describe(adapter->cardSide).id;
+        node["busKind"] = Describe(adapter->cardSide).id;
+        node["host"] = slot.entry.slot;
+    }
+    else
+    {
+        const size_t dot = slot.entry.slot.rfind('.');
+        node["bus"] = dot == std::string::npos ? slot.entry.slot : slot.entry.slot.substr(0, dot);
+        if (card != nullptr)
+        {
+            node["busKind"] = Describe(card->bus).id;
+        }
+    }
     node["fit"] = FitName(slot.fit);
     node["state"] = slot.entry.disabled                                     ? "disabled"
                     : networkOff && slot.group == SlotCardGroup::Network ? "feature network off"
@@ -91,12 +129,7 @@ StateNode SlotNode(const SlotManager::Slot& slot, const SlotPlanner& planner, bo
             {
                 continue;
             }
-            StateNode port = StateNode::Object();
-            port["range"] = FormatPortRange(claim.mask, claim.match);
-            port["direction"] = DirName(claim.dir);
-            port["iorqge"] = Describe(claim.iorqge).id;
-            port["gate"] = Describe(claim.gate).id;
-            ports.push(std::move(port));
+            ports.push(PortNode(claim));
         }
         node["ports"] = std::move(ports);
         StateNode media = StateNode::Array();
@@ -160,7 +193,47 @@ StateNode Slots(EmulatorContext* context)
         b["note"] = bus.note;
         buses.push(std::move(b));
     }
+    // A card in a slot of the machine's own that hosts a bus (the ZX-bus adapter): that bus, hosted by the slot
+    for (const SlotManager::MachineSlot& machineSlot : result.machineSlots)
+    {
+        if (machineSlot.hosts.empty())
+        {
+            continue;
+        }
+        StateNode b = StateNode::Object();
+        b["id"] = machineSlot.slot + "." + machineSlot.hosts;
+        b["kind"] = machineSlot.hosts;
+        b["host"] = machineSlot.slot;
+        b["arbitration"] = Describe(Arbitration::None).id;   // behind the ISA window no device competes
+        b["physicalSlots"] = 1;
+        b["retrofit"] = false;
+        b["note"] = "the " + machineSlot.name + " in " + machineSlot.slot + " (" + machineSlot.source +
+                    "): its card is the [SLOTS] entry " + machineSlot.slot;
+        buses.push(std::move(b));
+    }
     node["buses"] = std::move(buses);
+
+    // The machine's own slots (the Sprinter's ISA slots, SL-8): the board's cards, configured in its own section
+    StateNode machineSlots = StateNode::Array();
+    for (const SlotManager::MachineSlot& machineSlot : result.machineSlots)
+    {
+        StateNode m = StateNode::Object();
+        m["slot"] = machineSlot.slot;
+        m["bus"] = machineSlot.bus;
+        m["card"] = machineSlot.card;
+        m["name"] = machineSlot.name;
+        m["label"] = PlainLabel(machineSlot.name);
+        m["source"] = machineSlot.source;
+        m["details"] = machineSlot.details;
+        if (!machineSlot.hosts.empty())
+        {
+            m["hostsBus"] = machineSlot.slot + "." + machineSlot.hosts;
+            const SlotManager::Slot* hosted = result.FindSlot(machineSlot.slot);
+            m["hostedCard"] = hosted != nullptr ? hosted->entry.card : std::string("none");
+        }
+        machineSlots.push(std::move(m));
+    }
+    node["machineSlots"] = std::move(machineSlots);
 
     const bool networkOff = context->pFeatureManager != nullptr && !context->pFeatureManager->isEnabled(Features::kNetwork);
     StateNode slotList = StateNode::Array();
@@ -176,6 +249,7 @@ StateNode Slots(EmulatorContext* context)
         StateNode b = StateNode::Object();
         b["id"] = builtIn.id;
         b["name"] = builtIn.name;
+        b["label"] = PlainLabel(builtIn.name);
         b["kind"] = Describe(builtIn.kind).id;
         b["state"] = builtIn.state;
         if (builtIn.removed)
@@ -186,6 +260,38 @@ StateNode Slots(EmulatorContext* context)
         {
             b["source"] = builtIn.source;
         }
+        // Its functions and ports from the machine's declaration, as a card's: the device registry in one report
+        const BuiltInDef* def = nullptr;
+        for (const BuiltInDef& candidate : result.machine->builtIns)
+        {
+            if (builtIn.id == candidate.id)
+            {
+                def = &candidate;
+            }
+        }
+        StateNode functions = StateNode::Array();
+        StateNode ports = StateNode::Array();
+        if (def != nullptr)
+        {
+            if (def->socket != nullptr)
+            {
+                b["socket"] = def->socket;
+            }
+            if (def->chip != nullptr && def->chip[0] != '\0')
+            {
+                b["chip"] = def->chip;
+            }
+            for (const Function function : def->functions)
+            {
+                functions.push(Describe(function).id);
+            }
+            for (const PortClaim& claim : def->claims)
+            {
+                ports.push(PortNode(claim));
+            }
+        }
+        b["functions"] = std::move(functions);
+        b["ports"] = std::move(ports);
         builtIns.push(std::move(b));
     }
     node["builtIns"] = std::move(builtIns);

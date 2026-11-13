@@ -25,8 +25,8 @@
 #include <vector>
 
 #include "emulator/media/mediatypes.h"
+#include "emulator/io/storage/iblockdevice.h"
 
-class IBlockDevice;
 
 /// What sector 0 of a block image holds, by the same rules as the advisory:
 /// a FAT boot sector (the SD card layout) or an MBR partition table (the
@@ -41,8 +41,11 @@ SectorZeroLayout ClassifySectorZero(const uint8_t* sector, size_t size);
 
 /// Empty when sector 0 is unreadable, ambiguous, or matches what the tags
 /// expect. Never throws, never fails the insert - `block`'s read position is
-/// unaffected on return (this only reads sector 0)
-std::string DescribeBlockLayoutMismatch(IBlockDevice& block, const std::vector<std::string>& tags);
+/// unaffected on return (this only reads sector 0). `sdReadsMbr`: the slot's
+/// SD boot path finds the first FAT partition (SlotDescriptor::folderMbr, the
+/// ZX-Evolution Baseconf, the GMX monitor, the Next), so an MBR is not flagged
+std::string DescribeBlockLayoutMismatch(IBlockDevice& block, const std::vector<std::string>& tags,
+                                        bool sdReadsMbr = false);
 
 /// The FAT flavour of a block medium: the BPB of sector 0 when it is a FAT
 /// volume, or of the first FAT partition when sector 0 holds an MBR. nullopt
@@ -50,3 +53,14 @@ std::string DescribeBlockLayoutMismatch(IBlockDevice& block, const std::vector<s
 /// what to do with the answer is the caller's business (BUGS.md #1: a slot
 /// whose controller reads FAT32 only refuses a FAT16 image)
 std::optional<FatType> ProbeFatType(IBlockDevice& block);
+
+/// One FAT volume of a block medium (ProbeFatVolumes)
+struct FatVolumeProbe
+{
+    uint32_t partition = 0;  ///< 0: the volume starts at sector 0; 1-4 primary, 5+ logical (as `partition: N`)
+    FatType fs = FatType::Fat16;
+};
+
+/// Every FAT volume of a block medium: the one at sector 0, or each FAT partition of its MBR, primary and logical
+/// (the extended partition's chain). Unreadable and non-FAT entries are left out
+std::vector<FatVolumeProbe> ProbeFatVolumes(IBlockDevice& block);

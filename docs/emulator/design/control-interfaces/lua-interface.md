@@ -75,9 +75,30 @@ The model is a configuration name (`ZXPOLY-48K`, `ZXPOLY-128K`,
 
 ### Running Scripts
 
-#### From Command Line
+#### From Command Line (the headless runner)
 ```bash
-unreal-emulator --lua-script macro.lua
+unreal-qt --headless --script check.lua --exit-on-script [snapshot.sna]
+echo $?    # the script's exit code
+```
+
+- `--script <file>` runs the file once the Lua interpreter and the emulator are up (a file to open on the command
+  line is opened first; without one the runner starts the Machine menu's machine, as Start does). The window's sole
+  emulator becomes the selected one, the one the script acts on. Its `print` goes to stdout. The script runs on the interpreter's thread; deferred
+  callbacks run when it calls `callbacks_run()`.
+- `--exit-on-script` quits when the script ends. The exit code is the chunk's result: an integer as is, `true` 0,
+  `false` 1, nothing 0; an error (also a missing file, or an interpreter that did not start within 30 s) is 1, with
+  the message on stderr. Return the code; `os.exit` ends the process without the emulator's shutdown.
+- `--headless` uses the offscreen platform (no windows; an explicit `QT_QPA_PLATFORM` wins) and mutes the emulator
+  (the mixer's master) before the script runs.
+
+```lua
+-- check.lua: all four DAC channels of the General Sound play within 100 frames
+gs_on_dac_fetch([[return function(hit) shared_set("ch" .. hit.arg, true) end]], {mode = "sync"})
+run_frames(100)
+for ch = 0, 3 do
+    if not shared_get("ch" .. ch) then print("channel " .. ch .. " silent"); return 1 end
+end
+return 0
 ```
 
 #### From CLI Interface
@@ -110,9 +131,6 @@ sleep(100)
 
 -- Get current timestamp
 time = os.time()
-
--- Toggle Videowall Single Sync Mode
-videowall_singlesync(true, "emulator-id")
 ```
 
 ### Tape Operations
@@ -122,10 +140,10 @@ Global functions mirroring the CLI `tape` commands and the WebAPI `/tape/*` endp
 ```lua
 -- Load / eject
 local ok, why = tape_load("/path/to/game.tap")  -- A tape (.tap/.tzx/.spc/.sta/.ltp/.zxt) or a folder
-local ok = tape_eject()                     -- The tape leaves the tape slot (false while TTD records)
+local ok = tape_eject()                     -- The tape leaves the tape slot (while TTD records: at the next frame boundary)
 
 -- Transport (same semantics as `tape play|pause|stop|rewind|seek`)
-tape_play()      -- start at consumption cursor; resumes in place when paused
+tape_play()      -- start at consumption cursor; resumes in place when paused; queued for a tape still landing
 tape_pause()     -- freeze mid-block (idempotent); false when not playing
 tape_stop()      -- terminal stop: invalidates the loaded image
 tape_rewind()    -- rewind to block 0, image kept
@@ -185,6 +203,18 @@ media_eject("B", {export = "/tmp/b.trd"})
 media_info("sd"); media_formats("floppy"); media_save("A"); media_export("sd", "/tmp/card.img")
 media_targets("/discs/dna_nemo.iso")                    -- where a file can go: file, targets, default, refusal
 media_discard("A"); media_rescan("sd"); media_create("B"); media_protect("A", true)
+media_volumes("hd")                                     -- the file systems: TR-DOS, +3DOS, iS-DOS / TASiS, ATM CP/M, MB-02, MDOS, FAT partitions
+media_files("A", "SHELL", {recursive = true})           -- a directory's entries; {volume = "p1"} picks a volume
+media_read("A", "read_me.txt", {out = "/tmp/r.txt"})    -- base64 data, or written to out
+local bytes, why = media_read_bytes("hd", "AUTOEXEC.BAT", "p1")  -- the bytes as a string, or nil and the reason
+media_write("A", "PROG.C", "\243\201", {start = 0x8000})  -- onto any file system of the disk; nil, {["in"] = "prog.bin"} a host file
+media_rename("A", "PROG.C", "GAME.C")                   -- a bare name stays in its directory; "/x" moves a file or a directory (iS-DOS, FAT)
+media_delete("hd", "OLD.TXT", {volume = "p1"})
+media_mkdir("hd", "GAMES/NEW", {parents = true})         -- a FAT directory, an iS-DOS catalogue
+media_mkdir("A", "WORK", {continuous = true, blocks = 4}) -- an iS-DOS continuous catalogue of 4 blocks
+media_delete("hd", "GAMES", {recursive = true})          -- a directory with its contents
+media_attrib("hd", "GAME.COM", {attributes = "+R-H", time = "2026-10-26 14:30"})  -- FAT RHSA, iS-DOS RWHD, +3DOS RSA
+media_label("hd", "WORK DISK")                           -- FAT label, TR-DOS title, iS-DOS device name
 media(verb, slot, path, opts)                           -- any verb
 ```
 
@@ -200,6 +230,7 @@ user guide [docs/features/slots.md](../../../features/slots.md)).
 ```lua
 r = slots_state()          -- buses, slots (card, options, adapter, fit, state), built-ins, plan log
 c = slots_catalog()        -- every card: options, functions, ports, media, thisMachine {slot, fit, outcome, removes}
+c = slots_catalog("zxbus.1")  -- the same, each card planned into that slot (thisMachine.inSlot: the card there now)
 m = slots_matrix("cards")  -- the compatibility tables as markdown (all without an argument)
 
 r = slots_plug("zxbus.next", "multisound", {dry_run = true})                -- the plan only
@@ -217,6 +248,98 @@ option (`dip = {"ym", "saa"}` works too). Each returns the reply table every sur
 `plan` (`removed` with each card's `undo`, `shadowed`, `lostFunctions`, `media`, `lines`, ...), `restart`
 (`restarted`, `previousEmulatorId`, `emulatorId`, `started`) and `media`. A change restarts the machine: a script bound
 to the old instance follows it to the new one; the selection follows too.
+
+### Game Controllers
+
+The machine's joystick connectors and the host's game controllers - the same verbs, options and replies as the CLI
+`controllers`, the WebAPI `/controllers`, MCP and Python ([command-interface.md section 15](./command-interface.md#15-game-controllers)).
+
+```lua
+controllers("list")                                     -- the selected machine's connectors
+controllers("plug", "auto", "kempston-joystick")
+controllers("input", "kempston", nil, {press = "up+fire"})
+controllers_host("bindings", {layer = "play"})          -- any host verb with its options as a table
+
+local h = controllers_haptics()                         -- devices: available / reason, actuators, effects
+for _, device in ipairs(h.devices) do
+    if device.available then controllers_rumble(device.id, "clicks") end
+end
+```
+
+A control surface's outputs (the Surface Dial; [command-interface.md §15](./command-interface.md#15-game-controllers)):
+`controllers_output(dial, "buzz")`, `controllers_output(dial, {steps = 36, clicks = "off"})`,
+`controllers_output(dial, {marks = "second,edge"})`.
+
+Battery, light and notice: `controllers_host("devices").devices[i]` has `battery` (`text` is `unknown` when the OS
+says nothing), `light.available` and `notice`; `controllers_light(device, "#ff8000")` (or `"255,128,0"`, `"off"`) sets
+the light.
+
+`controllers(verb, [connector], [device], [opts])`, `controllers_host(verb, [opts])`, `controllers_haptics([device])`,
+`controllers_rumble(device, [effect])` (`identify` by default), `controllers_output(device, pattern | {steps, clicks,
+marks})`, `controllers_light(device, color)`. Each returns the reply table: `ok`, `error`, `message`
+and the verb's fields. The host side needs the Qt client (a headless process answers `unavailable`).
+
+### Host Actions
+
+Global functions over the core `ActionRegistry` - the same ids, values and errors as the CLI `action`, the WebAPI
+`/controllers/actions`, MCP `actions` and Python ([command-interface.md section 16](./command-interface.md#16-host-actions)).
+A changing action passes the script gate as the script's own control calls.
+
+```lua
+for _, a in ipairs(actions().actions) do print(a.id, a.available, a.reason) end
+action("run.pause_toggle")                 -- a press
+local r = action("run.step_in")            -- {ok = true, result = {pc = ..., state = "paused", ...}}
+action("ttd.jog_frames", -10)              -- a delta: signed steps
+action("run.turbo_hold", false)            -- the release of a held action
+action("run.n_scanlines", nil, {count = 8})
+```
+
+`actions()`, `action(id, [value], [params])`; value nil (a press), a boolean, a number (steps or a 0..1 level), a
+string or a table `{pressed, delta, rate, level, text}`. Each returns a table: `ok`, `error`, `message`, `result`.
+
+The control-surface actions and the context (control surfaces phase S2):
+
+```lua
+local r = action("ttd.seek_by", {delta = -3, rate = 18}, {unit = "seconds"})
+for _, m in ipairs(r.result.marks) do print(m.kind, m.frame) end   -- second, ten_seconds, bookmark, edge, barrier
+action("run.step_by", -4)                  -- back through the history (forward: step in), 16 at most
+action("ctx.set", "ttd.timecode")          -- the last setter wins; "" returns to the default
+print(context().context, context().by)     -- {ok, instance, context, set, by, default}
+```
+
+The control surface targets, readouts and activity (`surfaces(verb, {args})`,
+[command-interface.md §16.1](./command-interface.md#161-surface-targets-readouts-activity)):
+
+```lua
+local v = surfaces("views")                -- {ok, followed = {instance, index, model, view, mode, pin, source}, views}
+local s = surfaces("session_open", {name = "my script"}).session.id
+surfaces("pin", {session = s, target = "view:v1"})       -- follow | view:<id> | instance:<id|index>
+print(surfaces("target", {session = s}).target.instance)
+local r = surfaces("readouts", {names = {"run.state", "media.*"}})   -- r.values["run.state"].state
+local a = surfaces("activity", {since = 0})                          -- a.entries, a.last, a.dropped
+surfaces("session_close", {session = s})
+```
+
+The Stream Deck daemon (`streamdeck(verb, {args})`,
+[command-interface.md §16.2](./command-interface.md#162-the-stream-deck-daemon)):
+
+```lua
+local st = streamdeck("status").status     -- st.state ("running", "waiting", ...), st.pid, st.daemon.version
+streamdeck("settings", {mode = "always", activity = "line"})
+streamdeck("pair")                         -- the user approves it at the GUI
+streamdeck("brightness", {deck = "A1B2C3", value = 40})
+local packs = streamdeck("packs").packs    -- packs[1].name, packs[1].title
+streamdeck("pack", {deck = "A1B2C3", pack = "os4"})   -- pack = "scenario": its scenario's again
+```
+
+Monitoring (`monitor(name, {instance = })`, [command-interface.md §17](./command-interface.md#17-monitoring)); an
+instance's name reads this emulator unless `instance` names another:
+
+```lua
+local stats = monitor("emulator.stats")       -- stats.fps, stats.speed_percent, stats.cpu.mhz, stats.interrupts_per_frame
+local host = monitor("host.stats")            -- host.cpu_percent, host.rss_bytes, host.threads
+local groups = bp_groups().groups             -- {{name, total, active, ids}}
+```
 
 ### Disk Operations
 
@@ -284,7 +407,7 @@ mouse_buttons({"left","middle"})   --> state | nil, err    ({} = none)
 mouse_wheel(steps)                 --> state | nil, err    (-7..7, not 0)
 mouse_release_all()                --> state | nil, err
 mouse_set_counters(x, y)           --> state | nil, err    (debug: raw 0..255)
-mouse_status([device])             --> state | nil, err    (device: "kempston" | "sprinter" | "evo-ps2")
+mouse_status([device])             --> state | nil, err    (device: "kempston" | "sprinter" | "evo-ps2" | "amx")
 mouse_click_pending()              --> true while a click is still holding its button
 mouse_button_names()               --> {"left","right","middle"}
 ```
@@ -347,8 +470,8 @@ joystick_tap_pending()             --> true while a tap is still holding its but
 joystick_button_names()            --> {"up","down","left","right","fire","b5","b6","b7"}
 ```
 
-`state` has the same key names as the WebAPI state object: `available`, `present`, `wired`,
-`state` (the byte), `port_value` (what `IN #1F` returns), `buttons = {up=..., ...}`, `pressed`
+`state` has the same key names as the WebAPI state object: `available`, `present`, `wired`, `fit`
+(`""` when wired, else how to fit the slot card `kempston`), `state` (the byte), `port_value` (what `IN #1F` returns), `buttons = {up=..., ...}`, `pressed`
 (array of names), `button_names`, `keys`, `pending_tap` (`{mask, frames_left}`, or **absent**),
 plus `warning` when the guest cannot see the buttons.
 
@@ -420,7 +543,14 @@ ok, msg = midi_panic()     -- every voice stops (a TTD live input)
 ms  = audio_moonsound_state()       -- MoonSound OPL4: NEW/NEW2, latches, mix, wave_memory, keyed channels/slots
 msf = audio_moonsound_state("fm")   -- its 18 FM channels, timers, register banks
 msp = audio_moonsound_state("pcm")  -- its 24 wavetable slots, envelopes, register file
-fdc = fdc_state()           -- Beta Disk WD1793: registers, status_bits, fsm_state, signals, drives[4]
+dev = devices_state()       -- the reports this machine has: reports[i] = {id, title, available, summary, route, cli, script, mcp}; devices_state(true): the absent ones too, with description
+fdc = fdc_state()           -- Beta Disk WD1793: registers, status_bits, fsm_state, signals, drives[4], history
+-- Device histories by registry id (../debugger/device-history.md): off / ring / capture, a JSON Lines stream
+history_list()
+history("beta128", 8)       -- stats + the newest 8 records
+history_config("beta128", {mode = "capture", limit = 0, stream = "scratch/fdc.jsonl"})
+history_clear("beta128")
+history_pause("zxbus.1")    -- hold the GS history (nothing recorded, the records kept); history_pause("zxbus.1", false) goes on
 ide = ide_state()           -- IDE board: scheme, adapter latches, units[2] (task_file, command, atapi)
 cd = cdaudio_state()        -- CD drives' audio: drives[] (slot, disc + tracks, audio status / head / track / index, drive_volume, mixer)
 r = cdaudio("play", "", {track=2})   -- verbs: status, play (track/to, lba/frames, msf/end), pause, resume, stop, volume, mixer
@@ -435,11 +565,41 @@ vid, err = sprinter_video{page=1, all=false, squares=false}  -- the mode table: 
 pal, err = sprinter_palette(4)    -- palettes (0-7, "all", default "used"): pens n / rgb "#RRGGBB" (R,G,B as stored) / vram
 ring = sprinter_sound_ring()      -- the Covox-Blaster ring: rows (16 words, [ ] playing, < > next write), words[256]
 zx = sprinter_zx_mode()           -- the ZX mode: active, config.best_match.file ("SP.ZX"), options, clock, frame.int, rom, ports; sprinter_zx_mode(false) skips the RAM search
+n = next_state()                  -- the ZX Spectrum Next: machine (type, timing, cpu_clock_hz, speed_ratio), mmu, divmmc, interrupts, ctc, spi; next_regs() the NextREG table, next_mmu() the 8K slots; available=false on other machines
+next_reg_journal_control{enabled=true, clear=true, capacity=65536}  -- switch (off by default) / clear / resize the NextREG write journal
+j, err = next_reg_journal{regs="07,02", sources="nextreg,copper", since=0, from=0, to=999, limit=50}  -- who wrote which NextREG: events {seq, frame, t, pc, source, reg, name, value, previous, decoded}; the copper makes no port cycle, so the port trace never sees its writes (it shows the NEXTREG instruction as OUT #243B / #253B)
+next_sd_journal_control{enabled=true, clear=true, capacity=16384}  -- switch (off by default) / clear / resize the SD journal
+sd, err = next_sd{kinds="command,read", card=0, since=0, from=0, to=999, limit=50}  -- the Next SD cards (type SDSC|SDHC, state, blocks), the SPI engine and the SD journal: events {seq, frame, t, pc, card, kind, command, argument, r1, crc_valid | block, ok}
+buses, err = bus_list()                                      -- the bus analyzer: buses (zc.spi, next.spi, divmmc.spi, neogs.*, ATA ide0 / ide1), devices, trace / checks state
+bus_control("all", {enabled=true, checks=true, clear=true, capacity=65536, protocol_only=true})  -- trace / checks on (off by default); observes only; protocol_only: no single bytes, data words or status reads
+ev, err = bus_events("zc.spi", {kinds="sd", slot=0, since=0, from=0, to=999, limit=50})  -- events {seq, frame, t, pc, source, slot, kind, mosi, miso, read | command, argument, r1, crc_valid | block, ok | register, value | word, write}; kinds also reg_read, reg_write, ata_command, data (group ata)
+f, err = bus_findings("zc.spi", {rules="dma_collision,command_while_busy", since=0, limit=50})  -- findings {seq, event_seq, frame, t, pc, source, slot, rule, severity, value, detail}
+bus_sd_timing("zc.spi", {profile="slow", seed=1, slot=0})       -- SD card timing: ideal | realistic | slow (changes the machine)
+vcd, err = bus_export("zc.spi", {format="vcd", since=0})         -- the trace as VCD (SPI wires) or JSON lines (format="jsonl")
+next_divmmc_journal_control{enabled=true, clear=true, capacity=16384}  -- switch (off by default) / clear / resize the DivMMC journal
+dm, err = next_divmmc{kinds="map_in,esx_call", since=0, from=0, to=999, limit=50}  -- the Next DivMMC: state, entries (NR #B8-#BB decoded) and the journal events {seq, frame, t, pc, kind, address, entry, map | call, name, return_address, basic_rom, af, bc, de, hl}
+mp = next_magic_port{since=0, limit=50}; next_magic_port_control{enabled=true, port=0x00FF, mode="line", clear=true}  -- the program's debug console (jnext --magic-port): items {seq, frame, t, pc, text}; off by default
+next_nmi_journal_control{enabled=true, clear=true, capacity=16384}  -- switch (off by default) / clear / resize the interrupt / NMI / reset journal
+nm, err = next_nmi{kinds="int_ack,nmi_request", since=0, from=0, to=999, limit=50}  -- the Next NMI sources {name, via, modelled, enabled, would_fire, blocked_by}, in_service, multiface, nr_02, stackless_nmi, reset {bits, last}, interrupts {mode, pending, in_service, vector_base} and the journal events {seq, frame, t, pc, kind, source, vector | accepted, reason | reset_bits, reset_last}
+au = next_audio()                -- the Next's sound as configured: config {chip_model, stereo_mode, turbosound, dac, nr_06, nr_08, nr_09}, selected_chip, chips[3] {pan, mono, registers[16], tone_periods, noise_period, mixer, volumes, envelope_period, envelope_shape}, dac {a, b, c, d, left_sum, right_sum}
+ip = next_input()                 -- the Next's joystick modes: joystick_modes {nr_05, left / right {code, name, port}}, io_mode {nr_0b, enabled, mode}, kempston_1f {value, bits, selected_by_nr_05, answers_here, note}, kempston_37 {value, answers_here}, extended_keys {nr_b0, nr_b1, pressed}, md_pad_extra {nr_b2, left / right {mode, x, y, z}, host_keys}
+u = next_uart()                  -- the Next's two UARTs: selected, ports {enabled}, channels[2] {name, prescaler, baud, frame, rts, rx / tx {count, capacity, preview_hex}, status, bytes, interrupts, peer {attached, kind, target}}
+d = next_dma()                    -- the Next's DMA as programmed and running: mode (zxn|z80), enabled, waiting, burst, prescaler, a/b {address, type, step, timing}, direction, block_length, counter, src/dst (+ src_kind/dst_kind: the 8K slot they hit, 'rom' = a write into ROM), holds_bus, status; reading never advances its read sequence
+v = next_video()                  -- layer_order {value, name}, ula {mode, port_ff, scroll, clip}, layer2 {resolution, bank, scroll, clip}, tilemap {columns, map_bank, map_offset, ...}, sprites, transparency, raster {hc, vc, frame_t}, timing
+p, err = next_palette{palette="sprites_1", range="0-15"}  -- the 9-bit palettes (default: the selected one, all 256 entries; palette=0..7|name|"all"): selected, transparent, palettes[{name, entries[{index, rgb9, red, green, blue, priority}]}]; no index moves
+w, err = next_ports(0x6B, "w")    -- the internal port enable word (NR #82-#85) and which device answers the port: device, decoded_by, enabled, enabled_by {nr, bit}, enforced, side_effect (a number is the port, a string hex text)
+r, err = next_nextreg(0x07)       -- one NextREG without side effects: value, stored, access, reset, decoded; next_nextreg() all of them, next_nextreg(nil, true) only those that differ from their reset
+w, err = next_nextreg_write(0x07, 3, "nextreg")  -- write a NextREG through the board's write choke point (door "nextreg" (default) | "port" | "internal"); returns {ok, reg, value, previous, after, door, moment}
+c, err = next_copper{from=0, count=64, raw=true}  -- the copper list as a disassembly: control {mode, name}, running, address (write pointer, never stepped by the report), pc, list_length, instructions[{index, word, op=wait|move|halt|nop, reg, reg_name, value | hpos, vpos, text, current}], around_pc when the pc is outside the window, raw (hex)
+sp, err = next_sprites{from=0, count=128, all=true}  -- enabled, over_border, clip, flags {collision, too_many} (not cleared), visible_count, sprites[{index, kind=basic|anchor|relative, x, y, pattern, four_bit, palette_offset, x_mirror, y_mirror, rotate, scale_x, scale_y, visible, bytes, anchor/offset_x/offset_y}], pattern_memory {non_zero_bytes, used_patterns_8bit, used[]}
+px, err = next_pixel(105, 87)     -- the pixel inspector of the last captured frame (x 0-319, y 0-255, optional sub-pixel 0|1): winner {layer, id}, colour {rgb9, rgb}, layer_order, layers.{ula,layer2,tilemap,sprites} = {opaque, rgb9, rgb, wins, why, source}; nil + error when the capture is off / no frame yet / not a Next
+c, err = next_layer_capture_control{enabled=true}  -- switch (on by default) or, with no argument, report the per-layer record of the Next screen: {available, enabled, frames, last_frame, bytes}
+shot, err = capture_screen_layer("tilemap", {format="png", alpha=true, path="scratch/tiles.png"})  -- ONE LAYER of the last completed Next frame ("ula" "layer2" "tilemap" "sprites" "ids"): {layer, format, alpha, width=640, height=512, size, frame={sequence, frame_number}, data = PNG (or raw RGBA, format="rgba") as a string | file, legend for "ids"}; alpha 0 where the layer does not paint, alpha=false flattens
 j, err = sprinter_pld_journal{kinds="cnf,port_1ffd", source="live"}  -- who changed the PLD setup: events {frame, t, pc, kind, port, value, text}; source="ttd": the recording
 sprinter_pld_journal_control{enabled=true, clear=true}            -- switch / clear the PLD journal
 bios = sprinter_bios()            -- BIOS images (file, alias, crc32, present, loaded, selected, known_issues), loaded, known_issues, reload_pending, options
 r, err = sprinter_bios_select{bios="3.06", fast_start=false, reset=true}  -- the image loads at the reset (now unless reset=false)
-regs = memory_regions()           -- device memory regions: {name="vram", size=262144, pages=16, ...} on the Sprinter; "cram" / "sfile" (512 bytes each) on TS-Conf; "cmos" on every machine with a CMOS clock; "eeprom" (4 KiB) on ZX-Evo
+regs = memory_regions()           -- device memory regions: {name="sprinter.vram", aliases={"vram"}, ttd_region="sprinter.vram", size=262144, pages=16, ...} on the Sprinter; "tsconf.cram" / "tsconf.sfile" (512 bytes each) on TS-Conf; "rtc.cmos" with a CMOS clock; "evo-avr.eeprom" (4 KiB) on ZX-Evo; and every memory time travel records ("neogs.ram", "gs.ram", "moonsound.wave", "evo.flash", ...). Old short names still work
 bytes, err = region_read("vram", 0x17F0, 3)     -- table of bytes; region_write("vram", 0x17F0, "0000A8") / {0,0,0xA8}
 ok, err = region_save("vram", "vram.bin")       -- region_load("vram", "vram.bin" [, offset])
 ch = video_changes(2)             -- video change log: frames[] {start, writes[] (t, line, t_in_line, pc, changes), tables}
@@ -453,8 +613,31 @@ shot, err = screenshot{area="screen", format="png", source="live", path="scratch
           -- nil, err for a bad word or no frame. screenshot() = the whole frame as PNG
 mx = audio_mixer()                -- per-device mixer: master, devices[] (source, muted, solo, volume, gain_db, peak, active)
 mx, err = audio_mixer_set("covox", {muted=true})  -- solo=, volume=0..1, gain_db=; "master" takes muted
+mx, err = audio_mixer_set("ay1.b", {solo=true})  -- a channel "<row>.<channel>": ay1.a, gs.3, moonsound_fm.7, ms_midi.10, next_dac.c (solo within its row)
+ch, err = audio_mixer_get("ay1.a")            -- one row (with its channels) or channel
+lv = audio_levels()                           -- every row's and channel's peak, active, mute, solo (the topic audio.mixer)
+-- get_sound_character() / set_sound_character(name, value): ay_stereo, ay_chip, fm_trim_db, neogs_stereo, covox_dc_removal, fir_filter too
 r = audio_capture_start(1.0, "covox")             -- capture one device's own buffer (default: the master mix)
+r = audio_capture_start(600, "", "out.wav")       -- a WAV file written while the samples come (up to 86400 s; closes at the target; status: file_closed)
+r, err = section_timer_start{sections = {"Plasma", "spark=#8000:#8010,#8020"}, break_if = {"net:Plasma>53400"}}
+                                                  -- section timing at full speed (command-interface 5.5c): the results
+                                                  -- without the passes, or nil and the reason; extra, recursive,
+                                                  -- frame_t, capacity too; no sections = every X with an X.End
+r = section_timer_result()                        -- active, sections {name, entry, exits, count, min, max, avg, net_*,
+                                                  -- interrupted, last, max_frame, max_t}, passes {name, frame, t,
+                                                  -- elapsed, net, interrupts}, hits, orphan, dropped, open, stopped
+print(section_timer_text())                       -- the table; section_timer_json([offset [, limit]]) the JSON
+section_timer_stop()                              -- results stay; section_timer_clear() drops them
 rtc = rtc_state()           -- CMOS clock: chip, ports, time_mode, time, register_a..d, alarm, dump
+exe = execution_state()     -- execution arbiter: phase, intent + intent_set_by, serving, queue, claim, driver_violations
+take_control("my script")   -- automation session: the GUI shows it; after the user takes control back, control calls raise revoked_by_user - stop, do not retry. Takes over another client's implicit session, never an explicit one. Code sent by POST /api/v1/lua/exec or /lua/file acts in the sender's session on a machine the sender holds (an MCP agent's too): no take needed, release_control() leaves that session in place
+release_control()
+c = companions()            -- companion clients (devices acting as the user's hands): {companions = {...}, pairings = {...}, approval_available}
+n = companion_revoke("Desk panel")   -- revoke by id or name ("all": every one); the number revoked. A script never pairs or acts as a companion
+r = gui_list()                       -- the GUI control plane (command-interface.md §16.4): every GUI program, its windows and views
+r = gui_catalogue()                  -- the GUI interfaces, their commands and parameters
+r = gui_state("main/screen")         -- a node's state: {ok = true, body = {target, interfaces, state, instance}}
+r = gui_call("memory.goto", {addr = "0x6000"}, "debugger/memory")  -- a GUI command: {ok, body} or {ok = false, error, message}; waits up to 15 s
 profi = profi_state()       -- ZX Profi board chips: port_map (ext_ports, dos_latch, cpm, rom14, extended_map), ppi8255, pit8253.counters[], usart8251; available=false on other machines
 net = network_state()       -- network adapters: card (ZXNETUSB, W5300 sockets), com_port (UART, peer), virtual network (leases, sockets, activity); available=false without one
 r, err = network_configure{card="zxnetusb", host_access=true, hosts="name=10.0.2.50"}  -- change [NETWORK] settings: the reply table (nil, err, reply when refused); a ZX-bus card change (zxnetusb / zxwifi) is a slot change applied by a restart (owner decision Q11: r.status "applied", r.restart.emulatorId; the other keys go to the restarted machine), else "accepted" (in place)
@@ -500,8 +683,9 @@ emu = Emulator.new("symbolic_id")
 success = emu:init()
 
 -- Control
-emu:reset()
-emu:pause()
+emu:reset()                -- soft: the reset button (the ZX Next restarts NextZXOS at once)
+emu:reset{hard = true}     -- hard: a power cycle (the ZX Next runs its boot ROM and firmware); emu:reset(true) too
+emu:pause()   -- "paused", "queued: behind <command>" (applies when it ends) or "refused: <why>"
 emu:resume()
 r = emu:step(false)      -- one instruction, breakpoints honored (default true skips them)
 r = emu:steps(count)     -- up to N instructions; a breakpoint ends the run early
@@ -517,6 +701,14 @@ regs = get_registers()   -- pc sp af bc de hl ix iy af_ bc_ de_ hl_ i r memptr q
 -- t = CPU T-states since the frame's start
 v = get_register("memptr")        -- any name of the register table, nil when unknown
 ok = set_register("im", 2)        -- false for an unknown name or im > 2 / iff1, iff2 > 1
+-- The sound card CPU (General Sound / NeoGS; "ms": the MultiSound's): the CPU name last. get_registers has
+-- card_time instead of t; an unknown name or a card CPU that is not there is a script error
+regs = get_registers("gs");  pc = get_register("pc", "gs");  set_register("a", 0x10, "gs")
+b = mem_read(0x4000, "gs");  mem_write(0x4000, 1, "gs");  lines = disasm(-1, 8, "gs")  -- from the card's PC
+w = memory_map("gs")              -- {cpu, windows = {{start, size, kind = "rom"|"ram"|"none", page, offset}, ...}}
+-- Its steps: the machine runs until the card's step ends, then is paused; {ok, stop = {cpu, reason, cpu_pc, ...},
+-- pc, sp, main_pc, main_sp, state}, or {ok = false, error}
+r = step("gs");  r = steps(10, false, "gs");  r = stepover("gs");  r = step_out("gs")
 
 -- Properties
 id = emu:get_id()
@@ -611,7 +803,7 @@ page_write("ram", 5, 0x100, 0xFF)
 -- Block operations
 data = page_read_block("rom", 2, 0, 256)    -- Read 256 bytes from ROM page 2
 bytes = mem_read_bytes(0, 65536)            -- the whole CPU view as one Lua string (wraps at #FFFF)
-bytes = mem_read_bytes(0x1800, 768, "ram5") -- a page window ("ram5", "rom2", "cache0"; "ram" = all RAM pages)
+bytes = mem_read_bytes(0x1800, 768, "ram5") -- a page window ("ram5", "rom2", "cache0"; "ram" = all RAM pages; or a region: "sprinter.vram", "neogs.ram", ...)
 bytes, err = mem_read_bytes(0, 1, "ram9")   -- nil, "this machine has no page ram9"
 page_write_block("ram", 7, 0x1000, data)    -- Write block to RAM page 7
 
@@ -646,20 +838,51 @@ stops where: [.recipe/analysis/breakpoints-and-events.md](../../../../.recipe/an
 id = bp(0x8000)                -- execution breakpoint, returns its id (-1 when refused)
 id = bp(0x8000, {to=0x80FF})   -- a range #8000-#80FF (one check per access, however many ranges)
 id = bp(0x0038, {hits=50})     -- stop on the 50th hit only; '>=50' from the 50th on, '%50' every 50th
-id = bp(0xC000, "ram32")       -- physical: RAM page 32, offset #0000, in whatever slot shows it ("rom3", "cache0")
+id = bp(0xC000, "ram32")       -- physical: RAM page 32, offset #0000, in whatever slot shows it ("rom3", "cache0"; "vram1" = the Sprinter's video RAM #4000-#7FFF, read / write watchpoints)
 id = bp(0xC000, {page="ram32", slot_only=true})  -- only through slot 3 (#C000)
 id = bp_read(0x4000)           -- memory read; the same options
 id = bp_write(0x4000, {to=0x57FF})  -- memory write: the screen bitmap
 id = bp_port_in(0xFE, {mask=0x00FF})  -- port IN on #FE with any high byte; options {mask=, hits=}
 id = bp_port_out(0x7FFD)
+id = bp_nextreg_write(0x07)    -- ZX Next: a write of NR #07 by any door; bp_nextreg_read, bp_nextreg (both)
+id = bp_nextreg_write(0x40, {to=0x44, doors="copper", value=0x01, vmask=0x03, hits=">=2"})  -- options {to=, doors=, value=, vmask=, hits=}
+id = bp_magic("ed_ff")         -- ZX Next: stop after the magic opcode ED FF (or "dd_01") ran
+id = bp_beam(99, {hc=255})     -- ZX Next: the beam passes line 99 (the copper's counter) at pixel clock 255
+id = bp_copper(12, {to=14})    -- ZX Next: the copper completes list instruction 12..14
+id = bp(0x0038, {cpu="gs"})    -- the sound card CPU's (General Sound / NeoGS); bp_remove(id, "gs"), bp_list("gs") ...
+                               -- cpu="ms": the MultiSound card's General Sound, the same way
+id, why = bp_event("card_command", {value=0x23})  -- a GS protocol event: int, nmi, reset, page, card_command, card_data,
+                               -- card_reply, dac_fetch, clock_change, dma_start, dma_done, gscfg0 (the card's), host_command,
+                               -- host_data, host_reply and the ZX Next's machine events (cpu_int, cpu_nmi, esxdos_call,
+                               -- divmmc_map, zxndma_start, ...: the main CPU's); cpu= defaults to the side
+id = gs_on_dac_fetch(fn, {mode="sync"})  -- a card event callback (hit.arg its detail); also gs_on_command, gs_on_data,
+                               -- gs_on_reply, gs_on_int, gs_on_nmi, gs_on_page, gs_on_clock_change, gs_on_dma_start,
+                               -- gs_on_dma_done, gs_on_gscfg0, gs_on_port_in(port, fn), gs_on_port_out(port, fn); {cpu="ms"} the
+                               -- MultiSound's
+id, why = bp_chipreg("ay", 7, {value=0x3F, vmask=0x3F})  -- a sound chip register write by the main CPU: ay, fm,
+                               -- saa, opl4, opl4wave, dac, cbl; to= a range end, unit= one chip of the kind
 bp_reset_hits(id)              -- hit counter back to 0 (no id: all)
+bp(0x0038, {stop=false})       -- only counts its hits, never stops (bp, bp_read, bp_write, bp_port_in/out)
+bp_hits(id)                    -- the hit count; -1 for an unknown id
 bp_remove(id); bp_clear()
 bp_enable(id); bp_disable(id)
 bp_note(id, "main loop")       -- annotation (empty clears); false for an unknown id
+id, why = bp_write(0x5C78, {condition = "VAL == 0"})  -- a condition (any bp / bp_read / bp_write / bp_port_*; dialect = "c");
+                               -- refused: -1 and the reason
+ok, why = bp_condition(id, "VAL == 80")  -- change it ("" clears): true, or false and the reason (the old one stays)
 bp_group(id, "game")           -- group, created on use; switched on / off together (CLI bpgroup)
+id = bp_key("space")           -- keyboard: the first keyboard read that sees SPACE go down; {on="release"|"both", hits=, group=, note=}; "any"
+bp_select("group:game", "disable")  -- a selection (all, an id, a kind, group:<name>): enable | disable | toggle | remove
+                               -- -> {select, selected, changed, active}; a refusal: ok = false, error
+bp_groups()                    -- {ok, instance, groups = {{name, total, active, ids}, ...}}
+trace("opcode", "start")       -- profilers and traces (tracecontrol): opcode, memory, calltrace, coverage, porttrace,
+trace("audio", "start", {seconds = 2, source = "ay1"})  -- gsporttrace, pchist, aylog, audio, all; start | stop | toggle |
+                               -- pause | resume | pause_toggle | clear | status -> {name, state, can_pause}
+analyzer_list(); analyzer_enable("trdos"); analyzer_disable("trdos"); analyzer_active("trdos")
 n = bp_count()
 print(bp_list())               -- the text table: range "to 0x80FF", "in ram32", "mask 0x00FF", "hits >=50", "(hit 12x)"
 st = bp_status()               -- the last hit: {valid, id, type, address, access, active, note, group, hit_count, page = {kind, page}}
+                               -- with a condition also condition, match_count (every match), condition_error
 ```
 
 ### Analyzer Management
@@ -711,6 +934,7 @@ emu:bp_clear_last()  -- Clear last triggered breakpoint ID
 -- Disassembly
 local lines = disasm()                   -- Disassemble from PC (default 10 lines)
 local lines = disasm(0x8000, 20)         -- Disassemble from address, count
+local lines = disasm(0x8000, 20, 8)      -- 8 rows above the address first (the virtual window's backward sync)
 local lines = disasm_page("rom", 2, 0, 20)   -- Disassemble physical ROM page (e.g., TR-DOS)
 local lines = disasm_page("ram", 5, 0x100, 10)  -- Disassemble physical RAM page
 -- Returns: table with entries: {offset, bytes, mnemonic, size, label,
@@ -724,7 +948,7 @@ local enabled = emu:feature_get("debugmode")
 ```
 
 > [!NOTE]
-> Memory counters (`memcounters`) and call trace (`calltrace`) are available via CLI and WebAPI. Full Lua bindings for these analysis features are planned.
+> Memory counters and watches: `memory_counters`, `memory_counter`, `memory_watch_*` (see Memory Profiler below). The call trace (`calltrace`) is available via CLI and WebAPI.
 
 ### Opcode Profiler
 
@@ -765,22 +989,26 @@ local trace = profiler_trace(500)
 Track memory access patterns across all physical memory pages (RAM/ROM/Cache).
 
 ```lua
--- Session control
-memory_profiler_start()    -- Enable feature, start capture
-memory_profiler_stop()     -- Stop capture
-memory_profiler_pause()    -- Pause capture (retain data)
-memory_profiler_resume()   -- Resume paused capture
-memory_profiler_clear()    -- Clear all data
+-- Session control (tracecontrol): trace("memory", "start"), also stop / pause / resume / clear / status
+trace("memory", "start")
 
--- Status query
-local status = memory_profiler_status()
--- status.feature_enabled, status.capturing, status.session_state, status.tracking_mode
+-- Per-address counters (MemoryCounters, docs/emulator/design/debugger/memory-counters.md): a table or nil, error
+local hot = memory_counters{space = "cpu", view = "top", kinds = "x", limit = 16}
+for _, cell in ipairs(hot.cells) do            -- cell = {address, reads, writes, executes}
+    print(string.format("%04X r=%d w=%d x=%d", cell[1], cell[2], cell[3], cell[4]))
+end
+local banks = memory_counters{space = "phys", view = "top", kinds = "w"}   -- cell[1] // 0x4000 = absolute page
+local cells = memory_counters{addresses = "0x5C00,0x5C08,0x8000-0x800F"}  -- or a table of addresses
+local r, w, x = memory_counter(0x5C08)          -- one cell; memory_counter(0x1C08, "ram5")
 
--- Data retrieval
-local pages = memory_profiler_pages(20)      -- Get per-page access summaries
-local counters = memory_profiler_counters(5, "physical")  -- Address-level counters for page
-local regions = memory_profiler_regions()    -- Monitored region statistics
-memory_profiler_save("/path/output", "yaml") -- Save data to file
+-- Watches (MemoryWatch): true or nil, error
+memory_watch_add("sysvars", 0x5C00, 0xC0, {callers = true})
+memory_watch_port("kempston", 0x1F, 0x00FF, {values = true})   -- every port with low byte 0x1F
+for _, watch in ipairs(memory_watches()) do     -- {name, kind, start, length / port, mask, reads, writes, executes, callers, values}
+    print(watch.name, watch.reads, watch.writes)
+end
+memory_watch_remove("sysvars")
+memory_watch_clear()
 ```
 
 ### Call Trace Profiler
@@ -849,7 +1077,7 @@ Play RZX input recordings: the start snapshot loads, then every `IN` returns the
 | `rzx_stop()` | boolean | Stop playing; `false` when nothing played. |
 | `rzx_status()` | table | `loaded`, `active`, `summary`, `path`, `creator`, `state` (`playing` / `finished` / `desynced` / `stopped`), `frame`, `total_frames`, `block`, `blocks`, `interrupts`, `desyncs`, `drift`, `max_drift`, `snapshots_applied`, `keyframes`, `keyframe_bytes`, `reason`, `first_desync` `{kind, frame, expected, actual, pc}`. |
 
-`snapshot_load("game.rzx")` plays a recording on the machine as it is. `snapshot_load` returns `ok, reason, emulator_id`: a TS-Conf program (`.spg`) on another model switches the machine to TS-Conf first when the script is not bound to one machine (`emulator_id` is then the new instance), and is refused with the reason when it is.
+`snapshot_load("game.rzx")` plays a recording on the machine as it is. `snapshot_load(path [, commit | {commit = name, switch_model = bool}])` returns `ok, reason, emulator_id`: a TS-Conf program (`.spg`) on another model switches the machine to TS-Conf first unless `switch_model = false` (`emulator_id` is then the new instance). An `.szx` of another model, or a `.z80` / `.sna` the machine cannot hold (a 128K file on a 48K), switches with `switch_model = true` (or `[SNAPSHOT] SwitchModel=1` in the configuration) and is refused with the machine it needs otherwise. A script bound to one machine never switches: such a file is refused with the reason.
 
 ```lua
 local r = rzx_play("games/ericfloaters.rzx", {desync_mode = "tolerant"})
@@ -862,11 +1090,11 @@ print(rzx_status().summary)   -- playing frame 500 / 32315 (1.5%), block 1 / 1, 
 
 The TTD functions are **global functions** (like the mouse functions), not methods on the emulator object. They act on the bound emulator, or on the selected one when the script is not bound to an instance. Bindings: `core/automation/lua/src/emulator/lua_emulator.h`. Command semantics and background: [command-interface.md §8](./command-interface.md#8-time-travel-debugging-ttd).
 
-**Session rules** — read [command-interface.md → TTD Session Rules](./command-interface.md#ttd-session-rules). In short: states are `idle`, `recording`, `detached`; seek/step/find-last/reverse functions are refused while recording (`ttd_seek` returns `reached = false` and `error` = the reason, the boolean functions return `false`), so call `ttd_stop()` first; a seek or a step leaves the machine paused at the target, and `ttd_resume()` runs it again (the same on every surface); `ttd_start()` switches the `timetravel` feature on by itself; while recording (`snapshot_load` only on v1: on the engine a snapshot load is part of the recording), `tape_load`, `disk_create`, `ttd_invalidate`, `ttd_set_journal_enabled` are refused (on v1 also `gs_switch_personality` and every slot change, `slots_*`: `status = "recording"`; on the engine they end the session) and return `false, reason` (`disk_load`: `success = false` with the reason in `message`); on a stopped session loads, disk create, ROM reload, a host speed change and `ttd_invalidate()` drop the history, while a reset keeps it; `feature_set` switching `timetravel` / `debugmode` off stops the recording cleanly (history kept, `last_stop_reason` in `ttd_status()`); while recording, the host speed is locked to 1x and turbo / fast tape / turbo tape / fast disk are off; `tinframe` counts T-states at the machine's top CPU clock (plain T-states without a hardware turbo, ×2 on Scorpion/ATM Turbo 2+, ×4 on ZX-Evo - see Time in the session rules).
+**Session rules** — read [command-interface.md → TTD Session Rules](./command-interface.md#ttd-session-rules). In short: states are `idle`, `recording`, `detached`; seek/step/find-last/reverse functions are refused while recording (`ttd_seek` returns `reached = false` and `error` = the reason, the boolean functions return `false`), so call `ttd_stop()` first; a seek or a step leaves the machine paused at the target, and `ttd_resume()` runs it again (the same on every surface); `ttd_start()` switches the `timetravel` feature on by itself; while recording (a snapshot load is part of the recording), `ttd_invalidate`, `ttd_set_journal_enabled` are refused (a tape / disk / media change is an event of the recording at the next frame boundary, the others end the session) and return `false, reason`; on a stopped session loads, disk create, ROM reload, a host speed change and `ttd_invalidate()` drop the history, while a reset keeps it; `feature_set` switching `timetravel` / `debugmode` off stops the recording cleanly (history kept, `last_stop_reason` in `ttd_status()`); while recording, the host speed is locked to 1x and turbo / fast tape / turbo tape / fast disk are off; `tinframe` counts T-states at the machine's top CPU clock (plain T-states without a hardware turbo, ×2 on Scorpion/ATM Turbo 2+, ×4 on ZX-Evo - see Time in the session rules).
 
 ```lua
 local ok, reason = tape_load("game.tap")
-if not ok then print(reason) end   -- "Cannot insert a tape while TTD is recording: ... stop the recording first."
+if not ok then print(reason) end   -- a refused call returns false and the reason
 ```
 
 Unlike the WebAPI, the Lua functions do not pause the emulator for you: pause it before browsing history. Errors never raise; they come back as `false` (plus a reason for a TTD refusal), an empty table, or a table with an `error` string. When the build has no TTD engine every function returns `false` / an empty or `error` table.
@@ -876,11 +1104,13 @@ Unlike the WebAPI, the Lua functions do not pause the emulator for you: pause it
 ```lua
 ttd_start()                  --> bool   -- keeps the ttd_set_journal_enabled choice (off by default)
 ttd_start(true)              --> bool   -- also record the write journal
+ttd_start(false, true, 2)    --> bool   -- the black box: the last 2 minutes (default 5), turbo free
 ttd_set_journal_enabled(b)   --> ok, reason  -- switch the write journal at any moment, also while recording
                                        --   (each on-off span is a segment; status.write_journal_segments)
 ttd_build_journal([from_frame], [to_frame])  --> {ok, error, cancelled, frames_built, frames_covered,
                                        --   frames_refused, records}: build it by replaying frames from..to
                                        --   (default: the whole session), about 2-4 ms per frame; not while recording
+ttd_cancel_journal_build()   --> {cancelled}  -- stop a build that runs (another thread's call)
 ttd_set_history_limit(frames, bytes)   --> frames, bytes  -- keep only the newest history while recording
                                        --   (0 = no limit, nil keeps a value; status: history_* fields)
 ttd_get_journal_enabled()    --> bool
@@ -950,12 +1180,15 @@ local status = ttd_status()
 **Navigation:**
 
 ```lua
-ttd_seek(4823)                   -- frame 4823's end on the engine (state and picture of {4824, 0}), its start on v1
+ttd_seek(4823)                   -- frame 4823's end (state and picture of {4824, 0})
 ttd_seek(4823, 14982)            -- seek to (frame, tinframe); ttd_seek(4823, 0) is the frame's start
 -- --> { reached = true, arrived_at = {frame = 4823, tinframe = 14982},
 --       halt_reason = "target",          -- "target" | "external_event" | "out_of_range"
 --       blocking_marker = {frame, tinframe, kind, reason},  -- only for external_event
---       state = "detached" }
+--       state = "detached",
+--       check = {status = "exact", message = "", issues = {}} }  -- "not_bit_exact": other settings or a
+--                                         -- medium written since, each issue {kind, severity, device, detail}
+-- ttd_status() carries check while detached (the boolean step functions: read it there)
 -- The machine stays paused at the target; ttd_resume() records again and runs it.
 -- While recording: { reached = false, ok = false, error = "<why>" }
 
@@ -968,7 +1201,7 @@ ttd_resume()                     --> bool  -- record again from the exact curren
 ttd_resume(4823, 0)              --> bool  -- ...or from (frame, tinframe; tinframe defaults to 0); future is discarded
                                             -- fails from idle: seek first
 
-ttd_position()
+ttd_position()   -- current, session_end, first_frame, history, state, paused, fps; never parks the machine
 -- --> { current = {frame, tinframe}, session_end = {frame, tinframe} }
 ```
 
@@ -978,6 +1211,9 @@ ttd_position()
 ttd_reverse_step()               --> bool  -- one instruction back
 ttd_reverse_step(10)             --> bool  -- ten instructions back
 ttd_reverse_step_tstates(5000)   --> bool  -- back 5000 t-states (nearest instruction start)
+ttd_reverse_step_scanlines(2)    --> bool  -- back 2 scanlines of the machine (t_line each)
+ttd_reverse_step_over()          --> bool  -- back over a routine when the instruction before is its return,
+                                          --    otherwise one instruction back (the debuggers' Shift+F8)
 
 local r = ttd_reverse_continue({0x8000, 0x8010})
 -- --> { matched = true, pc = 0x8000, frame = 4700, tinframe = 812 }
@@ -986,13 +1222,20 @@ local r = ttd_reverse_continue({0x8000, 0x8010})
 --     blocked_by_marker = {kind, reason, frame, tinframe}  (as the WebAPI does)
 --     covered_from, covered_from_tinframe, covered_to, covered_to_tinframe:
 --     the searched span (command-interface.md -> Search window)
+
+-- Options (second table): phys_page (0..255 or "rom"), all, limit, before_frame / before_tin or before (machine T),
+-- from_frame. all = true: every hit newest first, the machine stays
+local hits = ttd_reverse_continue({0xC000}, { phys_page = 3, all = true, limit = 500 })
+-- --> { hits = { {frame, tinframe, t, pc, phys_page}, ... }, count, truncated, next_before, ... }
+-- first_per_pc = true: one hit per PC (its newest), the walk ends once each has one; pcs_without_hit names the rest
+local last = ttd_reverse_continue({0x8200, 0x9A10, 0xC000}, { first_per_pc = true })
 ```
 
 **Reverse search:**
 
 ```lua
 -- Positional form: addr, access, value, pc_from, pc_to, before_frame, before_tin,
---                  phys_page, addr_from, addr_to
+--                  phys_page, addr_from, addr_to, space
 local r = ttd_find_last(0x5800, "write")
 -- Not while recording, and the access must be write, read, execute or io:
 -- otherwise { found = false, ok = false, error = "<why>" }
@@ -1007,8 +1250,15 @@ local r2 = ttd_find_last{
     pc_to     = 0x8000,
     before_frame = 4823,       -- search at or before this point (default: current position)
     before_tin = 0,
-    phys_page = 5              -- 0..255: one physical RAM page
+    phys_page = 5              -- 0..255 or "rom": one physical RAM page
 }
+-- Every write that changed the byte, newest first, with the byte it replaced (table form); the machine stays
+local changes = ttd_find_last{ addr = 0x5B00, changes_only = true, all = true, limit = 500 }
+-- --> { hits = { {frame, tinframe, t, pc, value, old_value, ...}, ... }, count, truncated, next_before }
+--     more keys: before (machine T), from_frame
+-- The Sprinter's video RAM / fast RAM: space = "vram" | "cache" (table form), addr = an offset in it
+local v = ttd_find_last{ addr = 0x4805, space = "vram" }
+-- --> { found = true, pc, space = "vram", offset = 0x4805, phys_page = nil, ... }
 -- --> { found = false }  (no match)  or
 --     { found = true, frame, tinframe, pc, value, phys_page, access }  or
 --     { found = false, blocked = true, marker_frame, marker_tinframe,
@@ -1022,7 +1272,7 @@ local r2 = ttd_find_last{
 
 **When did the program ... (port events):** `ttd_port_events(event, [arg], [options])` searches the port journals - every IN and OUT with its time and PC - without replay. Events, arguments and options: [command-interface.md → Port events](./command-interface.md).
 
-Output below is from the recorded fixture `testdata/ttd/port-journals/dizzyx.ttd` (Dizzy X):
+Output below is from the recorded fixture `testdata/ttd/port-journals/engine/dizzyx.ttd` (Dizzy X):
 
 ```lua
 local r = ttd_port_events("key", "space")          -- when the game saw SPACE pressed
@@ -1032,7 +1282,7 @@ local r = ttd_port_events("key", "space")          -- when the game saw SPACE pr
 local w = ttd_port_events("ay-write", 7, { limit = 3 })
 -- w.count = 3, w.truncated = true; w.hits[1]: frame 50, tinframe 9202, pc 0xD86E, value 0x18, ay_register 7
 
-local f = ttd_port_events("key", "q", { file = "testdata/ttd/port-journals/dizzyx.ttd" })
+local f = ttd_port_events("key", "q", { file = "testdata/ttd/port-journals/engine/dizzyx.ttd" })
 -- a saved session, searched without loading it: f.hits[1].frame = 365
 
 local j = ttd_port_events("in", nil, { port = 0x1F, port_mask = 0xFF, match = "any-set", value_mask = 0x1F })
@@ -1050,10 +1300,17 @@ end   -- kind: tape_control | disk_write | debugger_edit | other
 
 ttd_bookmark_add("before crash")            -- at the current position
 ttd_bookmark_add("umt entry", 4823, 14982)  -- at (frame, tinframe)
--- --> { added = true, label, frame, tinframe }  or  { added = false, error = "..." }
-for _, bm in ipairs(ttd_bookmarks()) do     -- time-sorted
-    print(bm.frame, bm.tinframe, bm.label)
+ttd_bookmark_add("lives", 212, 31540, {note = "the life counter drops", tags = {"lives"}, watch = {"#A13C"}})
+ttd_bookmark_add("here", {note = "...", context = false})  -- the options table may stand in for the frame
+-- --> { added = true, label, frame, tinframe, bookmark, text }  or  { added = false, error = "..." }
+-- bookmark.context = { pc, sp, af, ..., instruction, text } taken once (another moment: one silent seek)
+for _, bm in ipairs(ttd_bookmarks()) do     -- time-sorted; ttd_bookmarks("lives"): one tag
+    print(bm.frame, bm.tinframe, bm.label, bm.note)
 end
+ttd_bookmark_note("lives", {note = "only on contact", append = true, add_tags = {"enemy"}})
+-- also tags = {...}, remove_tags = {...}, rename = "..."; --> { updated = true, bookmark, text } or { updated = false, error }
+local e = ttd_bookmark_export{format = "markdown", tag = "lives", title = "Green Beret"}   -- or "profile", "json"
+print(e.text)                               -- path = "..." writes it too: e.path, e.bytes
 ttd_bookmark_delete("before crash")        --> bool
 ttd_seek_bookmark("umt entry")
 -- --> same table as ttd_seek (blocking_marker included when a marker stops it)
@@ -1062,10 +1319,29 @@ ttd_seek_bookmark("umt entry")
 
 Bookmarks are advisory and never stop a seek; markers do.
 
+**Branches** (a resume in the past records on a new branch, named by its time from the trunk start such as
+`+00:01:25.150`, and the old future stays on the parent; the first history is the
+`trunk`, id 0; a branch is named by its id, its GUID or its name):
+
+```lua
+local b = ttd_branches()                    -- or ttd_branches{scope = "lineage", tag = "boss", pinned = true, limit = 20, offset = 0}
+-- --> { branches = { {id, guid, name, parent, fork = {frame, tinframe} | nil, ["end"] = {...}, length, created_by,
+--       reason, tags, note, pinned, children, active, on_lineage}, ... }, total, count, active, viewed,
+--       lineage = { {branch, from = {frame, tinframe}}, ... }, text }   (no branches: an empty list)
+for _, br in ipairs(b.branches) do print(br.id, br.name, br.length, br.active) end
+ttd_branch_switch("+00:00:25.150")               -- at its end; ttd_branch_switch(1, 4830, 0): a moment on it
+-- --> { switched = true, branch, arrived_at, state, check, text }  or  { switched = false, error = "..." }
+ttd_branch_update("+00:00:25.150", {name = "boss fight", note = "...", add_tags = {"boss"}, pinned = true})
+-- also tags = {...} (replace), remove_tags = {...}; --> { updated = true, branch, text } or { updated = false, error }
+ttd_branch_delete("boss fight", true)       -- force: pinned ones too; its descendants go with it
+-- --> { deleted = true, removed = {ids}, removed_names = {...}, text }  or  { deleted = false, error = "..." }
+```
+
 **Sessions on disk:**
 
 ```lua
-ttd_dump("/tmp/session.ttd")               --> bool
+ttd_dump("/tmp/session.ttd")               --> bool; every branch
+ttd_dump("/tmp/line.ttd", true)            --> bool; only the active branch's lineage, one linear history
 ttd_load("/tmp/session.ttd")
 -- --> { ok = true, checkpoint_count, session_start_frame, current_end_frame }
 --     or { ok = false, error = "..." }  (e.g. recorded on a different model: both model ids named)
@@ -1101,6 +1377,86 @@ local scan = ttd_coverage_scan{kind = "executed", addr_from = 0x0038, addr_to = 
 --   matching_frames = 3, scanned_frames = 183, truncated = false,
 --   covered_from = 18, covered_to = 197, index_available = true }
 
+-- order = "newest": the newest matches first; ranges = true: runs {from, to}; a cut list carries next_from_frame
+-- (oldest order) or next_to_frame (newest); exact = false without phys_page (the offset matched on every page)
+local runs = ttd_coverage_scan{kind = "executed", addr_from = 0x8200, addr_to = 0x8200, phys_page = 2,
+                               order = "newest", ranges = true, limit = 50}
+
+-- The Sprinter's video RAM by its own offsets (space = "vram" / "cache": inside one 16 KB page)
+local written = ttd_coverage_scan{kind = "written", space = "vram", addr_from = 0x4805, addr_to = 0x4805}
+
+-- Rare code in one call: addresses executed in at most max_frames frames, as blocks with those frames
+local rare = ttd_coverage_rare{max_frames = 2, addr_from = 0x8000, addr_to = 0xFFFF, limit = 50}
+-- { rare_keys = 41, distinct_keys = 2310, rare_blocks = 6, truncated = false,
+--   blocks = { {addr_from = "0x9A10", addr_to = "0x9A2C", phys_page = 2, page_offset_from = "0x1A10", ...,
+--               keys = 11, frame_count = 1, frames = {1834}}, ... } }
+
+-- In which frames did a game profile's probes fire: a replay of the window, the machine put back
+local probes = ttd_probe_frames({{probe = "exec", address = 0x8A14},
+                                 {probe = "write", address = 0x5F20, ["if"] = "VAL < MDT"}}, {from_frame = 100})
+-- { from_frame = 100, to_frame = 2400, replayed_frames = 2301, pruned_frames = 0, truncated = false,
+--   probes = { {probe = "exec", address = "0x8A14", frame_count = 14, hit_count = 14, frames = {120, 388, ...},
+--               hits = {1, 1, ...}}, ... } }
+-- One probe: ttd_probe_frames{probe = "port-out", address = 0xFE, port_mask = 0x01}; limit = N frames per probe
+
+-- A memory at a past checkpoint, and what changed between two - from the store, no seek
+local at = ttd_memory_at{space = "ram5", frame = 150, offset = 0x1C78, length = 2}   -- tinframe = T: inside the frame (ram, vram, cache)
+-- { space = "ram", offset = 89208, length = 2, frame = 150, at_frame = 150, exact = true, hex = "6500" }
+-- ram / ramN offsets are physical; space = "cpu": Z80 addresses as the CPU saw them, with banks = {{window, addr,
+-- kind, page, name}, ...}
+local cpu = ttd_memory_at{space = "cpu", frame = 150, tinframe = 20000, offset = 0xC000, length = 16}
+-- Without frame: the machine now (live = true, at_tinframe), no recording needed
+local now = ttd_memory_at{space = "cpu", offset = 0x5C00, length = 64}
+local diff = ttd_memory_diff{space = "neogs.ram", from_frame = 150, to_frame = 600}
+-- { space = "neogs.ram", changed_bytes = ..., ranges = { {offset = 4096, length = 64}, ... }, truncated = false }
+
+local timeline = ttd_timeline{min_phase_ms = 500}   -- also from_frame, to_frame, buckets, limit, bucket_size, ports
+-- { from_frame = ..., to_frame = ..., phases = { {frame_start = ..., frame_end = ...,
+--   tags = {"halt", "input"}, executed = ..., keys = {"A"}, busiest_frame = ..., ...}, ... },
+--   events = {...}, missing = { {fact = "writes", reason = "the write journal is off"} }, ... }
+
+-- Where a value came from: a Z80 address (a number) or a register name; options frame, tinframe, phys_page,
+-- depth (default 4), max_links (32), max_frames (50), flags (follow F), text (the indented lines too)
+local chain = ttd_cause_chain(0x5C78, {depth = 6})
+-- { target = {kind = "memory", name = "(#5C78 RAM 5)", ...}, links = { {id = 0, parent = -1, depth = 0,
+--   kind = "store", name = "(#5C78 RAM 5)", value = 3, frame = ..., pc = 0x8A14, text = "LD (HL),A",
+--   inputs = {"A=#03"}}, ... }, stops = 0, frames_traced = 2, ms = ... }
+local why = ttd_cause_chain("HL", {frame = 150, tinframe = 20000})
+
+-- The call stack at a moment (default: the current position); options frame, tinframe, max_depth (16),
+-- max_slots (256), text
+local bt = ttd_backtrace{frame = 150, tinframe = 20000, text = true}
+-- { at = {frame = 150, tinframe = 20000}, pc = 0x8020, sp = 0xBFFA, routine = 0x8020,
+--   frames = { {depth = 1, kind = "call", slot = 0xBFFA, return_address = 0x8014, caller_pc = 0x8011,
+--   text = "CALL #8020", frame = 149, tinframe = ..., callee = 0x8020, routine = 0x8010, data_words = 0}, ... },
+--   stop = "before_session", stop_slot = 0xC000, slots_scanned = 3, data_words = 1, text = "#0  pc #8020 ..." }
+
+-- When did it happen: kind mem / screen / exec / port / border / key, options as the WebAPI query
+-- (cond, addr, phys_page, size, value, bit, exact, min_changed, addr_to, dir, port, port_mask, value_mask, key,
+-- pressed, order = "first" | "last", from_frame, to_frame, limit, max_frames, text)
+local down = ttd_find_event("mem", {addr = 0xA130, cond = "decreased", limit = 3})
+-- { event = {kind = "mem", cond = "decreased", order = "first", addr = 41264, phys_page = 2},
+--   hits = { {frame = 1834, tinframe = 21980, pc = 0x8A14, text = "ld (hl),a", before = 3, after = 2,
+--   why = "(#A130 RAM 2) #03 -> #02  decreased"}, ... }, more = true, next_from_frame = ..., ms = ... }
+local scene = ttd_find_event("screen", {min_changed = 60})
+local fire = ttd_find_event("key", {key = "SPACE"})
+
+-- What one frame did: frame (default the current one), options sections ("time,routines,..."), limit (8), text
+local f = ttd_explain_frame(1204, {sections = "time,routines,memory", limit = 4})
+-- { frame = 1204, frame_t = 69888, end_t = 69888, instructions = 18312, time = {isr = 6210, halt = 21700, code = ...},
+--   routines = { {pc = 0x8A14, calls = 1, t = 31220, own_t = 2110, insns = 4812, caller = 0x8003}, ... },
+--   memory = { {region = "screen pixels", addr = 0x4800, changed = 1024, writers = { {pc = 0x9A12,
+--   text = "ld (hl),a", count = 1024} }}, ... }, more_memory = 2, frames_replayed = 1, ms = ... }
+
+-- What differs between two moments: from_frame (+ from_tinframe), to_frame (+ to_tinframe; default the current
+-- position), options sections ("cpu,paging,memory,screen,devices,between"), limit (16), writers (true), text
+local d = ttd_diff{from_frame = 1201, to_frame = 1204, sections = "cpu,memory"}
+-- { from = {frame = 1201, tinframe = 0}, to = {frame = 1204, tinframe = 0}, backwards = false,
+--   registers = { {name = "PC", before = 0x8008, after = 0x8009}, ... },
+--   memory = {changed = 2, pages = 1, ranges = { {region = "ram", page = 2, offset = 0x2000, address = 0xA000,
+--   length = 1, changed = 1, before = {3}, after = {6}, last_write = {frame = 1203, tinframe = 71, pc = 0x800C,
+--   address = 0xA000, text = "inc (hl)"}}, ... }, more = 0}, writer_searches = 2, ms = ... }
+
 local summary = ttd_coverage_summary{from_frame = 1, to_frame = 500, bucket_size = 50, limit = 100}
 -- { from_frame = 1, to_frame = 500, covered_from = 18, covered_to = 497,
 --   bucket_size = 50, bucket_count = 10, index_available = true,
@@ -1124,6 +1480,24 @@ emu.step_out()                       -- run until the current subroutine returns
 emu.skip_until(0x8000)               -- fast-forward until PC == target (breakpoints skipped)
 emu.skip_until("0x8000", 70000000)   -- optional explicit t-state budget
 
+-- Frame watches (command-interface.md, "Run until, and frame watches"): rules checked at every frame end
+run_until{text = "PRESS", max_frames = 500}   -- {met, outcome, frames, frame, pc, ms, hit = {reasons, text_line}, text}
+run_until{["if"] = "M(#5C3A)==1", screen = "stable", stable_frames = 50, match = "all"}
+watch_add{text = "GAME OVER", label = "over"}  -- {id, watch, text}; a hit pauses at that frame end
+watches()                                       -- {count, watches = {...}, text}
+watch_remove(1)                                 -- or watch_remove("all")
+
+-- The paced run (core RunPacer, command-interface.md §2.1): a frame / lines / an instruction per interval,
+-- stops at a breakpoint. The reply: the body with `pace` and ok (false: error = the message)
+pace()                               -- {preset, label, unit, count, interval_ms, effective_ms, running, ticks,
+                                     --  stop_reason, presets}
+pace_set("5fps")                     -- full, 25fps, 5fps, 1fps, frame, 100lines, 10lines, 1line, 1op
+pace_set("1op", 200)                 -- and the interval of frame .. 1op (1..5000 ms)
+pace_interval(50)
+pace_next() pace_prev()              -- finer / coarser
+pace_start() pace_stop() pace_toggle()
+pace_step()                          -- one step at the pace
+
 -- Memory search
 emu.mem_find("AF 3C")                -- hex pattern as string (spaces optional)
 emu.mem_find(0xAF3C)                 -- or as a number
@@ -1136,7 +1510,7 @@ snap, err = debug_snapshot{disasm = 21, stack = 8, memory = {"cpu:0x8000:256", "
 -- snap.pages[1].kind, snap.stack.words, snap.time.frame, snap.disasm[1].mnemonic,
 -- snap.memory[1].bytes (a Lua string), snap.memory[2].error when a window cannot be read
 emu.mem_find("C3", nil, nil, 1, 64, "ram")         -- every RAM page: matches as page {kind, page} + offset
-emu.mem_find("C3 00 80", 0, 0x3FFF, 1, 64, "ram5") -- one page (offsets), also "rom2", "cache0"
+emu.mem_find("C3 00 80", 0, 0x3FFF, 1, 64, "ram5") -- one page (offsets), also "rom2", "cache0", or a region by name ("vram", "neogs.ram": offsets in it)
 emu.mem_find("21 00 40", nil, nil, 1, 64, "cpu", "FF FF F0")  -- mask: 1 bits must match
 -- Result: {space, count, truncated, matches = {{address | page, offset, context_start, context}}};
 -- context = 4 bytes before, the match, 4 after; {error = "..."} when refused
@@ -1187,7 +1561,62 @@ emu.video_temporal_set("mod-tpgwafsd") -- switch it on; "off" or "" switches it 
                                      --   picture is shown later by the algorithm's look-ahead (7 frames for
                                      --   mod-tpgwafsd with the default A/V delay of 2) and the sound is delayed
                                      --   by the difference (audio_extra_delay_frames, 5 here) to stay in sync.
+emu.window_display()                 -- GUI window display settings: { backend ("gpu" / "software"), gpu_available,
+                                     --   gpu, crt, crt_profile, crt_profiles = {...}, blending (temporal blending),
+                                     --   blending_frames (2..5), blending_weights ("equal" / "exponential"),
+                                     --   blending_decay (0.1..0.9), smooth_motion ("off" / "blend" /
+                                     --   "interpolate" / "auto"), effects_device ("gpu" / "cpu"), present_policy
+                                     --   ("auto" / "vrr" / "vsync"), display_rate ("keep" / "match"),
+                                     --   lip_sync_offset_ms (-200..200),
+                                     --   present = { presenter, vrr, vrr_support = { state, reason }, clock, timing = { delay_clamped, max_delay_ms, clamped_frames, early, carried, cuts, carry_ms }, late, beat = { frames, off }, lead_ms, error_ms, sound_offset_ms = { p50, p99 }, gpu_wait_ms, gpu_ms = { smooth, smooth_cpu, picture = { p50, max, longest, measured } }, sync = { mode, reason }, smooth = { mode, renders, interpolated, ... },
+                                     --   display = { state, reason, hz, ... } }
+                                     --   (the frame presenter's timing), emulator (the instance the window shows),
+                                     --   fullscreen, view ("full" / "screen" / "content"), views, scale (1..4, 0 = resized by hand), toolbar, status_bar, hud,
+                                     --   hud_theme, hud_themes, hud_notices = {id = shown}, osd_keyboard,
+                                     --   osd_keyboard_picture, osd_keyboard_pictures, osd_keyboard_style,
+                                     --   osd_keyboard_styles, next_layers, next_layers_mode,
+                                     --   next_layers_shown = {ula, layer2, tilemap, sprites} }; headless
+                                     --   { ok = false, error, kind = "no-window" }
+emu.window_display_set({crt_profile = "basic", blending = true})  -- any of gpu, crt, blending, fullscreen,
+                                     --   toolbar, status_bar, hud, osd_keyboard, next_layers (boolean),
+                                     --   crt_profile (one of crt_profiles: none, basic, ...,
+                                     --   shader:<name> (a preset or a custom shader) with the GPU; other
+                                     --   than none switches CRT on), blending_frames, blending_weights,
+                                     --   blending_decay (0.3), smooth_motion ("interpolate"), effects_device
+                                     --   ("gpu" / "cpu"), present_policy ("vsync"), display_rate ("match"),
+                                     --   lip_sync_offset_ms (-40),
+                                     --   view ("full" / "screen" / "content"), scale (1..4), hud_theme, hud_notices = {["ram-page"]
+                                     --   = false}, osd_keyboard_picture, osd_keyboard_style ("photo" / "schematic" /
+                                     --   "hybrid"), next_layers_mode ("layers" / "composed" /
+                                     --   "winner"), next_layers_shown = {sprites = false}; applied the way the View
+                                     --   menu does. Returns the settings after the change, or
+                                     --   { ok = false, error, kind = "bad-parameter" / "no-window" / "unavailable" }
+emu.window_crt_params()              -- the active CRT profile's parameters: { profile, kind ("preset" / "profile" /
+                                     --   "none"), parameters = {{name, description, value, initial, minimum,
+                                     --   maximum, step}, ...} }; headless { ok = false, error, kind = "no-window" }
+emu.window_crt_params_set({CRTgamma = 2.4}, {steps = {curvature = 2}, reset = true})  -- set values (clamped),
+                                     --   move by a dial's steps, reset all (true) or one ("name"); returns the
+                                     --   parameters after it, or { ok = false, error, kind }
+emu.window_record("/abs/demo.mp4", {keyboard = "default", codec = "h264"})  -- record the GUI window as drawn (CRT,
+                                     --   the on-screen keyboard, the machine's sound, one video frame per emulated
+                                     --   frame); options: keyboard ("default", a picture id, false), codec ("prores" /
+                                     --   "h264"), audio (boolean), fps (1..100, audio = false only), scale (1..4),
+                                     --   hardware, fit, picture_height (0..4320, GPU), width / height (the frame), layout ("below" /
+                                     --   "side"). Returns { recording, path, keyboard, frames, width, height, fps,
+                                     --   audio, sample_rate, audio_samples }, or { ok = false, error, kind }
+emu.window_record_frames(100)        -- a paused machine runs 100 frames, every one recorded; the status with ran
+emu.window_record_stop()             -- finish the file (waits for ffmpeg, muxes the sound in); its last status
+emu.window_record_status()           -- the recording's status; headless { ok = false, error, kind = "no-window" }
+emu.video_viewport()                 -- the overscan frame and its crop: { overscan, overscan_available, viewport,
+                                     --   viewports, framebuffer, display, video_mode } (the machine's: headless too)
+emu.video_viewport_set("standard")   -- full / symmetric / standard / screen_only / next / prev; a crop other than
+                                     --   full needs overscan on (feature "overscan"); { ok = false, error } refused
 emu.frame_cost()                     -- per-frame halt/run cost accounting
+emu.operations([since [, limit]])    -- the operation log (reset, autostart, snapshot load, media insert / eject /
+                                     --   discard, blank disk; refusals too): { mode, last_seq, capacity,
+                                     --   entries = {{seq, frame, t_in_frame, wall_ms, kind, source, mode, status,
+                                     --   effect, summary, detail}} } oldest first; since: after that seq; limit:
+                                     --   the newest N (0 = all). Fields: command-interface.md, Operation log
 
 -- Coverage analyzer
 emu.coverage_start()                 -- start clean; emu.coverage_start(true) keeps old data
@@ -1195,6 +1624,8 @@ emu.coverage_stop()
 emu.coverage_status()                -- executed count + first ranges
 emu.coverage_gaps()                  -- executed ranges and gaps over the full 64K
 emu.coverage_gaps(0x8000, 0xFFFF, 10)
+emu.coverage_export()                -- SkoolKit map text: { success, format, start, end, count, map, message }
+emu.coverage_export("/abs/run.map", {start = 0x6000, merge = true})   -- written: { ..., path, merged }
 
 -- AY register log
 emu.ay_log_start()                   -- default capacity; emu.ay_log_start(8192) to override
@@ -1229,7 +1660,13 @@ emu.video_record("start", {format = "h264", filename = "run.mkv", profile = "4k"
                                      -- profile: "native" (default) | "1080p" | "1440p" | "4k": a fixed frame, the
                                      -- picture fitted into it (aspect kept, nearest, black bars; h264 /
                                      -- h265 only). acceleration: "auto" | "hardware" | "software"
+emu.video_record("start", {preset = "gameplay"})  -- a core preset (recording_presets() lists them); fields win
+emu.video_record("start", {mode = "audio", container = "flac"})  -- audio only; mode "multi": a track per source
+emu.video_record("toggle")           -- stop a running recording, else start one
 emu.video_record("stop")             -- also "pause" / "resume"
+recording_presets()                  -- {{id = "gameplay", title = "Gameplay (MP4)", mode, format, container, audio, ...}, ...}
+recent_files("tape")                 -- the files opened lately: {kind, files = {{index, kind, name, path, time}, ...}}
+recent_clear()                       -- forget them (a kind, or all); open one: action("media.open_recent", nil, {index = 0})
 emu.video_record_status()             -- recording state + live stats (frames, duration, fps,
                                      -- audio, audio_codec, audio_sample_rate, audio_duration)
 
@@ -1246,6 +1683,83 @@ emu.listing_load("game.lst")
 emu.listing_source_at()              -- source line at PC; emu.listing_source_at(0x8100)
 emu.listing_step_line()              -- run until the source line changes (~2 s budget)
 emu.listing_run_to_line(120)         -- run to first code byte of line 120 (~10 s budget)
+```
+
+### Analysis layers
+
+The L0 access facts, the L1 build and the L2 structure of the [analysis layers](../../analysis/analysis-layers.md) through the shared
+core handler (`analysis::Execute`): the answer is a table of its fields plus `text` (the CLI's lines); a refusal is
+`{ ok = false, error = <why> }`.
+
+```lua
+emu.analysis("start")                                -- level facts, mode z80, a fresh session
+emu.analysis("start", {level = "counters", mode = "physical"})
+emu.analysis("start", "counters")                    -- a string: the level
+emu.analysis("status")                               -- { state, level, mode, frame, facts, text }
+local r = emu.analysis("explain", "$80BC")           -- a string: the address (or a label)
+print(r.text)
+emu.analysis("explain", {address = 0xC000, page = "ram:3"})   -- physical mode: the page
+emu.analysis("stop")                                 -- the facts stay readable
+
+-- L1: record, build from the recording (a job), then routine fact sheets
+emu.analysis("start", {record = true})               -- also a TTD recording
+emu.analysis("build", {wait = 20000})                -- { job, state, bundle, progress, ready, text }; frames, path
+emu.analysis("build", {from_frame = 1200, from_tinframe = 3500, to_frame = 4000})  -- a window: one stage (analysis-layers.md#stages-and-windows)
+emu.analysis("build", "500")                         -- a string: the frames to replay
+local sheet = emu.analysis("explain", "$0038")       -- L1 ready: { what = "routine", routine, text = the sheet }
+emu.analysis("explain", {address = 0x38, what = "byte"})
+emu.analysis("cancel")                               -- a running build; refused when none runs
+
+-- L2 (made by the build): the detectors' claims and the draft
+emu.analysis("query", {kind = "records", range = "8000-83FF", limit = 20})  -- { kind, range, regions, count, truncated, text }
+emu.analysis("query", "conflicts")                   -- a string: the kind
+local ctl = emu.analysis("export", "ctl")            -- a string: the format; ctl.content is the file
+emu.analysis("export", {format = "skool", path = "game.skool", ranges = "5900-59FF,8000-FFFF", width = 8})
+emu.analysis("gallery", {kind = "sprite"})           -- the graphics found: { regions, count, truncated, text }
+local g = emu.analysis("gallery", "$8200")           -- a string: the address; g.png is the PNG (base64)
+emu.analysis("gallery", {address = 0x8200, scale = 4, path = "sprite.png"})
+emu.analysis("trace", {path = "scratch/pass.uatr", from_frame = 1001, to_frame = 1003})  -- the CPU access trace
+
+-- L3 (the review): findings register, review queue, experiments on muted clones, directed coverage
+emu.analysis("findings", {kind = "bug"})             -- { count, total, by_kind, by_status, findings, text }
+local item = emu.analysis("review")                  -- the next item: { item, sheet, sheet_bytes, queue, text }
+emu.analysis("review", {op = "resolve", id = item.item.id, verdict = "ok", label = "MainLoop"})
+emu.analysis("experiment", '{"poke": {"$8100": 5}, "frames": 50, "expect": {"mem:$8101": "$AA"}}')  -- the spec as JSON text
+emu.analysis("cover", "32")                          -- a string: the budget
+```
+
+### Memory markup
+
+The [memory markup](../../../inprogress/2026-11-05-software-metadata-profile/README.md) through the shared core handler (`markup::Execute`): the answer is a table of its fields
+plus `text`; a refusal is `{ ok = false, error = <why> }`. A string second argument is the action's main option
+(show, mark, unmark: the range; comment: the address; clear: the layer; save: the profile).
+
+```lua
+emu.markup("mark", {range = "8000-80FF", kind = "sprite", title = "hero"})  -- the user layer
+local m = emu.markup("show", "8000-81FF")            -- { from, to, spans, anchors, comments, count, truncated, text }
+emu.markup("comment", {address = "$8010", text = "frame 2"})
+emu.markup("unmark", "8040-80FF")
+emu.markup("layers")                                 -- { layers, runtime, revision, text }
+emu.markup("clear", "user")
+emu.markup("save", {analysis = {"code", "sprite"}, keep = true})  -- unreal-qt: into the game's software profile
+```
+
+### CPU time profile
+
+The [CPU time profile](../../analysis/cpu-profile.md) through the shared core handler (`profile::Execute`): a table of
+the answer's fields plus `text`; a refusal is `{ok = false, error = <why>}`. A string as the second argument is the
+mark's name (`mark`), the top (`report`), the last (`frames`) or the format (`export`).
+
+```lua
+emu.cpuprofile("start")                                -- cells + call stack + per-frame series
+emu.cpuprofile("start", {beam = true, reset = true})
+emu.run_frames(500)
+local r = emu.cpuprofile("report", {top = 10})       -- { window, routines = {{name, entry, self, inclusive, ...}}, text }
+print(r.text)
+emu.cpuprofile("mark", "level2")
+emu.cpuprofile("report", {since = "level2"})
+emu.cpuprofile("export", {format = "kit", path = "work/p1/profile-l1.json"})
+emu.cpuprofile("stop")
 ```
 
 ## Usage Examples
@@ -1462,42 +1976,42 @@ disassemble(cpu:get_pc(), 16)
 
 ## Event Callbacks
 
-### Supported Events
+A script is called back on a tap (a memory or port access, with an optional condition; it never stops the machine),
+on a breakpoint's stop, or on a game event of the controller profile. The emulation thread notes each hit with a
+snapshot of the registers; the function runs later on this interpreter's thread (deferred mode). A string instead
+of a function is a chunk (Lua source that returns the function) for the emulator's hook state: it runs on the
+emulation thread inside the access (`mode = "sync"`) or at the frame end (`"frame"`), with an instruction budget.
+Full reference:
+[docs/features/script-callbacks.md](../../../features/script-callbacks.md).
 
 ```lua
--- Frame rendered
-emu:set_frame_callback(function()
-    -- Called every frame
-end)
+-- One of exec, read, write, port_in, port_out names the address; to=, page=, mask=, ["if"]=, dialect=
+id, err = on_tap({write = 0x5C78, ["if"] = "MDT < 5"}, function(hit)
+    print(hit.frame, hit.pc, hit.value, hit.regs.hl)
+end, {label = "lives"})                      -- options: policy (suspend | disable | ignore), budget_us, ring, label
+id, err = on_tap({event = "fdc_command", value = 0x80, vmask = 0xE0}, fn)  -- a machine event; hit.arg the detail
+id, err = on_tap({chip = "ay", reg = 7}, fn)  -- a sound chip's register write; to=, unit=, value=, vmask=, ["if"]=
+id, err = on_breakpoint(3, function(hit) print("stop at", hit.pc) end)  -- the breakpoint still stops
+id, err = on_game_event("died", function(hit) print(hit.event, hit.value) end)
 
--- Breakpoint hit
-emu:set_breakpoint_callback(function(bp_id, address)
-    -- Called when breakpoint triggers
-end)
+for _, cb in ipairs(callbacks()) do          -- id, on, owner, label, target, policy, state, reason, stats
+    print(cb.id, cb.target, cb.state, cb.hits, cb.calls, cb.max_us)
+end
+callback_resume(id)                          -- a suspended callback again, statistics reset
+callback_policy(id, "ignore")
+callback_remove(id)
+callbacks_run()                              -- run the waiting hits now (a script looping without returning)
 
--- State changed
-emu:set_state_callback(function(old_state, new_state)
-    print("State: " .. old_state .. " -> " .. new_state)
-end)
-
--- Memory written
-emu:set_memory_write_callback(function(address, value)
-    print(string.format("Write: [0x%04X] = 0x%02X", address, value))
-end)
+-- The hook state: peek, peek16, poke, reg, set_reg, frame, tstate, shared_get, shared_set
+id, err = on_tap({write = 0x5C78}, [[return function(hit) shared_set("lives", hit.value) end]],
+                 {mode = "sync", instructions = 5000})  -- policy may also be "unpaced"
+-- role "logic": the writes land at the next instruction boundary and TTD records them (a replay applies them)
+id, err = on_tap({write = 0x5C78}, [[return function(hit) poke(0x5C78, 5) end]], {mode = "sync", role = "logic"})
+print(shared_get("lives"))                   -- values shared with the hooks: nil, boolean, number, string
+callback_hooks()                             -- {unpaced, unpaced_spans, last_frame_us, max_frame_us, frames_over_share}
 ```
 
-### Callback Management
-
-```lua
--- Register callback
-callback_id = emu:register_callback("frame", my_function)
-
--- Unregister callback
-emu:unregister_callback(callback_id)
-
--- Clear all callbacks
-emu:clear_callbacks()
-```
+A registration returns the id, or `-1` and the reason. The callbacks go when the interpreter stops.
 
 ## Lua Standard Library
 

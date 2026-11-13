@@ -5,8 +5,10 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 
+#include "dialects/common/characters.h"
 #include "dialects/common/macros.h"
 #include "dialects/common/z80.h"
 
@@ -211,7 +213,7 @@ struct ExpressionParser
             if ((c == '[' || c == ']') && !(c == ']' && memoryDepth > 0))
             {
                 ++i;
-                acc = Expr::Binary(c == '[' ? Op::RotateLeft16 : Op::RotateRight16, std::move(acc), Expr::Number(1));
+                acc = Expr::Binary(c == '[' ? Op::CyclicLeft16 : Op::CyclicRight16, std::move(acc), Expr::Number(1));
                 continue;
             }
             Op op;
@@ -663,6 +665,8 @@ struct LineParser
     std::set<std::string>& macros;
     FrontendResult& result;
     int localRegion = 0;
+    // .PAGE n (4.05): the code of the next ORGs at #C000 and up goes to RAM page n (checked in TASM 4.12)
+    std::optional<Expr> page{};
     bool inMacro = false;                      // inside DEFMAC: ...labels are local to each expansion
     const std::set<std::string>* referenced = nullptr;   // names the source uses as operands
     const std::set<std::string>* labels = nullptr;       // names defined in column 0
@@ -769,6 +773,20 @@ struct LineParser
                 const std::string word = t.substr(i, j - i);
                 while (j < t.size() && t[j] == ' ')
                     ++j;
+                if (z80::Upper(word) == ".PAGE" || z80::Upper(word) == ".RUN")
+                {
+                    // .PAGE n: kept for the ORGs that follow (ORG address,page); .RUN address (4.11) only sets where
+                    // TASM's Run command starts the code: no counterpart, kept as a comment
+                    const std::string operand = t.substr(j);
+                    if (z80::Upper(word) == ".PAGE")
+                        page = p.Parse(operand);
+                    else
+                        result.diagnostics.push_back({Severity::Info, number, 0, ".RUN " + operand + " (TASM's Run address) kept as a comment"});
+                    line.comment = " " + z80::Upper(word) + " " + operand + (line.hasComment ? ";" + line.comment : std::string());
+                    line.hasComment = true;
+                    result.program.lines.push_back(std::move(line));
+                    return;
+                }
                 if (z80::Upper(word) == ".LOCAL")
                 {
                     // A new region for ...labels; the labels are renamed, nothing is left to write
@@ -783,6 +801,14 @@ struct LineParser
                     macros.insert(s.text);
                 if (s.kind == Statement::Kind::Directive && s.directive == ir::DirectiveKind::Other)
                     result.diagnostics.push_back({Severity::Warning, number, 0, "TASM directive " + word + " kept as text"});
+                if (s.kind == Statement::Kind::Directive && s.directive == ir::DirectiveKind::Org && page && s.args.size() == 1)
+                {
+                    // TASM puts the code in the page only at #C000 and up ("ORG must be above #C000")
+                    if (s.args[0].kind == Expr::Kind::Number && s.args[0].value >= 0xC000)
+                        s.args.push_back(*page);
+                    else if (s.args[0].kind != Expr::Kind::Number)
+                        result.diagnostics.push_back({Severity::Warning, number, 0, "ORG after .PAGE with an address not known here: the page is not attached"});
+                }
                 if (s.kind == Statement::Kind::Directive && (s.directive == ir::DirectiveKind::Org || s.directive == ir::DirectiveKind::Disp))
                 {
                     EndPhase(line);
@@ -878,6 +904,82 @@ std::pair<std::string, std::string> Command(const std::string& text)
     while (k < text.size() && (text[k] == ' ' || text[k] == '\t'))
         ++k;
     return {z80::Upper(text.substr(i, j - i)), text.substr(k)};
+}
+
+/// TASM 4.12's conditionals do not nest (checked in the emulator, research-tasm-to-sjasmplus.md): one state, which .IF
+/// sets from its value even inside a skipped part, .ELSE inverts and .ENDIF clears. As sjasmplus blocks: a .IF while
+/// one is open closes it first, a .ENDIF with none open is dropped, a .ELSE with none open starts skipping (IF 0), and
+/// an open block ends before ENDMAC and at the end of the file. A macro body keeps its own state.
+void FlattenConditionals(ir::Program& program, Diagnostics& diagnostics)
+{
+    const auto directive = [](ir::DirectiveKind kind) {
+        Statement s;
+        s.kind = Statement::Kind::Directive;
+        s.directive = kind;
+        return s;
+    };
+    bool open = false;
+    bool outerOpen = false;
+    for (ir::Line& line : program.lines)
+    {
+        std::vector<Statement> statements;
+        for (Statement& s : line.statements)
+        {
+            if (s.kind != Statement::Kind::Directive)
+            {
+                statements.push_back(std::move(s));
+                continue;
+            }
+            switch (s.directive)
+            {
+                case ir::DirectiveKind::If:
+                    if (open)
+                    {
+                        statements.push_back(directive(ir::DirectiveKind::EndIf));
+                        diagnostics.push_back({Severity::Info, line.sourceLine, 0, ".IF while a .IF is open: TASM's conditionals do not nest, the open one ends here"});
+                    }
+                    open = true;
+                    break;
+                case ir::DirectiveKind::Else:
+                    if (!open)
+                    {
+                        // No block open: TASM's .ELSE inverts "not skipping" into skipping
+                        s = directive(ir::DirectiveKind::If);
+                        s.args.push_back(Expr::Number(0));
+                        open = true;
+                        diagnostics.push_back({Severity::Info, line.sourceLine, 0, ".ELSE with no .IF open: skips to the next .ENDIF / .IF"});
+                    }
+                    break;
+                case ir::DirectiveKind::EndIf:
+                    if (!open)
+                    {
+                        diagnostics.push_back({Severity::Info, line.sourceLine, 0, ".ENDIF with no .IF open: nothing to end"});
+                        continue;
+                    }
+                    open = false;
+                    break;
+                case ir::DirectiveKind::Macro:
+                    outerOpen = open;
+                    open = false;
+                    break;
+                case ir::DirectiveKind::EndMacro:
+                    if (open)
+                        statements.push_back(directive(ir::DirectiveKind::EndIf));
+                    open = outerOpen;
+                    outerOpen = false;
+                    break;
+                default:
+                    break;
+            }
+            statements.push_back(std::move(s));
+        }
+        line.statements = std::move(statements);
+    }
+    if (open && !program.lines.empty())
+    {
+        program.lines.back().statements.push_back(directive(ir::DirectiveKind::EndIf));
+        diagnostics.push_back({Severity::Info, program.lines.back().sourceLine, 0, "a .IF still open at the end of the file ends there"});
+    }
 }
 }  // namespace
 
@@ -1008,6 +1110,8 @@ FrontendResult TasmFrontend::Parse(const SourceDocument& source) const
         for (Statement& st : l.statements)
             if (st.kind == Statement::Kind::Directive && st.directive == ir::DirectiveKind::Equ && redefined.count(l.label))
                 st.directive = ir::DirectiveKind::Defl;
+    FlattenConditionals(result.program, result.diagnostics);
+    CharactersInCodePage(result.program, source.codePage);
     return result;
 }
 }  // namespace unrealasm::dialects

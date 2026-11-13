@@ -52,6 +52,8 @@ protected:
     blip_t* _blipL = nullptr;
     blip_t* _blipR = nullptr;
     bool _synthesisSuppressed = false;
+    bool _useCustomLevels = false;
+    int32_t _customLevels[4] = {};
 
     // Last amplitudes written to blip_buf (tracked independently for Port #FE OUT vs Tape IN)
     int32_t _lastPortFEAmplitude = DAC_LEVEL_00;
@@ -59,6 +61,7 @@ protected:
 
     // Previous port #FE state (bits 3-4: MIC/EAR)
     uint8_t _portFEState = 0;
+    uint32_t _earEdges = 0;  ///< TakeEarEdges
 
     // Output buffer — points into SoundManager's beeper AudioFrameDescriptor
     int16_t* _outputBuffer = nullptr;
@@ -86,6 +89,9 @@ public:
     /// region <Methods>
 public:
     void reset();
+    /// Drop the deltas no frame end has read (synthesis resuming, a restored machine: a search replays one frame
+    /// many times) and restart the buffers at the level the circuit holds, so later deltas stay relative to it
+    void discardPending();
 
     /// A level change (port #FE or tape) landed in the last finished frame
     bool hadSoundLastFrame() const { return _hadSoundLastFrame; }
@@ -115,6 +121,13 @@ public:
     /// @param value  Full port #FE byte (bits 3-4 = MIC/EAR)
     /// @param frameTState  T-state counter within the current frame
     void handlePortOut(uint8_t value, uint32_t frameTState);
+    /// EAR (bit 4) edges since the last call: the haptic feed's beeper-density (controller manager haptics.md §4)
+    uint32_t TakeEarEdges()
+    {
+        const uint32_t edges = _earEdges;
+        _earEdges = 0;
+        return edges;
+    }
 
     /// Turbo mode (audio muted, frame-end synthesis skipped): keep tracking the
     /// port #FE / tape levels so the next edge after turbo is correct, but do not
@@ -146,5 +159,18 @@ protected:
     /// Look up DAC amplitude from EAR and MIC bits.
     /// @param earMicBits  Bits 3-4 of port #FE value (masked)
     static int32_t dacAmplitude(uint8_t earMicBits);
+
+public:
+    /// A machine whose ULA output goes through its own mixer (the Next: EAR 2048, MIC 512 of 32768) replaces the four
+    /// levels (index = EAR << 1 | MIC); clearDacLevels returns the ULA circuit's levels
+    void setDacLevels(const int32_t levels[4])
+    {
+        for (int i = 0; i < 4; i++)
+            _customLevels[i] = levels[i];
+        _useCustomLevels = true;
+    }
+    void clearDacLevels() { _useCustomLevels = false; }
+    int32_t levelFor(uint8_t earMicBits) const;
+protected:
     /// endregion </Helper methods>
 };

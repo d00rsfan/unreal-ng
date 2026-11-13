@@ -16,7 +16,7 @@
 #include "_helpers/scratchfolder.h"
 #include "base/featuremanager.h"
 #include "debugger/ttd/ide/ttdcddrive.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/cpu/core.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/emulator.h"
@@ -35,7 +35,7 @@ namespace
     protected:
         Emulator* _emulator = nullptr;
         EmulatorContext* _context = nullptr;
-        ttd::TimeTravelManager* _ttd = nullptr;
+        ttd::TimeTravelController* _ttd = nullptr;
         std::unique_ptr<ScratchFolder> _folder;
 
         void SetUp() override
@@ -44,7 +44,7 @@ namespace
             ASSERT_NE(_emulator, nullptr);
             _context = _emulator->GetContext();
             _emulator->GetFeatureManager()->setFeature(Features::kTimeTravel, true);
-            _ttd = _context->pTimeTravelManager;
+            _ttd = _context->pTimeTravelController;
             _folder = std::make_unique<ScratchFolder>("ttd-cd");
             MediaSource source;
             source.path = cdtest::WriteMusicDisc(_folder->Path(), 1, 3, 16, cdtest::MusicLayout::Mixed);
@@ -83,8 +83,8 @@ namespace
 TEST_F(TTDCdDrive_Test, RegisteredOnlyWithACdDrive)
 {
     ASSERT_TRUE(_ttd->StartRecording());
-    EXPECT_TRUE(_ttd->GetPeripheralRegistry().IsRegistered(ttd::PeripheralId::CdDrive));
-    EXPECT_TRUE(_ttd->GetPeripheralRegistry().IsRegistered(ttd::PeripheralId::AtaChannel));
+    EXPECT_TRUE(_ttd->GetPeripheralRegistry().IsRegistered(ttd::TTDDeviceType::CdDrive));
+    EXPECT_TRUE(_ttd->GetPeripheralRegistry().IsRegistered(ttd::TTDDeviceType::AtaChannel));
     _ttd->StopRecording();
     EXPECT_EQ(ttd::TTDCdDrive(_context).TTDStateSize(), 8u + 2 * (sizeof(CdAudioState) + sizeof(AtapiStage) + 8));
 
@@ -92,10 +92,10 @@ TEST_F(TTDCdDrive_Test, RegisteredOnlyWithACdDrive)
     Emulator* pentagon = EmulatorTestHelper::CreateStandardEmulator("PENTAGON", LoggerLevel::LogError);
     ASSERT_NE(pentagon, nullptr);
     pentagon->GetFeatureManager()->setFeature(Features::kTimeTravel, true);
-    ttd::TimeTravelManager* other = pentagon->GetContext()->pTimeTravelManager;
+    ttd::TimeTravelController* other = pentagon->GetContext()->pTimeTravelController;
     ASSERT_TRUE(other->StartRecording());
-    EXPECT_TRUE(other->GetPeripheralRegistry().IsRegistered(ttd::PeripheralId::AtaChannel));
-    EXPECT_FALSE(other->GetPeripheralRegistry().IsRegistered(ttd::PeripheralId::CdDrive));
+    EXPECT_TRUE(other->GetPeripheralRegistry().IsRegistered(ttd::TTDDeviceType::AtaChannel));
+    EXPECT_FALSE(other->GetPeripheralRegistry().IsRegistered(ttd::TTDDeviceType::CdDrive));
     other->StopRecording();
     EmulatorTestHelper::CleanupEmulator(pentagon);
 }
@@ -210,6 +210,10 @@ TEST_F(TTDCdDrive_Test, FolderDiscReplaysIdenticallyAndAnotherDiscIsReported)
     ASSERT_EQ(Cd().Disc()->ReadAudio(lba, first), CdImage::ReadResult::Ok);
     RunTo(endFrame, endT);
     EXPECT_EQ(Blob(), recorded) << "head, status and the disc identity as recorded";
+    // A media change in the recorded past is refused (the policy keeps history's media); the checks below load the
+    // recorded blob by hand, so the session is closed first and the machine is live
+    ASSERT_FALSE(_context->pMediaManager->Insert("ide0.slave", source, options).Ok()) << "refused in the past";
+    _ttd->InvalidateSession("the checks below swap the disc");
 
     // The same files in another folder: the same disc
     ScratchFolder copy("ttd-cd-folder-copy");

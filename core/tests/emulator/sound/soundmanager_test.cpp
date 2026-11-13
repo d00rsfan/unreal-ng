@@ -345,6 +345,7 @@ std::vector<std::vector<int16_t>> RunBeeperFrames(EmulatorContext* context, int 
     context->pAudioCallback.store(&DelayCapture::callback, std::memory_order_release);
     context->pAudioManagerObj.store(&capture, std::memory_order_release);
     SoundManager sound(context);
+    sound.unmute();  // a SoundManager starts muted
     sound.reset();
     sound.getBeeperChain().setPunchEnabled(false);
     Z80* z80 = context->pCore->GetZ80();
@@ -476,7 +477,7 @@ TEST_F(SoundManagerCd_Test, OneRowPerCdDrive)
     EXPECT_EQ(IdeController::CdAudioName(3), "CD ide1.slave");
 
     // The unit becomes a hard disk: its row goes; back to a CD drive: it comes back
-    ASSERT_TRUE(_context->pMediaManager->Eject("ide0.slave", {Disposition::Discard}).Ok());
+    ASSERT_TRUE(_context->pMediaManager->Eject("ide0.slave", EjectOptions::Discarding()).Ok());
     ASSERT_TRUE(_context->pIdeController->SetUnitKind(1, false));
     _emulator->RunNFrames(1);
     EXPECT_EQ(Row(), nullptr);
@@ -530,7 +531,9 @@ TEST_F(SoundManagerCd_Test, MixedSampleExactAndNothingWhileIdle)
     {
         const uint64_t k = i - start;
         if (k % cdtest::kSamples == 0 || i == start)
+        {
             ASSERT_EQ(disc->ReadAudio(static_cast<uint32_t>(kTrack2 + k / cdtest::kSamples), frame), CdImage::ReadResult::Ok);
+        }
         const size_t at = (k % cdtest::kSamples) * 2;
         ASSERT_EQ(mixed[2 * i], frame[at]) << "sample " << i;
         ASSERT_EQ(mixed[2 * i + 1], frame[at + 1]) << "sample " << i;
@@ -635,6 +638,7 @@ protected:
     std::unique_ptr<SoundManager> MakeSound()
     {
         auto sound = std::make_unique<SoundManager>(_context);
+        sound->unmute();  // a SoundManager starts muted
         sound->reset();
         ProgramTone(*sound->getTurboSound());
         return sound;
@@ -753,11 +757,14 @@ TEST_F(SoundManagerHostOutput_Test, ReconcileDropsOnlyStaleHolds)
     auto sound = MakeSound();
     auto leaked = std::make_unique<SoundManager::HostOutputHold>(sound.get(), Reason::DirectRun);
     SoundManager::HostOutputHold replay(sound.get(), Reason::TtdReplay);
+    auto unpaced = std::make_unique<SoundManager::HostOutputHold>(sound.get(), Reason::Unpaced);
 
-    EXPECT_EQ(sound->reconcileHostOutputHolds(false, true, false), 1);
+    EXPECT_EQ(sound->reconcileHostOutputHolds(false, true, false, true), 1);
     EXPECT_EQ(sound->hostOutputHolds(Reason::DirectRun), 0);
     EXPECT_EQ(sound->hostOutputHolds(Reason::TtdReplay), 1) << "a replay in progress keeps its hold";
+    EXPECT_EQ(sound->hostOutputHolds(Reason::Unpaced), 1) << "so do unpaced script hooks";
     EXPECT_EQ(sound->hostOutputStaleHoldsCleared(), 1u);
+    unpaced.reset();
 
     SoundManager::HostOutputHold fresh(sound.get(), Reason::DirectRun);
     leaked.reset();  // the stale guard's release is void: it must not end the fresh run's hold
@@ -765,7 +772,7 @@ TEST_F(SoundManagerHostOutput_Test, ReconcileDropsOnlyStaleHolds)
     fresh.Release();
     replay.Release();
     EXPECT_FALSE(sound->isHostOutputHeld());
-    EXPECT_EQ(sound->reconcileHostOutputHolds(false, false, false), 0) << "nothing left to drop";
+    EXPECT_EQ(sound->reconcileHostOutputHolds(false, false, false, false), 0) << "nothing left to drop";
 
     _sink = Sink{};
     RunFrame(*sound);
@@ -847,10 +854,12 @@ public:
     {
         Machine().RunFrame(true);
         if (check)
+        {
             EXPECT_EQ(size_t(Context()->pSoundManager->getBeeper().getLastSamplesRead()),
                       Context()->pSoundManager->lastFrameSamples())
                 << where << ", frame " << Context()->emulatorState.frame_counter
                 << ": the beeper delivered a different count than the mixer read";
+        }
     }
     void Frames(int n, bool check, const std::string& where)
     {

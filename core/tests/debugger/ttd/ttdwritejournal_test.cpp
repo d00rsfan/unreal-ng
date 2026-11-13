@@ -2,7 +2,7 @@
 /// @brief Unit tests for TTDWriteJournal (ring buffer, scan, lifecycle, serialization).
 ///
 /// Per parent TDD §9.3. Tests the write journal in isolation — no emulator,
-/// no TimeTravelManager. The journal is a pure data structure with a well-
+/// no TimeTravelController. The journal is a pure data structure with a well-
 /// defined thread model (single-producer append, control-thread read under
 /// pause), so we can exercise it without the full emulator harness.
 
@@ -615,4 +615,70 @@ TEST(TTDWriteJournal_Test, CorruptSectionSizesAreRefusedBeforeAllocating)
     EXPECT_FALSE(load(patched(kRecordCountAt, 0)));
     EXPECT_FALSE(load(patched(kCompressedSizeAt, 0xFFFFFFFFu)));
     EXPECT_FALSE(load(patched(kRawSizeAt, 0xFFFFFFFFu)));
+}
+
+/// Pages of another memory space (ttdphyspage.h: the Sprinter's video and fast RAM) keep bit 8 through a block; a
+/// block of RAM pages only has no page-high column, so blocks written before it read the same
+TEST(TTDWriteJournal_Compression_Test, PagesOfAnotherSpaceRoundTripAndRamOnlyBlocksKeepTheirLayout)
+{
+    std::vector<TTDWriteRecord> recs;
+    for (uint32_t i = 0; i < 21; i++)
+    {
+        TTDWriteRecord r = MakeRec(100 + i, static_cast<uint16_t>(0x1000 + i), static_cast<uint8_t>(i), 0x8000);
+        SetRecordPage(r, i % 3 == 0 ? SpacePage(TTDMemorySpace::Vram, 0x12345 + i)
+                         : i % 3 == 1 ? SpacePage(TTDMemorySpace::Cache, 0x4000 * (i & 3))
+                                      : static_cast<PhysPage>(i == 20 ? kPhysPageNone : i));
+        recs.push_back(r);
+    }
+    std::vector<TTDWriteRecord> back;
+    ASSERT_TRUE(DecodeWriteBlock(EncodeWriteBlock(recs.data(), 21), 21, back));
+    for (uint32_t i = 0; i < 21; i++)
+        EXPECT_EQ(RecordPage(back[i]), RecordPage(recs[i])) << "record " << i;
+    EXPECT_EQ(RecordPage(back[0]), kVramPageBase + 4);
+    EXPECT_EQ(SpaceOffset(RecordPage(back[0]), back[0].addr & 0x3FFF), 0x10000u + 0x1000u) << "page 4 of the video RAM";
+    EXPECT_EQ(RecordPage(back[20]), 0xFFu) << "no page: the 0xFF a record always had";
+
+    // RAM pages only: the block is the layout before the column (the I/O bits end it)
+    std::vector<TTDWriteRecord> ram(recs.begin(), recs.end());
+    for (TTDWriteRecord& r : ram)
+        SetRecordPage(r, 7);
+    const std::vector<uint8_t> withHigh = EncodeWriteBlock(recs.data(), 21);
+    const std::vector<uint8_t> plain = EncodeWriteBlock(ram.data(), 21);
+    EXPECT_EQ(withHigh.size(), plain.size() + 3) << "3 bytes of page-high bits for 21 records";
+    ASSERT_TRUE(DecodeWriteBlock(plain, 21, back));
+    for (const TTDWriteRecord& r : back)
+        EXPECT_EQ(RecordPage(r), 7u);
+}
+
+/// The 8K-half bit (the Next's MMU: an odd 8K page in an even slot) survives a block; a block without such a record
+/// keeps the layout before the column, and one with flips but RAM pages only writes a zero page-high column first
+TEST(TTDWriteJournal_Compression_Test, EightKHalvesRoundTripAndBlocksWithoutThemKeepTheirLayout)
+{
+    std::vector<TTDWriteRecord> recs;
+    for (uint32_t i = 0; i < 21; i++)
+    {
+        TTDWriteRecord r = MakeRec(100 + i, static_cast<uint16_t>(0xC000 + i), static_cast<uint8_t>(i), 0x8000);
+        SetRecordPage(r, 7);
+        r.flip = (i % 3 == 1) ? 1 : 0;
+        recs.push_back(r);
+    }
+    std::vector<TTDWriteRecord> back;
+    ASSERT_TRUE(DecodeWriteBlock(EncodeWriteBlock(recs.data(), 21), 21, back));
+    for (uint32_t i = 0; i < 21; i++)
+    {
+        EXPECT_EQ(back[i].flip, recs[i].flip) << "record " << i;
+        EXPECT_EQ(RecordPage(back[i]), 7u) << "record " << i;
+    }
+    EXPECT_EQ(RecordOffset(back[1]), 0x2001u) << "the upper 8K half of page 7";
+    EXPECT_EQ(RecordOffset(back[0]), 0x0000u);
+
+    std::vector<TTDWriteRecord> plain(recs.begin(), recs.end());
+    for (TTDWriteRecord& r : plain)
+        r.flip = 0;
+    const std::vector<uint8_t> withFlip = EncodeWriteBlock(recs.data(), 21);
+    const std::vector<uint8_t> noFlip = EncodeWriteBlock(plain.data(), 21);
+    EXPECT_EQ(withFlip.size(), noFlip.size() + 6) << "3 bytes of zero page-high bits and 3 of flip bits";
+    ASSERT_TRUE(DecodeWriteBlock(noFlip, 21, back));
+    for (const TTDWriteRecord& r : back)
+        EXPECT_EQ(r.flip, 0u);
 }

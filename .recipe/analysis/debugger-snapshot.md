@@ -29,7 +29,7 @@ emulator was never started).
 ```text
 # Registers, previous registers, pages, stack, time, 21 lines of code from PC, two memory windows
 inspect_state {"aspects":["snapshot"],"count":21,"windows":["cpu:0x8000:256","ram5:0x1800:768"]}
-# -> [snapshot] seq 42, paused (read paused), last stop breakpoint, PC=8000, frame 100 t 1234, 21 code line(s), 2 memory window(s)
+# -> [snapshot] seq 42, paused (read paused), last stop breakpoint, PC=8000, frame 100 t 1234 of 69888 (global t 6990034), 21 code line(s), 2 memory window(s)
 ```
 
 The structured answer is the WebAPI object below; memory windows carry `base64`.
@@ -101,8 +101,8 @@ memory save cpu:0:65536 all.bin
 
 ## Fields (summary)
 
-`seq`, `cpu` (`z80`), `state` (paused | running | stopped), `pause` {`reason` none | pause | breakpoint | step,
-`breakpoint_id`, `address`}, `consistency`, `regs` (the `GET /registers` object), `prev_regs` (null before the
+`seq`, `cpu` (`z80`), `state` (paused | running | stopped), `pause` {`reason` none | pause | breakpoint | step | watch,
+`breakpoint_id`, `address`; a watch: `watch_id`, `watch_label`, `frame`, `reasons`, `text_line`}, `consistency`, `regs` (the `GET /registers` object), `prev_regs` (null before the
 first stop), `pages[]` {`window`, `start`, `kind` rom | ram | cache, `page`}, `stack` {`sp`, `words[]`},
 `time` {`frame`, `t`, `frame_t`, `line`, `dot`}, `disasm[]` (the `GET /disasm` lines), `memory[]` {`space`,
 `address`, `length`, `base64` (WebAPI, MCP) or `bytes` (Lua, Python, CLI)} or {`space`, `address`, `error`}.

@@ -2,6 +2,9 @@
 #include "stdafx.h"
 #include "portdecoder_atm710.h"
 
+#include <cstring>
+#include "loaders/snapshot/snapshotcapture.h"
+
 #include <algorithm>
 
 #include "debugger/ttd/atm/ttdatmiobus.h"
@@ -24,6 +27,8 @@ PortDecoder_ATM710::PortDecoder_ATM710(EmulatorContext* context) : PortDecoder_A
 PortDecoder_ATM710::PortDecoder_ATM710(EmulatorContext* context, bool v710Board)
     : PortDecoder(context), _v710Board(v710Board)
 {
+    // Its snapshot view exists while the window map is a Spectrum 128K (the ATM3 and the ATM450 inherit it)
+    SetSnapshotCapturePolicy(&snapshot::WindowMapCapture::Instance());
     _context = context;
     _state = &context->emulatorState;
     _memory = context->pMemory;
@@ -105,8 +110,11 @@ void PortDecoder_ATM710::OnFrameEnd()
 
 PortDecoder_ATM710::~PortDecoder_ATM710()
 {
-    if (_kbc && _keyboard && _keyboard->GetPs2Sink() == _kbc.get())
-        _keyboard->SetPs2Sink(nullptr);
+    // Core::Release deletes the keyboard before the decoder and clears pKeyboard first: the cached _keyboard
+    // may be freed already, the context's pointer says whether it is still there (as the other decoders do)
+    Keyboard* keyboard = _context->pKeyboard;
+    if (_kbc && keyboard && keyboard->GetPs2Sink() == _kbc.get())
+        keyboard->SetPs2Sink(nullptr);
     if (_turboRamWaitsInstalled && _context->pCore)
         _context->pCore->RemoveBusOverlay(_turboRamOverlay.get());
     MLOGDEBUG("PortDecoder_ATM710::~PortDecoder_ATM710()");
@@ -131,7 +139,7 @@ void PortDecoder_ATM710::reset()
     // Palette RAM back to the standard ZX preset (xpeccy vid_reset() /
     // zx_set_pal()), bright-border latch off (aFF77 is deliberately kept -
     // see below)
-    _state->InitAtmPalette();
+    _state->atm.InitPalette();
 
     // FF77 / pFFF7 state is deliberately NOT touched here: the boot defaults
     // are mode-dependent and applied by ApplyBootROMDefaults() right after this
@@ -162,14 +170,14 @@ void PortDecoder_ATM710::ApplyBootROMDefaults(ROMModeEnum mode)
 
         // Both register sets (7FFD.4 = 0 / 1) start with the same mapping:
         // window 0 = sys/TR-DOS ROM pair, windows 1-3 = RAM 5/2/0
-        _state->pFFF7[0] = 0x0100 | 1;
-        _state->pFFF7[1] = 0x0200 | 5;
-        _state->pFFF7[2] = 0x0200 | 2;
-        _state->pFFF7[3] = 0x0200 | 0;
-        _state->pFFF7[4] = 0x0100 | 1;
-        _state->pFFF7[5] = 0x0200 | 5;
-        _state->pFFF7[6] = 0x0200 | 2;
-        _state->pFFF7[7] = 0x0200 | 0;
+        _state->atm.pFFF7[0] = 0x0100 | 1;
+        _state->atm.pFFF7[1] = 0x0200 | 5;
+        _state->atm.pFFF7[2] = 0x0200 | 2;
+        _state->atm.pFFF7[3] = 0x0200 | 0;
+        _state->atm.pFFF7[4] = 0x0100 | 1;
+        _state->atm.pFFF7[5] = 0x0200 | 5;
+        _state->atm.pFFF7[6] = 0x0200 | 2;
+        _state->atm.pFFF7[7] = 0x0200 | 0;
 
         // set_atm_FF77() ran set_banks() before pFFF7 was initialized; the
         // final mapping is rebuilt here (set_mode() runs set_banks() again in
@@ -191,8 +199,9 @@ void PortDecoder_ATM710::EnterSpectrum128Paging(uint16_t pc)
     //   #7FFD.4 = 0 (set 0): window 0 = the 128K BASIC's ROM pair (the system ROM when the DOS signal is up)
     //   #7FFD.4 = 1 (set 1): window 0 = the 48K BASIC's ROM pair (TR-DOS when the DOS signal is up)
     //   windows 1 and 2 = RAM 5 and 2, window 3 = RAM page from #7FFD (the FFF7 high bits are 0)
-    // The pairs are where the model keeps its ROMs: pages 2 / 0 in the 64 KB ROM of the ATM710, 30 / 28 in the ATM3's
-    Port_FF77_Out(0x4000 | 0x200 | 0x100, 0x80 | 0x40 | 0x20 | 3, pc);
+    // The pairs are where the model keeps its ROMs: pages 2 / 0 in the 64 KB ROM of the ATM710, 30 / 28 in the ATM3's.
+    // The clock select (bit 3) is kept: Core::ResetKeepingClock put back the clock the machine ran at
+    Port_FF77_Out(0x4000 | 0x200 | 0x100, static_cast<uint8_t>(0x80 | 0x40 | 0x20 | 3 | (_state->pFF77 & ATM_FF77_TURBO)), pc);
     uint16_t rom128 = 2;
     uint16_t rom48 = 0;
     if (_memory)
@@ -204,12 +213,63 @@ void PortDecoder_ATM710::EnterSpectrum128Paging(uint16_t pc)
     }
     for (unsigned set = 0; set < 8; set += 4)
     {
-        _state->pFFF7[set + 0] = static_cast<unsigned>(0x0100 | ((set ? rom48 : rom128) & 0xFE));
-        _state->pFFF7[set + 1] = 0x0200 | 5;
-        _state->pFFF7[set + 2] = 0x0200 | 2;
-        _state->pFFF7[set + 3] = 0x0000;
+        _state->atm.pFFF7[set + 0] = static_cast<unsigned>(0x0100 | ((set ? rom48 : rom128) & 0xFE));
+        _state->atm.pFFF7[set + 1] = 0x0200 | 5;
+        _state->atm.pFFF7[set + 2] = 0x0200 | 2;
+        _state->atm.pFFF7[set + 3] = 0x0000;
     }
     updateMemoryBanks();
+}
+
+bool PortDecoder_ATM710::FinishAutostartColdStart(uint16_t pc)
+{
+    // The TR-DOS cold start ($0000 -> $3C50 in every ATM2 ROM: BIOS 1.06 to 1.07.13) first looks for a resident in RAM
+    // page 31 through its page select at $3CC5: #7FFD = #17, then #FFF7 = #E7 into window 3 of the #7FFD.4 = 1 set,
+    // "RAM from #7FFD" over base 24 (#7FFD gives page bits 0-2 only: ATM2PORT.TXT MX_A; UnrealSpeccy, Xpeccy, ZXMAK2
+    // and the ZX-Evo atm_pager.v agree). Only a found resident ends with page 0 selected again; without
+    // one, every #7FFD page with bit 4 set lands in RAM 24-31 on 256 KB and up, while the picture stays in RAM 5 / 7
+    // (and 1 / 3 for the ATM modes): Ball Quest's ATM version shows half of its EGA planes. The BIOS's own entry for
+    // 128K programs is "SPECTRUM 128", whose menu enters TR-DOS without the resident probe; this is its paging
+    EnterSpectrum128Paging(pc);
+    return true;
+}
+
+uint16_t PortDecoder_ATM710::GetClockSelect() const
+{
+    // The autostart from the BIOS menu stands in for choosing an entry: TURBO ON there means 7 MHz, as the user's own
+    // boot of the disk through the menu would run (owner report 2026-11-02: the autostart from the menu ran at 3.5 MHz)
+    if (!(_state->pFF77 & ATM_FF77_TURBO) && BiosMenuTurbo())
+        return ATM_FF77_TURBO;
+    return _state->pFF77 & ATM_FF77_TURBO;
+}
+
+bool PortDecoder_ATM710::BiosMenuTurbo() const
+{
+    Memory* memory = _context->pMemory;
+    if (!memory || !memory->HasDosRom())
+        return false;
+    const uint8_t* menu = memory->RAMPageAddress(2);
+    const uint8_t* rom = memory->base_dos_rom + BIOS_MENU_ROM_OFFSET;
+    if (!menu)
+        return false;
+    // The running menu keeps its variables and self-modified code inside the copy: 20-30 of its 2048 bytes differ from
+    // the ROM (measured over its animation). Anything else in RAM 2 matches about 8 of them by chance
+    unsigned differing = 0;
+    for (uint16_t i = 0; i < BIOS_MENU_SIZE; i++)
+        differing += menu[i] != rom[i] ? 1u : 0u;
+    if (differing > BIOS_MENU_MAX_DIFFERING)
+        return false;
+    return menu[BIOS_MENU_TURBO_FLAG] != 0;
+}
+
+void PortDecoder_ATM710::RestoreClockSelect(uint16_t select)
+{
+    // Bit 3 of #FF77 is the clock alone: the video mode, VE1 and the INT gate stay as the reset left them
+    const uint8_t turbo = static_cast<uint8_t>(select & ATM_FF77_TURBO);
+    if ((_state->pFF77 & ATM_FF77_TURBO) == turbo)
+        return;
+    _state->pFF77 = static_cast<uint8_t>((_state->pFF77 & ~ATM_FF77_TURBO) | turbo);
+    updateTurboMode();
 }
 
 void PortDecoder_ATM710::UpdateModelMemoryBanks()
@@ -439,7 +499,7 @@ void PortDecoder_ATM710::DecodePortOut(uint16_t port, uint8_t value, uint16_t pc
         // It is re-latched by EVERY write (xpeccy atm2OutFE / evoOutFE:
         // nextbrd |= (port ^ 8) & 8) - not sticky - and extends the border
         // color to a 4-bit pointer into the #FF palette RAM.
-        _state->atmBorderBright = (port & 0x0008) ? 0 : 1;
+        _state->atm.borderBright = (port & 0x0008) ? 0 : 1;
     }
     // Port #7FFD - 128K paging
     else if (IsPort_7FFD(port))
@@ -672,7 +732,7 @@ bool PortDecoder_ATM710::IsDosPortsEnabled()
     //   answer even outside a session (ZXMAK2's SYSEN forces DOSEN).
     // PEN (aFF77 bit 8) is deliberately NOT part of the gate - it only
     // disables the window mapping (all windows -> last ROM page).
-    return ((_state->flags & CF_DOSPORTS) != 0) || ((_state->aFF77 & ATM_AFF77_CPM) == 0);
+    return ((_state->flags & CF_DOSPORTS) != 0) || ((_state->atm.aFF77 & ATM_AFF77_CPM) == 0);
 }
 
 bool PortDecoder_ATM710::IsPort_EFF7(uint16_t port)
@@ -789,7 +849,7 @@ void PortDecoder_ATM710::Port_FF77_Out(uint16_t port, uint8_t value, [[maybe_unu
 
     // Store value and full port address
     _state->pFF77 = value;
-    _state->aFF77 = port;
+    _state->atm.aFF77 = port;
 
     // Bit 6 = VE1: the keyboard controller off (all reads go to the ZX keyboard)
     if (_kbc)
@@ -845,7 +905,7 @@ void PortDecoder_ATM710::Port_FFF7_Out([[maybe_unused]] uint16_t port, uint8_t v
     // page in bits 0-5 (active-low). Expanded to the internal encoding:
     // [9:8] = type, [7:0] = page
     unsigned fullValue = (((value & 0xC0) << 2) | (value & 0x3F)) ^ 0x33F;
-    _state->pFFF7[regIndex] = fullValue;
+    _state->atm.pFFF7[regIndex] = fullValue;
 
     // Full set_banks() equivalent: window mapping + TR-DOS session flag re-derivation
     if (_memory)
@@ -884,18 +944,18 @@ void PortDecoder_ATM710::Port_EFF7_Out([[maybe_unused]] uint16_t port, uint8_t v
 void PortDecoder_ATM710::Port_ATM_Palette_Out(uint16_t port, uint8_t value)
 {
     // pen2: A14 of the last #xx77 write disables palette writes
-    if (_state->aFF77 & ATM_AFF77_PEN2)
+    if (_state->atm.aFF77 & ATM_AFF77_PEN2)
     {
         MLOGDEBUG("Port_ATM_Palette_Out: write to 0x%04X ignored (pen2 / A14 set)", port);
         return;
     }
 
     // Palette RAM cell pointer = the 4-bit border color
-    const uint8_t cell = static_cast<uint8_t>((_state->border_attr & 0x07) | ((_state->atmBorderBright & 1) << 3));
+    const uint8_t cell = static_cast<uint8_t>((_state->border_attr & 0x07) | ((_state->atm.borderBright & 1) << 3));
 
     // Raw byte for the ATM3 #BE.0D readback (stored pre-inversion, xpeccy
     // `comp->regPal(adr) = val`)
-    _state->atmPaletteRegs[cell] = value;
+    _state->atm.paletteRegs[cell] = value;
 
     const uint8_t v = static_cast<uint8_t>(value ^ 0xFF);  // inverse colors
 
@@ -916,11 +976,11 @@ void PortDecoder_ATM710::Port_ATM_Palette_Out(uint16_t port, uint8_t value)
     // 4-bit -> 8-bit expansion ladder (atm2clev), ABGR packing like the ULA tables
     static constexpr uint8_t LEVELS[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
                                            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
-    _state->atmPalette[cell] = 0xFF000000u | (static_cast<uint32_t>(LEVELS[blue]) << 16) |
+    _state->atm.palette[cell] = 0xFF000000u | (static_cast<uint32_t>(LEVELS[blue]) << 16) |
                                (static_cast<uint32_t>(LEVELS[green]) << 8) | LEVELS[red];
 
     MLOGDEBUG("Port_ATM_Palette_Out: port=0x%04X value=0x%02X cell=%d -> 0x%08X",
-              port, value, cell, _state->atmPalette[cell]);
+              port, value, cell, _state->atm.palette[cell]);
     if (_context->pScreen)
         _context->pScreen->NoteVideoTableWrite(videomap::VideoTable::Palette, cell);  // the video change log
 }
@@ -957,7 +1017,7 @@ void PortDecoder_ATM710::updateMemoryBanks()
     uint8_t romMask = romBanks ? static_cast<uint8_t>(romBanks - 1) : 0;
 
     // ~CPM=0 (aFF77 bit 9 clear) selects the TR-DOS half of the ROM pair
-    if (!(_state->aFF77 & ATM_AFF77_CPM))
+    if (!(_state->atm.aFF77 & ATM_AFF77_CPM))
     {
         _state->flags |= CF_TRDOS;
     }
@@ -965,7 +1025,7 @@ void PortDecoder_ATM710::updateMemoryBanks()
 
     // PEN=0 (aFF77 bit 8 clear): memory manager disabled - all four windows
     // read the last ROM page, writes go to the trash page
-    if (!(_state->aFF77 & ATM_AFF77_PEN))
+    if (!(_state->atm.aFF77 & ATM_AFF77_PEN))
     {
         _memory->SetROMPageToBank(0, romMask);
         _memory->SetROMPageToBank(1, romMask);
@@ -979,7 +1039,7 @@ void PortDecoder_ATM710::updateMemoryBanks()
 
     for (uint8_t bank = 0; bank < 4; bank++)
     {
-        unsigned fff7 = _state->pFFF7[regSet + bank];
+        unsigned fff7 = _state->atm.pFFF7[regSet + bank];
 
         switch (fff7 & 0x300)
         {
@@ -1139,13 +1199,13 @@ std::string PortDecoder_ATM710::Dump_EFF7_value(uint8_t value)
 
 /// endregion </Debug methods>
 
-std::vector<ttd::PeripheralId> PortDecoder_ATM710::GetTTDModelStateIds() const
+std::vector<ttd::TTDDeviceType> PortDecoder_ATM710::GetTTDModelStateTypes() const
 {
-    std::vector<ttd::PeripheralId> ids = {ttd::PeripheralId::AtmPaging};
+    std::vector<ttd::TTDDeviceType> ids = {ttd::TTDDeviceType::AtmPaging};
     if (GetKeyboardController())
-        ids.push_back(ttd::PeripheralId::Atm2Kbc);   // the v7.xx keyboard controller, when fitted
+        ids.push_back(ttd::TTDDeviceType::Atm2Kbc);   // the v7.xx keyboard controller, when fitted
     if (_v710Board)
-        ids.push_back(ttd::PeripheralId::AtmIoBus);  // the INTERNAL I/O connector's #FB latch
+        ids.push_back(ttd::TTDDeviceType::AtmIoBus);  // the INTERNAL I/O connector's #FB latch
     return ids;
 }
 

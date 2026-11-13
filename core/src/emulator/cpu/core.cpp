@@ -18,7 +18,9 @@
 #include "emulator/io/tape/tapeturbocontroller.h"
 #include "emulator/memory/scorpion/scorpionmemory.h"
 #include "emulator/memory/sprinter/sprintermemory.h"
+#include "emulator/memory/next/nextmemory.h"
 #include "emulator/memory/tsconf/tsconfmemory.h"
+#include "emulator/io/rtc/ds12887.h"
 #include "emulator/ports/portdecoder.h"
 #include "emulator/video/videocontroller.h"
 #include "emulator/video/zx/screenzx.h"
@@ -88,12 +90,12 @@ bool Core::Init()
     _state->current_z80_frequency = baseFrequency;
     _state->current_z80_frequency_multiplier = 1;
     _state->next_z80_frequency_multiplier = 1;  // Initialize queued multiplier
-    _state->scorpion_turbo = 0;                 // Turbo flip-flop cleared at power-on (hardware-reference 13)
+    _state->scorpion.turbo = 0;                 // Turbo flip-flop cleared at power-on (hardware-reference 13)
     _state->hw_turbo_ratio = 1;                 // No hardware turbo engaged at power-on (model-neutral)
     _state->hw_turbo_ratio_applied = 1;
     _state->hw_clock_den = 1;                   // A whole multiple of the base clock (the Profi's hi-res clock is not)
     _state->hw_clock_den_applied = 1;
-    _state->scorpionDosTrigger = 0;            // Magic-button DOS trigger cleared at power-on (hardware-reference §9)
+    _state->scorpion.dosTrigger = 0;            // Magic-button DOS trigger cleared at power-on (hardware-reference §9)
 
     // Initialize speed multiplier from configuration
     if (_config->speed_multiplier > 0 && _config->speed_multiplier <= 16)
@@ -112,12 +114,14 @@ bool Core::Init()
     // and ProfROM bus-cycle silicon, TS-Conf the one that maps its windows
     // from TsConfState and models its CPU cache; everything else stays on the
     // generic one
-    if (_config->mem_model == MM_SCORP || _config->mem_model == MM_PROFSCORP)
+    if (IsScorpionModel(_config->mem_model))
         _memory = new ScorpionMemory(_context);
     else if (_config->mem_model == MM_TSL)
         _memory = new TsConfMemory(_context);
     else if (_config->mem_model == MM_SPRINTER)
         _memory = new SprinterMemory(_context);
+    else if (_config->mem_model == MM_NEXT)
+        _memory = new NextMemory(_context);
     else
         _memory = new Memory(_context);
     if (_memory)
@@ -198,6 +202,17 @@ bool Core::Init()
     }
 
     /// endregion </Joystick>
+
+    /// region <Controllers>
+
+    // Connectors and retro devices; the list follows the machine (rebuilt below once the slot cards exist)
+    if (result)
+    {
+        _controllerManager = new controllers::ControllerManager(_context);
+        _context->pControllerManager = _controllerManager;
+    }
+
+    /// endregion </Controllers>
 
     /// region <Tape>
 
@@ -509,9 +524,15 @@ bool Core::Init()
     {
         // A fitted card that cannot be built refuses the machine with the reason (SlotManager::BuildError)
         result = _slotManager->BuildCards();
+        if (_portDecoder)
+            _portDecoder->BuildAccessObservers();  // the histories and the access watch of the slots now
         if (!result)
             _initError = _slotManager->BuildError();
     }
+
+    // The connectors the cards bring (a Fuller Box's stick socket) join the machine's
+    if (result && _controllerManager)
+        _controllerManager->Rebuild();
 
     /// endregion </Activate IO devices>
 
@@ -644,6 +665,13 @@ void Core::Release()
         _mouse = nullptr;
     }
 
+    _context->pControllerManager = nullptr;
+    if (_controllerManager != nullptr)
+    {
+        delete _controllerManager;
+        _controllerManager = nullptr;
+    }
+
     _context->pJoystick = nullptr;
     if (_joystick != nullptr)
     {
@@ -716,7 +744,9 @@ void Core::SelectMemoryInterface()
         return;
 
     std::lock_guard<std::mutex> lock(_memIfMutex);
-    const bool debug = _z80->isDebugMode;
+    _memIfGeneration++;
+    // An atomic byte read: the debugger's switch may be written on another thread meanwhile (it re-selects after)
+    const bool debug = std::atomic_ref<bool>(_z80->isDebugMode).load(std::memory_order_relaxed);
     const bool contended = IsContentionEffective();
     if (_busOverlay)
     {
@@ -733,6 +763,21 @@ void Core::SelectMemoryInterface()
         else
             _z80->MemIf = contended ? _z80->FastContendedMemIf : _z80->FastMemIf;
         _memory->SetBusOverlay(nullptr);
+    }
+
+    // A model that maps memory its own way (slots of 8K) brings its plain interface; a host bus overlay still wins
+    if (!_busOverlay)
+    {
+        if (MemoryInterface* own = _memory->ModelMemoryInterface(debug, contended))
+            _z80->MemIf = own;
+    }
+
+    // Read taps without the debug mode (breakpoint-taps §5): the read-tap interface over the one chosen, which it
+    // reads through. The debug interfaces tell the taps themselves
+    if (!debug && _memory->ReadTapDemand())
+    {
+        _memory->SetReadTapInner(_z80->MemIf);
+        _z80->MemIf = _z80->ReadTapMemIf;
     }
 
     // The +2A/+3 gate array contends memory cycles only
@@ -834,6 +879,8 @@ const char* Core::GetMemoryInterfaceName() const
     if (!_z80)
         return "none";
     const MemoryInterface* m = _z80->MemIf;
+    if (m == _z80->ReadTapMemIf)
+        return "fast_read_tap";
     if (m == _z80->OverlayDbgContendedMemIf)
         return "debug_contended_overlay";
     if (m == _z80->OverlayFastContendedMemIf)
@@ -856,10 +903,28 @@ void Core::Reset()
     Reset(static_cast<ROMModeEnum>(_config->reset_rom));
 }
 
+void Core::ResetKeepingClock()
+{
+    ResetKeepingClock(static_cast<ROMModeEnum>(_config->reset_rom));
+}
+
+void Core::ResetKeepingClock(ROMModeEnum mode)
+{
+    const uint16_t clockSelect = _portDecoder->GetClockSelect();
+    Reset(mode);
+    _portDecoder->RestoreClockSelect(clockSelect);
+}
+
 void Core::Reset(ROMModeEnum mode)
 {
-    // Set default ROM according to config settings (can be overriden for advanced platforms like TS-Conf and ATM)
-    _mode = mode;
+    // Set default ROM according to config settings (can be overriden for advanced platforms like TS-Conf and ATM).
+    // The model may start elsewhere: the GMX card always starts in its loader, a disk autostart's RM_DOS included
+    // until the firmware has booted (PortDecoder_ScorpionGMX::ResolveResetROMMode)
+    _mode = _portDecoder ? _portDecoder->ResolveResetROMMode(mode) : mode;
+
+    // The battery clock keeps its time over the reset, which restarts the emulated time it runs on
+    if (Ds12887* rtc = _portDecoder ? _portDecoder->RtcChip() : nullptr)
+        rtc->RebaseEmulatedTime(_portDecoder->EmulatedMicroseconds(), 0);
 
     // Reset EmulatorState fields that are not covered by individual peripheral resets
     // These must be cleared BEFORE peripheral resets so PortDecoder::reset() can set
@@ -881,6 +946,8 @@ void Core::Reset(ROMModeEnum mode)
                                        // only - RESET does not reach the interface (MiSTer mouse.v: cold_reset)
     if (_joystick)
         _joystick->ApplyConfiguration();  // Kempston joystick fitting and keys; held buttons mirror the physical stick
+    if (_controllerManager)
+        _controllerManager->Rebuild();    // the machine's connectors (plugs and held controls survive by id)
     _sound->reset();             // All sound devices (AY(s), COVOX, MoonSound, GS) and sound subsystem
     _screen->Reset();            // Reset all video subsystem
     _tape->reset();              // Reset tape loader state
@@ -915,7 +982,7 @@ void Core::Reset(ROMModeEnum mode)
     _screen->ResetBorderColor(_state->border_attr);
 #ifdef ENABLE_RECORDING
     if (_recordingManager)
-        _recordingManager->Reset();  // Reset recording manager (stops active recording, clears counters)
+        _recordingManager->Reset();  // Clears the counters; a recording goes on with its file untouched
 #endif
 
     // Single NC_SYSTEM_RESET notification per reset, posted only after the reset completes:
@@ -964,8 +1031,16 @@ uint16_t Core::GetCPUFrequencyMultiplier()
 bool Core::CanSetSpeedMultiplier(uint8_t multiplier) const
 {
     // A TTD recording captures the machine at real speed: only 1x while it is
-    // active (TimeTravelManager forces 1x on entry and restores the setting on exit)
-    return multiplier == 1 || !_context->pFeatureManager || !_context->pFeatureManager->isTtdRecordingActive();
+    // active (TimeTravelController forces 1x on entry and restores the setting on exit)
+    if (multiplier != 1 && _context->pFeatureManager && _context->pFeatureManager->isTtdRecordingActive())
+        return false;
+    // A history the user recorded keeps the speed it was recorded at: a change would drop it (Timing)
+    return multiplier == GetHostSpeedMultiplier() || SpeedLockReason().empty();
+}
+
+std::string Core::SpeedLockReason() const
+{
+    return _context && _context->pTimeTravelHooks ? _context->pTimeTravelHooks->SpeedLock() : std::string();
 }
 
 bool Core::SetSpeedMultiplier(uint8_t multiplier)

@@ -14,6 +14,7 @@
 #include "emulator/sound/chips/gs/soundchip_gs.h"
 #include "emulator/sound/soundmanager.h"
 #include "debugger/ttd/ttdperipheralregistry.h"
+#include "emulator/sound/chips/tsfm/ym2203pair.h"
 #include "sam2695/sam2695.h"
 
 using namespace slots;
@@ -28,8 +29,8 @@ constexpr struct
     AudioSourceType type;
     MultiSoundRow row;
     const char* name;
-    bool ssgVoicing;   // the AY / SSG tone voicing, as for the AY socket's chips (not the [AY] Stereo panning: the
-                       // card's ABC is its board wiring)
+    bool ssgRow;   // the AY / SSG tone voicing and character chain (punch, room), as for the AY socket's chips (not
+                   // the [AY] Stereo panning: the card's ABC is its board wiring)
 } kRows[] = {
     { AudioSourceType::MultiSoundSsg1, MultiSoundRow::Ssg1, "MS SSG 1", true },
     { AudioSourceType::MultiSoundSsg2, MultiSoundRow::Ssg2, "MS SSG 2", true },
@@ -71,8 +72,8 @@ MultiSoundCardConfig MultiSoundSlotCard::ConfigFrom(const CardContext& context)
     // T-states per second (turbo descaled by AudioTstate)
     config.hostTickRate = static_cast<uint32_t>(CPU_CLOCK_RATE);
     EmulatorContext* emulator = context.emulator;
-    // The YM2203 FM calibration: the TurboSound FM's [SOUND] TSFM_FmTrimDb, read and applied the same way (gain =
-    // 0.30 x 10^(trim / 20) on both boards, an absent key is 0 dB on both)
+    // The YM2203 FM calibration: the TurboSound FM's [SOUND] TSFM_FmLevelDb, read and applied the same way (gain =
+    // kFmBaseGain x 10^(trim / 20) on both boards, an absent key is 0 dB, the measured board, on both)
     if (emulator != nullptr)
         config.fmTrimDb = emulator->config.sound.tsfmFmTrimDb;
     if (emulator != nullptr && emulator->pSoundManager != nullptr)
@@ -93,9 +94,20 @@ MultiSoundCardConfig MultiSoundSlotCard::ConfigFrom(const CardContext& context)
 }
 
 MultiSoundSlotCard::MultiSoundSlotCard(const CardContext& context, const MultiSoundCardConfig& config)
-    : ICard(context), _context(context.emulator), _card(context.emulator, config),
-      _cardTtd(std::make_unique<MultiSoundCardTtd>(*this)), _synthTtd(std::make_unique<Sam2695Ttd>(_card.Synth()))
+    : ICard(context), _context(context.emulator),
+      _chipHistory(ChipHistoryRegistry(context.emulator), context.slot + ".chips", "SAA and SounDrive writes",
+                   kChipWriteRing),
+      _gsHistory(ChipHistoryRegistry(context.emulator), context.slot + ".gs", "GS port and activity events",
+                 GSPortTraceRecorder::kDefaultCapacity),
+      _gsExecHistory(ChipHistoryRegistry(context.emulator), context.slot + ".gs.cpu",
+                     "instructions the card's GS Z80 starts", kExecHistoryRing),
+      _card(context.emulator, config), _cardTtd(std::make_unique<MultiSoundCardTtd>(*this)),
+      _synthTtd(std::make_unique<Sam2695Ttd>(_card.Synth()))
 {
+    _card.SetChipHistory(&_chipHistory);
+    _card.Gs().attachPortTrace(&*_gsHistory);
+    _gsExecHistory->EnableFastPush();
+    _card.Gs().attachExecHistory(&*_gsExecHistory, context.emulator);
 }
 
 MultiSoundSlotCard::~MultiSoundSlotCard() = default;
@@ -136,6 +148,17 @@ uint64_t MultiSoundSlotCard::Position() const
         now += static_cast<uint64_t>(frameT) * _context->emulatorState.HostSpeedMultiplier();
     }
     return std::max(_last, now);
+}
+
+uint64_t MultiSoundSlotCard::MixerSamplePhase() const
+{
+    return (_context != nullptr && _context->pSoundManager != nullptr) ? _context->pSoundManager->samplePhase() : 0;
+}
+
+void MultiSoundSlotCard::AdoptMixerSamplePhase(uint64_t phase)
+{
+    if (_context != nullptr && _context->pSoundManager != nullptr)
+        _context->pSoundManager->adoptSamplePhase(phase);
 }
 
 void MultiSoundSlotCard::TrackM1()
@@ -209,11 +232,11 @@ void MultiSoundSlotCard::SetOutputRate(uint32_t rate)
     _card.SetOutputRate(rate);
 }
 
-int16_t* MultiSoundSlotCard::VoicedMixerBuffer(AudioSourceType type)
+int16_t* MultiSoundSlotCard::SsgMixerBuffer(AudioSourceType type)
 {
     for (const auto& row : kRows)
     {
-        if (row.type == type && row.ssgVoicing)
+        if (row.type == type && row.ssgRow)
             return _card.MutableRow(row.row);
     }
     return nullptr;
@@ -235,7 +258,7 @@ void MultiSoundSlotCard::MixerRows(std::vector<CardMixerRow>& out) const
 {
     for (const auto& row : kRows)
     {
-        out.push_back({ row.type, row.name, row.ssgVoicing });
+        out.push_back({ row.type, row.name, row.ssgRow });
     }
 }
 
@@ -251,6 +274,57 @@ const int16_t* MultiSoundSlotCard::MixerBuffer(AudioSourceType type) const
     return nullptr;
 }
 
+void MultiSoundSlotCard::MixerChannels(AudioSourceType type, std::vector<MixerChannelDesc>& out) const
+{
+    switch (type)
+    {
+        case AudioSourceType::MultiSoundSsg1:
+        case AudioSourceType::MultiSoundSsg2:
+            out.push_back({"a", "A", true, false});
+            out.push_back({"b", "B", true, false});
+            out.push_back({"c", "C", true, false});
+            break;
+        case AudioSourceType::MultiSoundFm1:
+        case AudioSourceType::MultiSoundFm2:
+            for (int ch = 1; ch <= 3; ch++)
+                out.push_back({std::to_string(ch), "FM " + std::to_string(ch), true, false});
+            break;
+        case AudioSourceType::MultiSoundMidi:
+            // The SAM2695 mutes a part (its voices render silent); it has no part gain
+            for (int ch = 1; ch <= 16; ch++)
+                out.push_back({std::to_string(ch), "MIDI " + std::to_string(ch), false, false});
+            break;
+        default:
+            break;
+    }
+}
+
+void MultiSoundSlotCard::SetMixerChannel(AudioSourceType type, size_t index, bool muted, float volume)
+{
+    switch (type)
+    {
+        case AudioSourceType::MultiSoundSsg1:
+        case AudioSourceType::MultiSoundSsg2:
+            if (Ym2203Chip* chip = index < 3 ? _card.Ym().chip(type == AudioSourceType::MultiSoundSsg1 ? 0 : 1) : nullptr)
+            {
+                chip->ssg.setChannelMuted(static_cast<uint8_t>(index), muted);
+                chip->ssg.setChannelVolume(static_cast<uint8_t>(index), volume);
+            }
+            break;
+        case AudioSourceType::MultiSoundFm1:
+        case AudioSourceType::MultiSoundFm2:
+            if (Ym2203Chip* chip = index < 3 ? _card.Ym().chip(type == AudioSourceType::MultiSoundFm1 ? 0 : 1) : nullptr)
+                chip->fm.setChannelGain(static_cast<uint32_t>(index), MixerChannelGainQ15(muted, volume));
+            break;
+        case AudioSourceType::MultiSoundMidi:
+            if (index < 16)
+                _card.Synth().SetChannelMute(static_cast<int>(index), muted);
+            break;
+        default:
+            break;
+    }
+}
+
 /// endregion </Frames>
 
 /// region <Time travel>
@@ -258,11 +332,16 @@ const int16_t* MultiSoundSlotCard::MixerBuffer(AudioSourceType type) const
 void MultiSoundSlotCard::CollectTtdDevices(std::vector<CardTtdDevice>& out)
 {
     const std::string base = SlotId() + "." + MultiSoundCard::kCardId;
-    out.push_back({ ttd::PeripheralId::MultiSound, _cardTtd.get(), base, nullptr });
-    out.push_back({ ttd::PeripheralId::Saa1099, &_card.Saa(), base + ".saa1099", nullptr });
-    out.push_back({ ttd::PeripheralId::Sam2695, _synthTtd.get(), base + ".sam2695", nullptr });
+    out.push_back({ _cardTtd.get(), base, nullptr });
+    out.push_back({ &_card.Saa(), base + ".saa1099", nullptr });
+    out.push_back({ _synthTtd.get(), base + ".sam2695", nullptr });
     SoundChip_GeneralSound& gs = _card.Gs();
-    out.push_back({ gs.TTDPeripheralId(), &gs, base + ".gs", &gs });
+    out.push_back({ &gs, base + ".gs", &gs });
+}
+
+GeneralSoundCard* MultiSoundSlotCard::DebugGeneralSound()
+{
+    return &_card.Gs();
 }
 
 void MultiSoundSlotCard::TtdFingerprint(std::vector<std::pair<std::string, uint64_t>>& out) const
@@ -270,14 +349,16 @@ void MultiSoundSlotCard::TtdFingerprint(std::vector<std::pair<std::string, uint6
     out.emplace_back("slots." + SlotId() + ".bank", Sam2695Ttd::BankFingerprint(_card.Synth()));
 }
 
-bool MultiSoundSlotCard::TtdSessionMatches(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs,
-                                           std::string& why) const
+bool MultiSoundSlotCard::TtdSessionMatches(const ttd::TTDDeviceStates& states, std::string& why) const
 {
-    const auto id = static_cast<uint8_t>(ttd::PeripheralId::Sam2695);
-    const auto found = blobs.find(id);
-    if (found == blobs.end() || found->second.empty())
+    // This card's synthesizer, by the instance its slot names (states without instances: the one there is)
+    const ttd::TTDDeviceKey key{ttd::TTDDeviceType::Sam2695, SlotId() + "." + MultiSoundCard::kCardId + ".sam2695"};
+    const auto found = states.find(key);
+    const std::vector<uint8_t>* recordedState =
+        found != states.end() ? &found->second : ttd::FindStateOfType(states, ttd::TTDDeviceType::Sam2695);
+    if (recordedState == nullptr || recordedState->empty())
         return true;   // a session without the card: the slot-set guard names that
-    const std::vector<uint8_t> state = ttd::TTDPeripheralRegistry::DecodeBlob(id, found->second);
+    const std::vector<uint8_t>& state = *recordedState;
     sam2695::BankDigest recorded{};
     if (!sam2695::Synth::StateBank(state.data(), state.size(), recorded))
     {

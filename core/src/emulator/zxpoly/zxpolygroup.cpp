@@ -16,7 +16,7 @@
 #include "emulator/zxpoly/zxpolyportinterceptor.h"
 #include "emulator/zxpoly/zxpolyscreencomposer.h"
 #include "emulator/zxpoly/zxpolyworkers.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "debugger/ttd/ttdcontrol.h"
 #include "debugger/ttd/ttdserializable.h"
 #include "emulator/io/fdc/wd1793.h"
@@ -47,29 +47,27 @@ namespace
     constexpr size_t OVERLAY_SIZE = 8 * PAGE_SIZE;   // one 128K module
 
     /// The devices whose runtime state makes up a machine besides CPU and RAM:
-    /// the same set a TTD checkpoint carries (TimeTravelManager::
-    /// RegisterModelPeripherals), keyed by peripheral id. Model latches come
-    /// from serializers the port decoder creates; they are kept in `owned`
-    std::map<ttd::PeripheralId, ttd::TTDSerializable*> CollectDevices(
+    /// the same set a TTD checkpoint carries (RegisterMachinePeripherals),
+    /// keyed by device type. Model latches come from serializers the port
+    /// decoder creates; they are kept in `owned`
+    std::map<ttd::TTDDeviceType, ttd::TTDSerializable*> CollectDevices(
         EmulatorContext* context, std::vector<std::unique_ptr<ttd::TTDSerializable>>& owned)
     {
-        std::map<ttd::PeripheralId, ttd::TTDSerializable*> devices;
-        auto add = [&](ttd::PeripheralId id, ttd::TTDSerializable* device) {
+        std::map<ttd::TTDDeviceType, ttd::TTDSerializable*> devices;
+        auto add = [&](ttd::TTDSerializable* device) {
             if (device)
-                devices[id] = device;
+                devices[device->TTDType()] = device;
         };
 
         if (SoundManager* sound = context->pSoundManager)
         {
-            if (ITurboSoundDevice* turboSound = sound->getTurboSound())
-                add(turboSound->TTDPeripheralId(), turboSound);
-            add(ttd::PeripheralId::Covox, sound->getCovox());
-            if (GeneralSoundCard* gs = sound->getGeneralSound())
-                add(gs->TTDPeripheralId(), gs);
+            add(sound->getTurboSound());
+            add(sound->getCovox());
+            add(sound->getGeneralSound());
         }
-        add(ttd::PeripheralId::Tape, context->pTape);
-        add(ttd::PeripheralId::KempstonMouse, context->pMouse);
-        add(ttd::PeripheralId::BetaDisk, context->pBetaDisk);
+        add(context->pTape);
+        add(context->pMouse);
+        add(context->pBetaDisk);
 
         if (context->pPortDecoder)
         {
@@ -77,7 +75,7 @@ namespace
             {
                 if (!serializer)
                     continue;
-                add(serializer->TTDPeripheralId(), serializer.get());
+                add(serializer.get());
                 owned.push_back(std::move(serializer));
             }
         }
@@ -301,7 +299,7 @@ void ZXPolyGroup::ResetPlatformState()
 
 bool ZXPolyGroup::LoadZXP(const std::string& path, std::string* error)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly load");  // the master held, then the slaves' pipelined work done
     if (!IsCreated())
     {
         if (error)
@@ -361,7 +359,7 @@ bool ZXPolyGroup::HasPaging128(std::string* error) const
 
 bool ZXPolyGroup::LoadMedia(const std::string& path, std::string* error)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly media");  // the master held, then the slaves' pipelined work done
     if (path.empty())
         return true;
 
@@ -395,7 +393,7 @@ ZXPolyGroup::Status ZXPolyGroup::GetStatus() const
 
 bool ZXPolyGroup::LoadPROM(const std::string& path, std::string* error)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly prom");  // the master held, then the slaves' pipelined work done
     if (!IsCreated())
     {
         if (error)
@@ -442,7 +440,7 @@ bool ZXPolyGroup::LoadPROM(const std::string& path, std::string* error)
 
 bool ZXPolyGroup::BootDisk(const std::string& path, std::string* error)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly boot disk");  // the master held, then the slaves' pipelined work done
     if (!IsCreated())
     {
         if (error)
@@ -542,7 +540,7 @@ void ZXPolyGroup::CopyMasterState()
 
 void ZXPolyGroup::ReplicateFromMaster()
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly replicate");  // the master held, then the slaves' pipelined work done
     // A stock program mirrored into the slaves: they get no IO writes of
     // their own (R0 D4), as a ZX-Poly edition's loader sets for its slaves
     CopyMasterState();
@@ -734,10 +732,10 @@ void ZXPolyGroup::UpdateIntGates()
     const EmulatorContext* master = GetContext(0);
     const uint8_t p7FFD = master->emulatorState.p7FFD;
     const bool latchIsPlain128 = master->config.ramsize <= 128;
-    GetContext(0)->pCore->GetZ80()->frameIntMasked =
-        !_locked && latchIsPlain128 && (p7FFD & 0x20u) == 0 && (p7FFD & 0x80u) != 0;
+    GetContext(0)->pCore->GetZ80()->frameIntMasked.store(
+        !_locked && latchIsPlain128 && (p7FFD & 0x20u) == 0 && (p7FFD & 0x80u) != 0, std::memory_order_relaxed);
     for (size_t m = 1; m < MODULES; m++)
-        GetContext(m)->pCore->GetZ80()->frameIntMasked = !_locked;
+        GetContext(m)->pCore->GetZ80()->frameIntMasked.store(!_locked, std::memory_order_relaxed);
 }
 
 void ZXPolyGroup::RaiseModuleInt(size_t module)
@@ -1038,7 +1036,7 @@ void ZXPolyGroup::ApplyInput(size_t module, const std::vector<InputOp>& input)
         }
 
         // Journal it in the module's TTD session first (the contract of
-        // TimeTravelManager::RecordInputEvent: before applying), so a replay
+        // TimeTravelController::RecordInputEvent: before applying), so a replay
         // feeds every module the same input at the same T
         ttd::ITimeTravelHooks* ttd = context->pTimeTravelHooks;
         if (ttd && ttd->IsRecording() && !ttd->IsReplayActive())
@@ -1087,7 +1085,7 @@ void ZXPolyGroup::ApplyInput(size_t module, const std::vector<InputOp>& input)
 
 void ZXPolyGroup::EnablePortReadCheck(bool enable)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly port check");  // the master held, then the slaves' pipelined work done
     _portReadCheck = enable;
     for (size_t m = 0; m < MODULES; m++)
     {
@@ -1109,7 +1107,7 @@ void ZXPolyGroup::EnablePortReadCheck(bool enable)
 
 void ZXPolyGroup::EnableInstructionTrace(bool enable)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly trace");  // the master held, then the slaves' pipelined work done
     // The per-instruction hooks are the group's own (InstallMasterM1Hook,
     // InstallSlaveM1Hooks); they log while this is on
     _instructionTrace = enable;
@@ -1381,6 +1379,16 @@ void ZXPolyGroup::AdvanceSlaves(const std::vector<InputOp>& input, bool mayOverl
     WaitForSlaves();
 }
 
+ZXPolyGroup::GroupHold::GroupHold(ZXPolyGroup& group, const char* tag)
+{
+    // The master's CPU first: no frame boundary of its (its loop or a direct run) hands the slaves new work while
+    // the operation touches them; then what a pipelined boundary left running is waited for. On the master's own
+    // thread (a hook, a direct run) the hold is free
+    if (Emulator* master = group._instances[0].get())
+        _hold = std::make_shared<Emulator::CpuHold>(*master, tag);
+    group.WaitForSlaves();
+}
+
 void ZXPolyGroup::WaitForSlaves() const
 {
     _workers->WaitAll();
@@ -1388,13 +1396,13 @@ void ZXPolyGroup::WaitForSlaves() const
 
 void ZXPolyGroup::SetParallelSlaves(bool parallel)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly parallel");  // the master held, then the slaves' pipelined work done
     _parallelSlaves = parallel;
 }
 
 void ZXPolyGroup::SetPipelinedSlaves(bool pipelined)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly pipelined");  // the master held, then the slaves' pipelined work done
     _pipelinedSlaves = pipelined;
 }
 
@@ -1450,7 +1458,7 @@ void ZXPolyGroup::RunFrame()
 void ZXPolyGroup::RunFrames(unsigned frames)
 {
     // Input queued before the call reaches all four where they are now
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly run frames");  // the master held, then the slaves' pipelined work done
     const std::vector<InputOp> input = TakePendingInput();
     for (size_t m = 0; m < MODULES; m++)
         ApplyInput(m, input);
@@ -1480,7 +1488,7 @@ void ZXPolyGroup::RunFrames(unsigned frames)
 
 bool ZXPolyGroup::StartRecording(std::string* error)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly ttd start");  // the master held, then the slaves' pipelined work done
     for (size_t m = 0; m < MODULES; m++)
     {
         // The members record only as one group: the lifted reason is set again on failure / stop
@@ -1508,7 +1516,7 @@ bool ZXPolyGroup::StartRecording(std::string* error)
 
 void ZXPolyGroup::StopRecording()
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly ttd stop");  // the master held, then the slaves' pipelined work done
     for (size_t m = 0; m < MODULES; m++)
     {
         (void)ttd::TTDControl(GetContext(m)).Execute({"stop", {}});
@@ -1553,6 +1561,8 @@ bool ZXPolyGroup::SeekToFrame(uint64_t frame, std::string* error)
         master.Pause();
         master.GetMainLoop()->WaitForPauseConfirmation(500);
     }
+    // Paused is not idle: a direct run on the master (run_frames) runs the slaves too - the seek holds the CPU
+    Emulator::CpuHold hold(master, "zx-poly seek");
     WaitForSlaves();
 
     // TTD seeks only a stopped session (history kept; ResumeRecording picks it
@@ -1602,7 +1612,7 @@ bool ZXPolyGroup::SeekToFrame(uint64_t frame, std::string* error)
 
 bool ZXPolyGroup::ResumeRecording(std::string* error)
 {
-    WaitForSlaves();
+    const GroupHold hold(*this, "zx-poly ttd resume");  // the master held, then the slaves' pipelined work done
     if (!_recording)
     {
         if (error)
@@ -1961,6 +1971,22 @@ ZXPolyGroup::Divergence ZXPolyGroup::CheckLockstep() const
     // after a load or a replication the slaves are copies standing where the
     // master stands, compared as they are
     const bool atBoundary = _boundaryChecked;
+
+    // Live registers: hold every member's CPU, so none is inside an instruction while it is read (a status request
+    // comes from an automation thread; a member can be stepped on its own, BUGS.md 2026-10-11 #5). The master first,
+    // as GroupHold does; on a member's own thread its hold is free
+    std::shared_ptr<void> holds[MODULES];
+    if (!atBoundary)
+    {
+        for (size_t m = 0; m < MODULES; m++)
+        {
+            if (Emulator* member = _instances[m].get())
+                holds[m] = std::make_shared<Emulator::CpuHold>(*member, "zx-poly lockstep");
+            if (m == 0)
+                WaitForSlaves();
+        }
+    }
+
     for (size_t m = 1; m < MODULES; m++)
     {
         std::string what;

@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 
+#include "emulator/bus/bustap.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/io/sdcard/sdcardspi.h"
 #include "emulator/io/spi/zcontrollerspi.h"
@@ -15,11 +16,14 @@
 #include "emulator/platforms/tsconf/tsconfdma.h"
 #include "emulator/platforms/tsconf/tsconfarbiter.h"
 #include "emulator/platforms/tsconf/tsconfengine.h"
+#include "emulator/platforms/tsconf/tsconfhistory.h"
 #include "emulator/platforms/tsconf/tsconfinterrupts.h"
 #include "emulator/platforms/tsconf/tsconfstate.h"
 #include "emulator/ports/portdecoder.h"
 
 class TsConfMemory;
+class Screen;
+class ScreenTSConf;
 class Vdac2Card;
 
 /// TS-Conf (ZX-Evo with the TS-Labs FPGA configuration) port decoder.
@@ -81,7 +85,13 @@ public:
     /// region <Interface methods>
 public:
     void reset() override;
-    void PowerCycle() override { PowerOn(); }
+    void PowerCycle() override
+    {
+        PowerOn();
+        // Reconfiguration clears the register file; the reset defaults and
+        // derived memory map must be restored before the CPU runs again.
+        reset();
+    }
     uint8_t DecodePortIn(uint16_t port, uint16_t pc) override;
     void DecodePortOut(uint16_t port, uint8_t value, uint16_t pc) override;
 
@@ -92,11 +102,21 @@ public:
     /// mode: window 0 is ROM page 0, whatever #7FFD says, and bits 7:6 of #7FFD add page bits
     void EnterSpectrum128Paging(uint16_t pc) override;
 
+    /// RM_DOS, the disk autostart's quick reset (Core::ResetKeepingClock): straight into TR-DOS, as TS-BIOS hands over
+    /// when "Reset to" names ROM #00 and the disk is booted from TR-DOS. Mapped mode, ROM128 = 1, PAGE0 = 0 and DOS on:
+    /// window 0 is ROM page 1, TR-DOS 5.04T of zxevo.rom. #7FFD decodes as on a 128K. Every other mode leaves the reset
+    /// as it is: the CPU starts in TS-BIOS (ROM page 0), which reads its settings and boots what they name
+    void ApplyBootROMDefaults(ROMModeEnum mode) override;
+    /// SYS_CONFIG[1:0], the CPU clock TS-BIOS (or the program) set: the quick reset skips TS-BIOS, so the clock it
+    /// chose is put back after the reset
+    uint16_t GetClockSelect() const override;
+    void RestoreClockSelect(uint16_t select) override;
+
     /// SYS_CONFIG selects 3.5, 7 or 14 MHz
     uint8_t TtdClockUnits() const override { return 4; }
 
     /// #1F outside DOS answers Joystick::Read()
-    bool HasKempstonJoystick() const override { return true; }
+    bool BoardHasKempstonJoystick() const override { return true; }
 
     /// #xxEF belongs to the AVR (its 16550 and ZiFi): a ZX-WiFi card does not fit
     bool ReservesLowByte(uint8_t lowByte) const override { return lowByte == 0xEF; }
@@ -105,7 +125,7 @@ public:
     /// (docs/inprogress/2026-10-02-tsconf-zifi/tdd.md)
     NetworkCapabilities DescribeNetwork() override;
 
-    std::vector<ttd::PeripheralId> GetTTDModelStateIds() const override;
+    std::vector<ttd::TTDDeviceType> GetTTDModelStateTypes() const override;
     /// The mouse ports read the AVR's PS/2 mouse registers
     bool PeekMouseRegister(uint8_t reg, uint8_t& value) const override
     {
@@ -125,6 +145,7 @@ public:
     /// BaseConf; it outlives Core::Reset() like the board's
     SdCardSpi& GetSdCard() { return _sdCard; }
     ZControllerSpi& GetZController() { return _zc; }
+    BusTap& SpiTap() { return _spiTap; }
     /// The VDAC2 card (FT812) on the IDE connector: present in the VDAC2
     /// build ([MISC] TS_VDAC2=1) of a binary with ENABLE_VDAC2, else nullptr
     /// (vdac2-integration-design.md §5)
@@ -155,6 +176,7 @@ public:
 
     void BeforeMachineM1(uint16_t address) override;
     void OnMachineM1(uint16_t address) override;
+    bool RepeatM1IsInert(uint16_t address) const override;
     /// endregion </Interface methods>
 
     /// region <TS-Conf state>
@@ -169,12 +191,18 @@ public:
     TsConfDma& GetDma() { return _dma; }
     /// Bring the engine (line starts, DRAM budget, DMA) up to the current CPU T-state
     void CatchUpEngine();
+    /// The CPU on #57 / #77 while an SPI DMA still runs after the catch-up: the two interleave on the board's one
+    /// SPI master (the bus analyzer's dma_collision finding)
+    void CheckSpiDmaCollision(bool write, uint8_t value);
 
     /// Registers the picture depends on (hardware-spec §3.2): a write first
     /// brings the engine and the screen up to the write
     static bool IsVideoRegister(uint8_t reg);
     /// Engine line starts, then the screen, up to the current CPU T-state
     void FlushVideo();
+    /// The screen draws what it has not drawn yet up to the end of the instruction before this one: before a write
+    /// to memory and before a DMA transfer, whose moment inside the instruction the picture does not model
+    void VideoCatchUpToStepEnd();
 
     /// Classify one I/O cycle
     PortArm ClassifyPort(uint16_t port) const;
@@ -226,9 +254,15 @@ private:
     class DramWriteWait : public HostBusOverlay
     {
     public:
-        explicit DramWriteWait(PortDecoder_TSConf& owner) : _owner(owner) { observesReads = false; }
+        explicit DramWriteWait(PortDecoder_TSConf& owner) : _owner(owner)
+        {
+            observesReads = false;
+            observesWriteStart = true;
+        }
         uint8_t onRead(uint16_t, uint8_t normal, bool, bool) override { return normal; }
         void onWrite(uint16_t addr, uint8_t value, bool romPaged) override;
+        /// The picture not drawn yet shows the byte the write replaces (ScreenTSConf::CatchUpToStepEnd)
+        void onBeforeWrite(uint16_t addr) override;
 
     private:
         PortDecoder_TSConf& _owner;
@@ -246,6 +280,9 @@ private:
     void ApplyIdeStall();
     void ApplyExternalIoStall(uint16_t port, PortArm arm);
     void InstallInterrupts();
+    /// platform-debugging P6: the DMA's RAM bytes against the page watchpoints, the beam against the beam breakpoints
+    void ReportDmaAccess(bool write, uint32_t byteAddress, uint8_t value);
+    void WatchBeam(uint32_t from, uint32_t to);
     void RefreshFmWindow();
     void ApplyClock();
     void ApplyVideoPage();
@@ -267,6 +304,14 @@ private:
     TsConfState _ts{};
     TsConfInterrupts _interrupts{_context, _ts};
     TsConfDma _dma{_ts, _interrupts};
+    /// The register writes and the DMA transfers (tsconfhistory.h), named by the registers' registry id
+    TsRegisterHistory _registerHistory{ &_context->histories, [this]() { return RegistersDevice(); },
+                                        "TS-Conf register writes", 4096 };
+    TsDmaHistory _dmaHistory{ &_context->histories, [this]() { return RegistersDevice() + ".dma"; },
+                              "TS-Conf DMA transfers", 1024 };
+    std::string RegistersDevice() const;
+    void RecordRegister(uint8_t reg, uint8_t value);
+    bool _dmaRunningAtWrite = false;
     TsConfEngine _engine{_context, _ts, _interrupts, _dma};
     TsConfArbiter _arbiter{_engine};
     TsConfMemory* _tsMemory = nullptr;
@@ -277,6 +322,8 @@ private:
     std::unique_ptr<IDeviceMemoryRegion> _cramRegion;
     std::unique_ptr<IDeviceMemoryRegion> _sfileRegion;
     DramWriteWait _dramWriteWait{*this};
+    Screen* _catchUpScreenBase = nullptr;
+    ScreenTSConf* _catchUpScreen = nullptr;
 
     // The board's AVR behind the Gluk CMOS ports (clock, NVRAM, extension
     // registers F0-FF), shared with ATM3: lives with the decoder so the
@@ -304,6 +351,9 @@ private:
         SlotDescriptor _descriptor;
     };
 
+    // The bus analyzer's view of the Z-Controller bus (docs/inprogress/2026-10-11-bus-analyzer): declared
+    // before the card and the controller, which point at it
+    BusTap _spiTap{"zc.spi", BusProtocol::Spi, "Z-Controller SPI (#57 data, #77 chip selects): SD card, VDAC2 FT812"};
     SdCardSpi _sdCard;
     ZControllerSpi _zc;
     SdSlot _sdSlot{*this};

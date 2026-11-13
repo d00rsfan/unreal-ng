@@ -18,7 +18,7 @@ namespace ttd
 ///          (TurboSound slot, Covox, General Sound / NeoGS, MoonSound, tape,
 ///          Kempston mouse, Beta 128, IDE board) and the model-specific
 ///          serializers the port decoder supplies. Used by the TTD session
-///          (TimeTravelManager) and by MachineStateTransfer, so both see the
+///          (TimeTravelController) and by MachineStateTransfer, so both see the
 ///          same device set.
 ///
 ///          The registry is cleared first. Devices owned by the emulator are
@@ -41,5 +41,16 @@ bool RegisterMachinePeripherals(EmulatorContext* context, TTDPeripheralRegistry&
 ///        from the machine's slot set (SlotManager). Empty for any other device, or a machine without a slot
 ///        declaration: the device keeps its own name
 std::string SlotCardInstance(const EmulatorContext* context, const TTDSerializable* device);
+
+/// The key a machine's device is registered under: its own (TTDDescribe), its instance named by its slot when it is
+/// a slot card's device (SlotCardInstance)
+TTDDeviceKey MachineDeviceKey(const EmulatorContext* context, const TTDSerializable* device);
+
+/// A device swapped for another one (the General Sound card's personality switch): every device of @p oldType leaves
+/// @p registry, @p device comes in under MachineDeviceKey (the lightweight General Sound: marked not recorded, it runs
+/// live through seeks). Also when the new device has the outgoing one's type: the registry refuses a second device
+/// under a held key. Null @p device: only the outgoing one leaves
+void SwitchMachinePeripheral(const EmulatorContext* context, TTDPeripheralRegistry& registry, TTDDeviceType oldType,
+                             TTDSerializable* device);
 
 } // namespace ttd

@@ -10,6 +10,7 @@
 #include "emulator/platforms/tsconf/tsconfstate.h"
 #include "emulator/platforms/tsconf/tsconftsu.h"
 #include "emulator/memory/memory.h"
+#include "emulator/memory/tsconf/tsconfmemory.h"
 
 void TsConfEngine::Reset()
 {
@@ -26,16 +27,28 @@ void TsConfEngine::Reset()
     _ts.budgetRaster = 0;
     _ts.cpuAccesses = 0;
     _ts.cpuLineAccesses = 0;
-    _cpuLineRunning = 0;
+    _ts.cpuLineRunning = 0;
     _passLine = kLines;
     RebuildLineTable();
 }
 
 void TsConfEngine::RebuildLineTable()
 {
-    const TsConfLine set = LatchedSet();
-    for (TsConfLine& line : _lines)
-        line = set;
+    // Every line with the current latches, its graphics fetch cost and the TS window the TSU pass gives it (line 0
+    // keeps none: LineStart takes it from no pass); the lines' TSU results are gone
+    TsConfLine set = LatchedSet();
+    const uint8_t tConfig = _ts.regs[TsConfReg::TConfig];
+    const TsConfGeometry::Window& win = (tConfig & 0x01) ? TsConfGeometry::kWindows[3] : TsConfGeometry::WindowOf(set.vConfig);
+    for (uint32_t i = 0; i < kLines; ++i)
+    {
+        _lines[i] = set;
+        _lines[i].videoCost = VideoCost(set.vConfig, i);
+        if (i > 0)
+        {
+            _lines[i].tsX0 = win.x0;
+            _lines[i].tsW = win.w;
+        }
+    }
     if (_ts.engNextLine > 0)
     {
         // The TSU lines of the current line and, when its ts_start passed, the
@@ -213,7 +226,7 @@ void TsConfEngine::AccountBudget(uint32_t raster)
     const uint32_t start = _ts.budgetRaster;
     const uint32_t cpu = _ts.cpuAccesses;
     _ts.cpuAccesses = 0;
-    _cpuLineRunning += cpu;
+    _ts.cpuLineRunning = static_cast<uint16_t>(std::min<uint32_t>(_ts.cpuLineRunning + cpu, 0xFFFF));
 
     // Idle DMA: the free cycles go to nobody - only the position moves (it
     // also marks which ts_start events have passed, TSU-6)
@@ -223,6 +236,10 @@ void TsConfEngine::AccountBudget(uint32_t raster)
             _ts.budgetRaster = raster;
         return;
     }
+
+    // The DMA is about to write: the picture not drawn yet shows what was there before
+    if (_videoCatchUp)
+        _videoCatchUp();
 
     // The SPI / IDE device phase is time: 8 fclk per raster tact, whatever the DRAM load
     if (raster > _ts.budgetRaster)
@@ -342,8 +359,8 @@ void TsConfEngine::LineStart(uint32_t line)
     _ts.latT1XOffsH = r[TsConfReg::T0XOffsL + 5];
 
     // The CPU's DRAM reads of the line that just ended feed the TSU budget
-    _ts.cpuLineAccesses = static_cast<uint16_t>(std::min<uint32_t>(_cpuLineRunning, 0xFFFF));
-    _cpuLineRunning = 0;
+    _ts.cpuLineAccesses = _ts.cpuLineRunning;
+    _ts.cpuLineRunning = 0;
 
     // The TSU drew this line during the previous one (TSU-6): keep its result
     const TsConfLine rendered = _lines[line];
@@ -416,10 +433,37 @@ void TsConfEngine::SetLiveVideoPage(uint8_t vPage)
     _lines[current].vPage = vPage;
 }
 
+void TsConfEngine::NoteStateApplied()
+{
+    _stepEndRaster = _ts.budgetRaster;
+}
+
 void TsConfEngine::OnMachineStep(uint32_t t)
 {
     _interrupts.OnMachineStep(t);
     CatchUp(t);
+    const uint32_t from = _stepEndRaster;
+    _stepEndRaster = RasterAt(t);
+    if (_context->beamWatch && onBeam && _stepEndRaster > from) [[unlikely]]
+        onBeam(from, _stepEndRaster);
+}
+
+uint32_t TsConfEngine::IdleFetchesUntil(uint16_t fetch, uint32_t t)
+{
+    // A running DMA moves memory with its share of the DRAM cycles at every step
+    if (_dma.Busy() || !_memory)
+        return t;
+    if (!_memory->ReadTakesDram(fetch))
+        return UINT32_MAX;
+    const uint32_t multiplier = std::max<uint32_t>(_context->emulatorState.current_z80_frequency_multiplier, 1u);
+    return (t / multiplier / kLineTacts + 1) * kLineTacts * multiplier;
+}
+
+void TsConfEngine::OnIdleFetches(uint16_t fetch, uint32_t count)
+{
+    // Each one a DRAM read, as TsConfMemory::CacheRead counts it
+    if (_memory && _memory->ReadTakesDram(fetch))
+        _ts.cpuAccesses += count;
 }
 
 void TsConfEngine::OnMachineFrameRollover(uint32_t frameLength)
@@ -428,9 +472,12 @@ void TsConfEngine::OnMachineFrameRollover(uint32_t frameLength)
     // the next frame starts at line 0
     CatchUp(kFrameTacts * std::max<uint32_t>(_context->emulatorState.current_z80_frequency_multiplier, 1u));
     AccountBudget(kFrameTacts);
+    if (_context->beamWatch && onBeam && _stepEndRaster < kFrameTacts) [[unlikely]]
+        onBeam(_stepEndRaster, kFrameTacts);  // the frame's tail after its last step
     _ts.engNextLine = 0;
     _ts.budgetRaster = 0;
-    _cpuLineRunning = 0;
+    _stepEndRaster = 0;
+    _ts.cpuLineRunning = 0;
     _passLine = kLines;
     _interrupts.OnMachineFrameRollover(frameLength);
     // Last: the interrupt controller has taken the old frame's line events

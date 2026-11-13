@@ -241,6 +241,7 @@ TEST(Ds12887_Test, UpdateEndedFlagOncePerSecond)
 {
     Rtc rtc;
     rtc.Set(0x26, 0x01, 0x01, 0x10, 0x00, 0x00);
+    rtc.Write(Ds12887::kRegA, 0x20);  // no periodic rate: PF stays out of C
     EXPECT_EQ(rtc.Read(Ds12887::kRegC), 0x00);
 
     rtc.now += kSecond / 2 - 1;
@@ -272,11 +273,39 @@ TEST(Ds12887_Test, UpdateInProgressWindow)
     EXPECT_EQ(rtc.Read(Ds12887::kRegA) & 0x7F, 0x2F) << "UIP is read-only, bits 6-0 stored";
 }
 
+/// PF follows the rate select in emulated time, with or without PIE; /IRQ is low while a flag with its enable is
+/// set and rises when C is read. 1024 Hz (A = #26) is 32 ticks of the 32.768 kHz crystal: 976.5625 us
+TEST(Ds12887_Test, PeriodicFlagAndIrqPin)
+{
+    Rtc rtc;
+    rtc.Set(0x26, 0x01, 0x01, 0x10, 0x00, 0x00);
+    rtc.Read(Ds12887::kRegC);
+    rtc.now = rtc.now / 15625 * 15625 + 15625 + 1;   // 1 us past a periodic edge (16 periods = 15625 us)
+    EXPECT_EQ(rtc.Read(Ds12887::kRegC) & 0x40, 0x40) << "PF without PIE";
+    EXPECT_FALSE(rtc.chip.IsIrqAsserted()) << "PIE off: no IRQ";
+    EXPECT_FALSE(rtc.chip.IrqMayAssert());
+
+    rtc.Write(Ds12887::kRegB, 0x42);  // PIE
+    EXPECT_TRUE(rtc.chip.IrqMayAssert());
+    rtc.now += 900;
+    EXPECT_FALSE(rtc.chip.IsIrqAsserted()) << "less than one period later";
+    rtc.now += 100;
+    EXPECT_TRUE(rtc.chip.IsIrqAsserted()) << "the next edge pulls /IRQ low";
+    EXPECT_TRUE(rtc.chip.IsIrqAsserted()) << "held until C is read";
+    EXPECT_EQ(rtc.Read(Ds12887::kRegC) & 0xC0, 0xC0) << "IRQF + PF";
+    EXPECT_FALSE(rtc.chip.IsIrqAsserted()) << "the read releases it";
+
+    rtc.Write(Ds12887::kRegA, 0x66);  // divider reset: no periodic output
+    rtc.now += 10 * 977;
+    EXPECT_FALSE(rtc.chip.IsIrqAsserted());
+}
+
 /// AF rises when seconds / minutes / hours match; 11xxxxxx is don't-care
 TEST(Ds12887_Test, AlarmFlag)
 {
     Rtc rtc;
     rtc.Set(0x26, 0x01, 0x01, 0x10, 0x00, 0x00);
+    rtc.Write(Ds12887::kRegA, 0x20);  // no periodic rate: PF stays out of C
     rtc.Write(Ds12887::kSecondsAlarm, 0x02);
     rtc.Write(Ds12887::kMinutesAlarm, 0xC0);
     rtc.Write(Ds12887::kHoursAlarm, 0xFF);
@@ -353,6 +382,51 @@ TEST(Ds12887_Test, LeavingEmulatedTimeKeepsTheGuestOffset)
     rtc.chip.SetFixedTime(1767268830);
     rtc.chip.EnterEmulatedTime();
     EXPECT_EQ(rtc.chip.GetTimeMode(), Ds12887::TimeMode::Fixed) << "a fixed clock stays fixed while recording";
+}
+
+/// A reset zeroes the emulated clock, not the battery clock: rebased, the chip reads on from where it was
+TEST(Ds12887_Test, RebaseKeepsTheTimeAcrossTheEmulatedClockJump)
+{
+    Rtc rtc;
+    rtc.Set(0x26, 0x10, 0x19, 0x12, 0x00, 0x00);
+    rtc.now += 10 * kSecond;
+    ASSERT_EQ(rtc.Read(Ds12887::kSeconds), 0x10);
+
+    rtc.chip.RebaseEmulatedTime(rtc.now, 0);
+    rtc.now = 0;
+    EXPECT_EQ(rtc.Read(Ds12887::kSeconds), 0x10) << "not back to the time of the old clock's zero";
+    EXPECT_EQ(rtc.Read(Ds12887::kMinutes), 0x00);
+    rtc.now += kSecond;
+    EXPECT_EQ(rtc.Read(Ds12887::kSeconds), 0x11) << "and it counts on";
+
+    rtc.chip.SetFixedTime(1767268830);
+    rtc.chip.RebaseEmulatedTime(rtc.now, 5 * kSecond);
+    EXPECT_EQ(rtc.chip.GetTimeMode(), Ds12887::TimeMode::Fixed) << "only an emulated clock rebases";
+}
+
+/// One fixed start makes two chips read the same time, whenever and at whatever emulated time each was anchored
+TEST(Ds12887_Test, AnchorStartsEveryChipAtTheSameInstant)
+{
+    const int64_t wall = Ds12887::ToMicros({2026, 1, 1, 12, 0, 0});
+    Rtc a;
+    Rtc b;
+    b.now = 77 * kSecond;
+    a.chip.AnchorEmulatedTime(wall);
+    b.chip.AnchorEmulatedTime(wall);
+    EXPECT_EQ(a.chip.GetTimeMode(), Ds12887::TimeMode::Emulated);
+    for (int step = 0; step < 3; ++step)
+    {
+        for (uint8_t index : {Ds12887::kSeconds, Ds12887::kMinutes, Ds12887::kHours, Ds12887::kDay, Ds12887::kMonth,
+                              Ds12887::kYear})
+            EXPECT_EQ(a.Read(index), b.Read(index)) << "register " << int(index) << " step " << step;
+        a.now += kSecond / 3;
+        b.now += kSecond / 3;
+    }
+    EXPECT_EQ(a.Read(Ds12887::kHours), 0x12);
+    EXPECT_EQ(a.Read(Ds12887::kYear), 0x26);
+
+    a.chip.LeaveEmulatedTime();
+    EXPECT_EQ(a.chip.GetTimeMode(), Ds12887::TimeMode::Emulated) << "a recording's stop keeps the tests' start";
 }
 
 /// TTD: a restored state replays the same reads, whatever the host clock does

@@ -27,7 +27,7 @@ A comprehensive cross-platform menu system has been implemented for the Unreal S
 - **Open Snapshot...** - Load snapshot (.z80, .sna, .szx) or play an RZX recording (.rzx: another model is replaced by the recording's first; the status bar shows `RZX nn%`, red after a desync, with the details in its tooltip; a click on it toggles a popover - the label is highlighted while it is open: file and creator, a slider over the whole recording with frame and time, `|<` / `>|`, the state, the keyframes and Stop Playback; a seek runs on a worker thread, back through the nearest keyframe. The popover is a small window glued to the main window (macOS: a child window that moves with it; other platforms follow the window's moves) and closes when the window loses focus, on a click outside it, on Esc or on minimize)
 - **Stop RZX Playback** - End an RZX playback early; the machine continues live (enabled while one plays). While a recording plays, fast tape / turbo tape / fast disk are greyed out
 - **Open Tape...** - Load tape (.tap, .tzx)
-- **Open Disk...** - Load disk image (.trd, .scl, .fdi)
+- **Open Disk...** - Load disk image (every floppy format of [disk images](../../../file-formats/disk-images/README.md): .trd, .scl, .fdi, .udi, .dsk, .td0, .mgt, .img, .mb2, .d80, .pro, ...)
 - **Save Snapshot...** - Save current state [TODO]
 - **Recent Files** - Recent file list [TODO]
 - **Exit** (Ctrl+Q / Cmd+Q) - Exit application
@@ -85,8 +85,10 @@ A comprehensive cross-platform menu system has been implemented for the Unreal S
 
 Only the platform's standard shortcuts are assigned (2026-10-05, owner decision; the earlier ad-hoc keys were
 removed): Open (`QKeySequence::Open`), Save snapshot (`Save`), Quit (`Quit`), Preferences (`Preferences`), Help
-(`HelpContents`); Full Screen is Ctrl+F (Cmd+F on macOS) on every platform (restored 2026-10-06, owner
-decision). Every other command is
+(`HelpContents`); Full Screen is Cmd+F on macOS and Alt+Enter on Windows and Linux (owner decision 2026-10-21: Ctrl+F
+there is the machine's Symbol Shift + F, TO in 48K BASIC; Ctrl+F on every platform before, from 2026-10-06).
+While the emulator screen has focus the machine's keys win over these shortcuts
+([keyboard.md](../../../features/keyboard.md#app-shortcuts-and-the-machines-keys)). Every other command is
 reached through the menus. Dialogs keep their local keys (Delete, Escape, search).
 
 ## Implementation Details
@@ -168,8 +170,8 @@ Called from:
 
 ### Windows/Linux
 - Standard menu bar
-- Ctrl key for shortcuts
-- Ctrl+F for Full Screen
+- Ctrl key for shortcuts (not while the emulator screen has focus: Ctrl is the machine's)
+- Alt+Enter for Full Screen
 - Ctrl+P for Preferences
 
 ## CLI Command Mapping

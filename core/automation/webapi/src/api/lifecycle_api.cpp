@@ -2,16 +2,23 @@
 // Extracted from emulator_api.cpp - 2026-01-08
 
 #include <emulator/ports/models/profiboard.h>
+#include <chrono>
+#include <cctype>
+#include <algorithm>
+#include "../common/session_helper.h"
 #include <emulator/ports/models/sprinter/sprinterbios.h>
 #include "../emulator_api.h"
 #include "../common/statenode_json.h"
 
 #include <drogon/HttpResponse.h>
 #include <emulator/buildinfo.h>
+#include <platform/processinfo.h>
 #include <emulator/config.h>
 #include <emulator/emulator.h>
 #include <emulator/emulatormanager.h>
+#include <emulator/execution/runcontrol.h>
 #include <emulator/zxpoly/zxpolygroup.h>
+#include <emulator/machinenames.h>
 #include <emulator/machinevariants.h>
 #include <emulator/media/modelswitch.h>
 #include <emulator/slots/slotcontrol.h>
@@ -36,6 +43,17 @@ extern std::string stateToString(EmulatorStateEnum state);
 
 namespace
 {
+/// The note a create / start / switch reply carries when the RAM size asked for is not what the machine got (Config::EffectiveRamSize);
+/// empty otherwise. The manager does the change, this only says it
+std::string RamSizeNote(const std::string& modelName, uint32_t requestedKb)
+{
+    const TMemModel* model = Config::FindModelByShortName(modelName);
+    std::string note;
+    if (model && requestedKb > 0)
+        (void)Config::EffectiveRamSize(model->Model, requestedKb, note);
+    return note;
+}
+
 /// Optional "ram_power_on": "random" | "zero" of a create / start / model
 /// switch body. True when absent or valid (mode set only when present);
 /// false with a 400 already sent when the value is not one of the two
@@ -312,6 +330,7 @@ void EmulatorAPI::get(const HttpRequestPtr& req, std::function<void(const HttpRe
         {
             Json::Value emuInfo;
             emuInfo["id"] = id;
+            emuInfo["symbolic_id"] = emulator->GetSymbolicId();
             emuInfo["state"] = stateToString(emulator->GetState());
             emuInfo["is_running"] = emulator->IsRunning();
             emuInfo["is_paused"] = emulator->IsPaused();
@@ -468,6 +487,9 @@ void EmulatorAPI::status(const HttpRequestPtr& req, std::function<void(const Htt
     server["git_branch"] = buildinfo::kGitBranch;
     server["git_commit"] = buildinfo::kGitCommit;
     server["build_type"] = buildinfo::kBuildType;
+    // The process: one emulator answers on the WebAPI port and on the MCP port; a client scanning ports tells the
+    // two answers of one process from two processes by it
+    server["pid"] = static_cast<Json::UInt>(platform::CurrentProcessId());
     ret["server"] = server;
 
     Json::Value creatableModels(Json::arrayValue);
@@ -580,6 +602,8 @@ void EmulatorAPI::createEmulator(const HttpRequestPtr& req,
         ret["state"] = stateToString(emulator->GetState());
         ret["symbolic_id"] = emulator->GetSymbolicId();
         AddIdentityFields(ret, *emulator);
+        if (const std::string note = RamSizeNote(modelName, ramSize); !note.empty())
+            ret["note"] = note;  // a size the core cannot address was created with the one it can
 
         auto resp = HttpResponse::newHttpJsonResponse(ret);
         resp->setStatusCode(HttpStatusCode::k201Created);
@@ -622,6 +646,7 @@ void EmulatorAPI::getEmulator(const HttpRequestPtr& req, std::function<void(cons
 
     Json::Value ret;
     ret["id"] = id;
+    ret["symbolic_id"] = emulator->GetSymbolicId();
     ret["state"] = stateToString(emulator->GetState());
     ret["is_running"] = emulator->IsRunning();
     ret["is_paused"] = emulator->IsPaused();
@@ -813,6 +838,8 @@ void EmulatorAPI::startEmulator(const HttpRequestPtr& req,
         ret["state"] = stateToString(emulator->GetState());
         ret["started"] = started;
         ret["message"] = started ? "Emulator created and started" : "Emulator created but failed to start";
+        if (const std::string note = RamSizeNote(modelName, ramSize); !note.empty())
+            ret["note"] = note;  // a size the core cannot address was created with the one it can
         if (ZXPolyGroup* group = manager->GetZXPolyGroup(emulatorId))
             ret["zxpoly"] = ZXPolyStatusJson(group->GetStatus());
 
@@ -971,21 +998,24 @@ void EmulatorAPI::pauseEmulator(const HttpRequestPtr& req, std::function<void(co
 
     try
     {
-        bool success = manager->PauseEmulator(id);
-
-        Json::Value ret;
-        ret["status"] = success ? "success" : "error";
-        ret["message"] = success ? "Emulator paused" : "Failed to pause emulator (not running or error)";
-        ret["emulator_id"] = id;
-
-        auto emulator = manager->GetEmulator(id);
-        if (emulator)
-        {
-            ret["state"] = stateToString(emulator->GetState());
-        }
+        auto target = manager->GetEmulator(id);
+        // ?wait=true (30 s) or ?wait=<ms> (up to 60 s): wait for the pause behind a running command too. Without it a
+        // pause behind a command answers at once, queued (it applies when the command ends)
+        std::chrono::milliseconds wait{0};
+        const std::string waitParam = req->getParameter("wait");
+        if (waitParam == "true" || waitParam == "1")
+            wait = std::chrono::milliseconds(30000);
+        else if (!waitParam.empty() && waitParam.size() <= 9 &&
+                 std::all_of(waitParam.begin(), waitParam.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+            wait = std::chrono::milliseconds(std::min<long long>(std::stoll(waitParam), 60000));
+        // RunControl (core/src/emulator/execution/runcontrol.h): the pause every surface and the actions share
+        const execution::RunReply reply = execution::RunControl(target).Pause(
+            webapi_session::RequesterOf(req, target ? target->GetContext() : nullptr), wait);
+        Json::Value ret = StateNodeToJson(reply.body);
+        const auto code = static_cast<HttpStatusCode>(reply.HttpStatus());
 
         auto resp = HttpResponse::newHttpJsonResponse(ret);
-        resp->setStatusCode(success ? HttpStatusCode::k200OK : HttpStatusCode::k400BadRequest);
+        resp->setStatusCode(code);
         addCorsHeaders(resp);
         callback(resp);
     }
@@ -1023,44 +1053,23 @@ void EmulatorAPI::resumeEmulator(const HttpRequestPtr& req, std::function<void(c
         return;
     }
 
-    // Check run-control claim (GDB TDD §3.3 / 1A.7.2)
-    auto emulator = manager->GetEmulator(id);
-    if (emulator)
-    {
-        auto* ctx = emulator->GetContext();
-        if (ctx && ctx->IsRunControlClaimed())
-        {
-            auto state = ctx->GetRunControlState();
-            Json::Value error;
-            error["error"] = "Run-control held";
-            error["message"] = "Run-control held by " + state.surfaceLabel + ". Use that surface to resume.";
-            error["emulator_id"] = id;
-
-            auto resp = HttpResponse::newHttpJsonResponse(error);
-            resp->setStatusCode(HttpStatusCode::k409Conflict);
-            addCorsHeaders(resp);
-            callback(resp);
-            return;
-        }
-    }
-
     try
     {
-        bool success = manager->ResumeEmulator(id);
-
-        Json::Value ret;
-        ret["status"] = success ? "success" : "error";
-        ret["message"] = success ? "Emulator resumed" : "Failed to resume emulator (not paused or error)";
-        ret["emulator_id"] = id;
-
-        auto emulator = manager->GetEmulator(id);
-        if (emulator)
+        // RunControl: the claim check (409 "Run-control held" for anybody but the holder), then the run as the
+        // session holding control, or as the surface alone; the arbiter refuses anybody else's run while it is held
+        auto target = manager->GetEmulator(id);
+        const execution::RunReply reply =
+            execution::RunControl(target).Resume(webapi_session::RequesterOf(req, target ? target->GetContext() : nullptr));
+        Json::Value ret = StateNodeToJson(reply.body);
+        if (reply.status == execution::RunReply::Status::Held)
         {
-            ret["state"] = stateToString(emulator->GetState());
+            ret["error"] = reply.error;
+            ret["message"] = reply.message;
         }
+        const auto code = static_cast<HttpStatusCode>(reply.HttpStatus());
 
         auto resp = HttpResponse::newHttpJsonResponse(ret);
-        resp->setStatusCode(success ? HttpStatusCode::k200OK : HttpStatusCode::k400BadRequest);
+        resp->setStatusCode(code);
         addCorsHeaders(resp);
         callback(resp);
     }
@@ -1079,7 +1088,7 @@ void EmulatorAPI::resumeEmulator(const HttpRequestPtr& req, std::function<void(c
 }
 
 /// @brief POST /api/v1/emulator/{id}/reset
-/// @brief Reset an emulator
+/// @brief Reset an emulator: soft (the reset button) by default; {"hard": true} or ?hard=true is a power cycle
 void EmulatorAPI::resetEmulator(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
                                 const std::string& id) const
 {
@@ -1100,11 +1109,22 @@ void EmulatorAPI::resetEmulator(const HttpRequestPtr& req, std::function<void(co
 
     try
     {
-        bool success = manager->ResetEmulator(id);
+        // Soft by default (the reset button: the ZX Next restarts NextZXOS at once); hard = power-on (the ZX Next runs
+        // its boot ROM and firmware again), from the body {"hard": true} or the query ?hard=true
+        bool hard = false;
+        const std::string hardParam = req->getParameter("hard");
+        if (hardParam == "true" || hardParam == "1")
+            hard = true;
+        auto json = req->getJsonObject();
+        if (json && json->isMember("hard") && (*json)["hard"].isBool())
+            hard = (*json)["hard"].asBool();
+
+        bool success = manager->ResetEmulator(id, hard);
 
         Json::Value ret;
         ret["status"] = success ? "success" : "error";
-        ret["message"] = success ? "Emulator reset" : "Failed to reset emulator";
+        ret["message"] = success ? (hard ? "Emulator reset (hard)" : "Emulator reset (soft)") : "Failed to reset emulator";
+        ret["reset"] = hard ? "hard" : "soft";
         ret["emulator_id"] = id;
 
         auto emulator = manager->GetEmulator(id);
@@ -1348,12 +1368,16 @@ void EmulatorAPI::switchModel(const HttpRequestPtr& req, std::function<void(cons
     // must leave the caller's emulator untouched (the old flow removed the
     // instance first and a bad model then left the caller with nothing).
     // These checks mirror the ones inside EmulatorManager create paths.
-    const TMemModel* requestedModel = Config::FindModelByShortName(modelName);
-    if (!requestedModel)
+    // A model, a machine variant (TSL-VDAC2, PROFI-PLUS) or a ZX-Poly configuration: what EmulatorManager creates
+    // by name (machines::Resolve)
+    machines::ResolvedName requested;
+    std::string resolveError;
+    const std::string ramNote = RamSizeNote(modelName, ramSize);
+    if (!machines::Resolve(modelName, ramSize, requested, resolveError))
     {
         Json::Value error;
         error["error"] = "Bad Request";
-        error["message"] = "unknown model '" + modelName + "'";
+        error["message"] = resolveError;
         error["requested_model"] = modelName;
         error["available_models_endpoint"] = "/api/v1/emulator/models";
 
@@ -1363,38 +1387,11 @@ void EmulatorAPI::switchModel(const HttpRequestPtr& req, std::function<void(cons
         callback(resp);
         return;
     }
-
-    if (ramSize > 0 && (ramSize & requestedModel->AvailRAMs) == 0)
-    {
-        Json::Value error;
-        error["error"] = "Bad Request";
-        error["message"] = "RAM size " + std::to_string(ramSize) + "KB is not supported by model '" + modelName +
-                           "' (see available_ram_sizes_kb in /api/v1/emulator/models)";
-        error["requested_model"] = modelName;
-        error["available_models_endpoint"] = "/api/v1/emulator/models";
-
-        auto resp = HttpResponse::newHttpJsonResponse(error);
-        resp->setStatusCode(HttpStatusCode::k400BadRequest);
-        addCorsHeaders(resp);
-        callback(resp);
-        return;
-    }
-
-    if (!Config::IsModelCreatable(*requestedModel))
-    {
-        Json::Value error;
-        error["error"] = "Bad Request";
-        error["message"] = "model '" + modelName +
-                           "' is not creatable on this build (port decoder or config folder missing)";
-        error["requested_model"] = modelName;
-        error["available_models_endpoint"] = "/api/v1/emulator/models";
-
-        auto resp = HttpResponse::newHttpJsonResponse(error);
-        resp->setStatusCode(HttpStatusCode::k400BadRequest);
-        addCorsHeaders(resp);
-        callback(resp);
-        return;
-    }
+    modelName = requested.name;
+    if (requested.kind == machines::NameKind::Model)
+        ramSize = requested.ramKb;
+    else
+        ramSize = 0;  // a variant's / a configuration's own RAM size
 
     // What happens to unsaved writes on media the new model has no slot for
     StrandedMedia stranded = StrandedMedia::Refuse;
@@ -1471,6 +1468,8 @@ void EmulatorAPI::switchModel(const HttpRequestPtr& req, std::function<void(cons
         Json::Value ret;
         ret["status"] = "success";
         ret["message"] = "Model switched successfully";
+        if (!ramNote.empty())
+            ret["note"] = ramNote;
         ret["old_emulator_id"] = id;
         ret["new_emulator_id"] = newEmulator->GetId();
         ret["state"] = stateToString(newEmulator->GetState());

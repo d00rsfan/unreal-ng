@@ -4,7 +4,7 @@
 /// Each tool is driven through a synchronous FakeApiCaller that records every
 /// HTTP call, so the tests assert exactly which WebAPI endpoint each action
 /// hits and with which body. Covered:
-///   - emulator_manage action routing (list/status/start/destroy/create)
+///   - emulator_manage action routing (list/status/start/destroy/create/reset soft and hard)
 ///   - load_software extension detection (.sna/.tap+.play/.trd+drive) and rejects
 ///   - control_execution step/run_frames/breakpoint mapping and body fields
 ///   - inspect_state aspect fan-out (machine+registers hit two endpoints)
@@ -20,10 +20,13 @@
 
 #include <json/json.h>
 
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "mcp-tool-utils.h"
 #include "mcp-tools.h"
 #include "target-resolver.h"
 
@@ -193,6 +196,28 @@ TEST_F(McpTools_Test, EmulatorManage_StartStopDestroy_VerbAndPath)
     EXPECT_TRUE(_caller->Saw("DELETE", "/api/v1/emulator/emu-1"));
 }
 
+TEST_F(McpTools_Test, EmulatorManage_Reset_SoftByDefault_HardOnRequest)
+{
+    _caller->routes["POST /api/v1/emulator/emu-1/reset"] = {200, Json::Value(Json::objectValue)};
+
+    Json::Value args;
+    args["action"] = "reset";
+    mcp::ToolResult soft = RunTool(*_registry, "emulator_manage", args, *_caller);
+    ASSERT_FALSE(soft.isError);
+    const auto* call = _caller->Last("POST", "/api/v1/emulator/emu-1/reset");
+    ASSERT_NE(call, nullptr);
+    EXPECT_FALSE(call->body["hard"].asBool());   // the reset button
+    EXPECT_NE(soft.text.find("Soft reset"), std::string::npos) << soft.text;
+
+    args["hard"] = true;
+    mcp::ToolResult hard = RunTool(*_registry, "emulator_manage", args, *_caller);
+    ASSERT_FALSE(hard.isError);
+    call = _caller->Last("POST", "/api/v1/emulator/emu-1/reset");
+    ASSERT_NE(call, nullptr);
+    EXPECT_TRUE(call->body["hard"].asBool());    // a power cycle
+    EXPECT_NE(hard.text.find("Hard reset"), std::string::npos) << hard.text;
+}
+
 TEST_F(McpTools_Test, EmulatorManage_CreateZXPoly_PostsTheWebApiZXPolyRequest)
 {
     Json::Value response;
@@ -236,6 +261,57 @@ TEST_F(McpTools_Test, EmulatorManage_CreateAndSwitchModel_ForwardRamPowerOn)
     const auto* switched = _caller->Last("POST", "/api/v1/emulator/emu-1/model");
     ASSERT_NE(switched, nullptr);
     EXPECT_EQ(switched->body["ram_power_on"].asString(), "random");
+}
+
+TEST_F(McpTools_Test, EmulatorManage_Operations_GetsTheLogWithOneLinePerOperation)
+{
+    Json::Value body;
+    body["mode"] = "recording";
+    body["last_seq"] = 7;
+    body["capacity"] = 1024;
+    Json::Value refused;
+    refused["seq"] = 7;
+    refused["frame"] = 120;
+    refused["kind"] = "media-insert";
+    refused["summary"] = "tape game.tzx";
+    refused["status"] = "refused";
+    refused["mode"] = "recording";
+    refused["source"] = "webapi";
+    refused["effect"] = "none";
+    refused["detail"] = "Cannot insert a tape while TTD is recording";
+    body["entries"].append(refused);
+    _caller->routes["GET /api/v1/emulator/emu-1/operations?since=0&limit=20"] = {200, body};
+
+    Json::Value args;
+    args["action"] = "operations";
+    mcp::ToolResult result = RunTool(*_registry, "emulator_manage", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("Operations of emu-1 (mode recording, last #7):"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("#7 frame 120 media-insert tape game.tzx refused [recording, webapi] - Cannot insert a "
+                               "tape while TTD is recording"),
+              std::string::npos)
+        << result.text;
+    EXPECT_EQ(result.structured["entries"][0]["kind"].asString(), "media-insert");
+}
+
+TEST_F(McpTools_Test, EmulatorManage_Operations_PassesSinceAndLimit)
+{
+    Json::Value body;
+    body["mode"] = "live";
+    body["last_seq"] = 42;
+    body["entries"] = Json::Value(Json::arrayValue);
+    _caller->routes["GET /api/v1/emulator/emu-1/operations?since=40&limit=0"] = {200, body};
+
+    Json::Value args;
+    args["action"] = "operations";
+    args["since"] = 40;
+    args["limit"] = 0;
+    mcp::ToolResult result = RunTool(*_registry, "emulator_manage", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/operations?since=40&limit=0"));
+    EXPECT_NE(result.text.find("last #42): none"), std::string::npos) << result.text;
 }
 
 TEST_F(McpTools_Test, EmulatorManage_ZXPolyStatus_GetsGroupEndpoint)
@@ -497,6 +573,42 @@ TEST_F(McpTools_Test, LoadSoftware_Snapshot_CarriesTheCommitChoice)
     EXPECT_FALSE(_caller->Last("POST", "/api/v1/emulator/emu-1/snapshot/load")->body.isMember("commit"));
 }
 
+TEST_F(McpTools_Test, LoadSoftware_Snapshot_CarriesTheSwitchModelChoice)
+{
+    _caller->routes["POST /api/v1/emulator/emu-1/snapshot/load"] = {200, Json::Value(Json::objectValue)};
+
+    Json::Value args;
+    args["path"] = "/games/exolon128.z80";
+    args["switch_model"] = true;
+    ASSERT_FALSE(RunTool(*_registry, "load_software", args, *_caller).isError);
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/snapshot/load");
+    ASSERT_NE(call, nullptr);
+    ASSERT_TRUE(call->body.isMember("switch_model"));
+    EXPECT_TRUE(call->body["switch_model"].asBool());
+
+    args["switch_model"] = false;
+    RunTool(*_registry, "load_software", args, *_caller);
+    EXPECT_FALSE(_caller->Last("POST", "/api/v1/emulator/emu-1/snapshot/load")->body["switch_model"].asBool());
+
+    // Not given: the body says nothing, the launcher's rule decides
+    Json::Value plain;
+    plain["path"] = "/games/other.z80";
+    RunTool(*_registry, "load_software", plain, *_caller);
+    EXPECT_FALSE(_caller->Last("POST", "/api/v1/emulator/emu-1/snapshot/load")->body.isMember("switch_model"));
+}
+
+TEST_F(McpTools_Test, LoadSoftware_Rzx_CarriesTheSwitchModelChoice)
+{
+    Json::Value args;
+    args["path"] = "/nonexistent/game.rzx";
+    args["switch_model"] = false;
+    ASSERT_FALSE(RunTool(*_registry, "load_software", args, *_caller).isError);
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/rzx/play");
+    ASSERT_NE(call, nullptr);
+    ASSERT_TRUE(call->body.isMember("switch_model"));
+    EXPECT_FALSE(call->body["switch_model"].asBool());
+}
+
 TEST_F(McpTools_Test, LoadSoftware_Inspect_AsksWhatALoadWouldDoAndLoadsNothing)
 {
     _caller->routes["POST /api/v1/emulator/emu-1/snapshot/inspect"] = {200, Json::Value(Json::objectValue)};
@@ -552,6 +664,76 @@ TEST_F(McpTools_Test, LoadSoftware_TapeWithPlay_LoadsThenPlays)
     ASSERT_FALSE(result.isError);
     EXPECT_TRUE(_caller->Saw("POST", "/api/v1/emulator/emu-1/tape/load"));
     EXPECT_TRUE(_caller->Saw("POST", "/api/v1/emulator/emu-1/tape/play"));
+}
+
+TEST_F(McpTools_Test, LoadSoftware_TapeAutostart_PlaysTypesLoadAndKeepsAPausedMachinePaused)
+{
+    Json::Value state(Json::objectValue);
+    state["is_running"] = true;
+    state["is_paused"] = true;
+    _caller->routes["GET /api/v1/emulator/emu-1"] = {200, state};
+    Json::Value typed(Json::objectValue);
+    typed["success"] = true;
+    typed["editor"] = "48 BASIC";
+    _caller->routes["POST /api/v1/emulator/emu-1/basic/run"] = {200, typed};
+
+    Json::Value args;
+    args["path"] = "game.tap";
+    args["autostart"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "load_software", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("LOAD \"\" typed (48 BASIC)"), std::string::npos) << result.text;
+    // The order: load, play, wake the paused machine, type, pause it again
+    std::vector<std::string> sequence;
+    for (const auto& call : _caller->calls)
+        if (call.method == "POST")
+            sequence.push_back(call.path.substr(std::string("/api/v1/emulator/emu-1").size()));
+    const std::vector<std::string> expected = {"/tape/load", "/tape/play", "/resume", "/basic/run", "/pause"};
+    EXPECT_EQ(sequence, expected);
+    EXPECT_EQ(_caller->Last("POST", "/api/v1/emulator/emu-1/basic/run")->body["command"].asString(), "LOAD \"\"");
+}
+
+TEST_F(McpTools_Test, LoadSoftware_TapeAutostart_StartsAMachineNotYetStartedAndPausesIt)
+{
+    // A slot change restarts a paused machine without starting it; run_frames on it leave a pause behind
+    Json::Value state(Json::objectValue);
+    state["is_running"] = false;
+    state["is_paused"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1"] = {200, state};
+
+    Json::Value args;
+    args["path"] = "game.tap";
+    args["autostart"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "load_software", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    std::vector<std::string> sequence;
+    for (const auto& call : _caller->calls)
+        if (call.method == "POST")
+            sequence.push_back(call.path.substr(std::string("/api/v1/emulator/emu-1").size()));
+    const std::vector<std::string> expected = {"/tape/load", "/tape/play", "/start", "/resume", "/basic/run", "/pause"};
+    EXPECT_EQ(sequence, expected);
+}
+
+TEST_F(McpTools_Test, LoadSoftware_TapeAutostart_ANotTypedLoadIsAnError)
+{
+    Json::Value state(Json::objectValue);
+    state["is_running"] = true;
+    state["is_paused"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1"] = {200, state};
+    Json::Value busy(Json::objectValue);
+    busy["message"] = "a program is running";
+    _caller->routes["POST /api/v1/emulator/emu-1/basic/run"] = {409, busy};
+
+    Json::Value args;
+    args["path"] = "game.tap";
+    args["autostart"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "load_software", args, *_caller);
+
+    EXPECT_TRUE(result.isError);
+    EXPECT_NE(result.text.find("a program is running"), std::string::npos) << result.text;
+    EXPECT_FALSE(_caller->Saw("POST", "/api/v1/emulator/emu-1/pause")) << "a running machine is left running";
 }
 
 TEST_F(McpTools_Test, LoadSoftware_Disk_UsesDriveParameter)
@@ -669,6 +851,103 @@ TEST_F(McpTools_Test, ControlExecution_Wait_LongPolls)
     mcp::ToolResult result = RunTool(*_registry, "control_execution", args, *_caller);
     ASSERT_FALSE(result.isError) << result.text;
     EXPECT_EQ(result.text, "Changed: seq 43, paused at breakpoint #3 (8000)");
+}
+
+/// Frame watches (docs/inprogress/2026-11-03-run-until-watches): run_until posts the rules (condition as `if`) and
+/// answers the server's text; watch_add / watch_list / watch_remove; wait names the watch that paused
+TEST_F(McpTools_Test, ControlExecution_RunUntil_PostsTheRulesAndAnswersTheText)
+{
+    Json::Value reply;
+    reply["met"] = true;
+    reply["outcome"] = "met";
+    reply["frames"] = 84;
+    reply["text"] = "met at frame 170 after 84 frames (text, row \"(c) 1982 Sinclair Research Ltd\"), PC #12A9, 31 ms; paused";
+    _caller->routes["POST /api/v1/emulator/emu-1/run_until"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "run_until";
+    args["text"] = "1982";
+    args["condition"] = "M(#5C3A) == 255";
+    args["match"] = "any";
+    args["max_frames"] = 500;
+    args["label"] = "ignored";  // a watch option: not sent to run_until
+    mcp::ToolResult result = RunTool(*_registry, "control_execution", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    ASSERT_TRUE(_caller->Saw("POST", "/api/v1/emulator/emu-1/run_until"));
+    const Json::Value& body = _caller->calls.back().body;
+    EXPECT_EQ(body["text"].asString(), "1982");
+    EXPECT_EQ(body["if"].asString(), "M(#5C3A) == 255");
+    EXPECT_EQ(body["max_frames"].asUInt(), 500u);
+    EXPECT_FALSE(body.isMember("label"));
+    EXPECT_EQ(result.text, reply["text"].asString());
+
+    Json::Value refused;
+    refused["error"] = "Bad Request";
+    refused["message"] = "nothing to wait for: give if, text, screen or event";
+    _caller->routes["POST /api/v1/emulator/emu-1/run_until"] = {400, refused};
+    Json::Value empty;
+    empty["action"] = "run_until";
+    result = RunTool(*_registry, "control_execution", empty, *_caller);
+    EXPECT_TRUE(result.isError);
+    EXPECT_NE(result.text.find("nothing to wait for"), std::string::npos) << result.text;
+}
+
+TEST_F(McpTools_Test, ControlExecution_Watches_AddListRemoveAndWaitNamesTheWatch)
+{
+    Json::Value added;
+    added["id"] = 1;
+    added["text"] = "watch 1 armed: text \"GAME OVER\" -> pause, once";
+    _caller->routes["POST /api/v1/emulator/emu-1/watches"] = {201, added};
+    Json::Value args;
+    args["action"] = "watch_add";
+    args["text"] = "GAME OVER";
+    args["label"] = "over";
+    args["then"] = "pause";
+    args["max_frames"] = 9;  // a run_until option: not sent to a watch
+    mcp::ToolResult result = RunTool(*_registry, "control_execution", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_EQ(_caller->calls.back().body["label"].asString(), "over");
+    EXPECT_FALSE(_caller->calls.back().body.isMember("max_frames"));
+    EXPECT_EQ(result.text, added["text"].asString());
+
+    Json::Value listed;
+    listed["text"] = "1 watch(es)\n  1 over: text \"GAME OVER\" -> pause, once; armed at frame 10, 0 hit(s)";
+    _caller->routes["GET /api/v1/emulator/emu-1/watches"] = {200, listed};
+    Json::Value list;
+    list["action"] = "watch_list";
+    result = RunTool(*_registry, "control_execution", list, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_EQ(result.text, listed["text"].asString());
+
+    Json::Value removed;
+    removed["text"] = "1 watch(es) removed";
+    _caller->routes["DELETE /api/v1/emulator/emu-1/watches/all"] = {200, removed};
+    Json::Value remove;
+    remove["action"] = "watch_remove";
+    remove["watch_id"] = "all";
+    result = RunTool(*_registry, "control_execution", remove, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    Json::Value noId;
+    noId["action"] = "watch_remove";
+    EXPECT_TRUE(RunTool(*_registry, "control_execution", noId, *_caller).isError);
+
+    Json::Value reply;
+    reply["seq"] = 8;
+    reply["changed"] = true;
+    reply["state"] = "paused";
+    reply["pause"]["reason"] = "watch";
+    reply["pause"]["watch_id"] = 1;
+    reply["pause"]["watch_label"] = "over";
+    reply["pause"]["frame"] = 4521;
+    reply["pause"]["reasons"].append("text");
+    reply["pause"]["text_line"] = "GAME OVER";
+    _caller->routes["GET /api/v1/emulator/emu-1/debug/wait?timeout_ms=10000&since=7"] = {200, reply};
+    Json::Value wait;
+    wait["action"] = "wait";
+    wait["since"] = 7;
+    result = RunTool(*_registry, "control_execution", wait, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_EQ(result.text, "Changed: seq 8, paused at watch 1 over, frame 4521 (text, row \"GAME OVER\")");
 }
 
 // ===========================================================================
@@ -927,6 +1206,9 @@ TEST_F(McpTools_Test, InspectState_SlotsAspect_SummarizesTheReport)
     Json::Value ay;
     ay["id"] = "ay";
     ay["state"] = "shadowed by zxbus.1";
+    Json::Value port;
+    port["range"] = "#E002/#E000";
+    ay["ports"].append(port);
     report["builtIns"].append(ay);
     _caller->routes["GET /api/v1/emulator/emu-1/slots"] = {200, report};
 
@@ -937,7 +1219,155 @@ TEST_F(McpTools_Test, InspectState_SlotsAspect_SummarizesTheReport)
     EXPECT_NE(result.text.find("zxbus.1 = multisound [dip=ym,saa,gs,sd gsRam=1m ctrlMask=pro] fit real, active"),
               std::string::npos)
         << result.text;
-    EXPECT_NE(result.text.find("built-in ay: shadowed by zxbus.1"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("built-in ay: shadowed by zxbus.1, ports #E002/#E000"), std::string::npos) << result.text;
+}
+
+// The ZX Next report aspects (design-automation-coverage.md): each reads its WebAPI route with the nr_ parameters as the query, and a
+// machine that is not a Next is a line, not an error
+TEST_F(McpTools_Test, InspectState_NextReportAspects_UseTheirRoutesAndQueries)
+{
+    struct Case
+    {
+        const char* aspect;
+        const char* path;
+    };
+    for (const Case& c : {Case{"next_dma", "/api/v1/emulator/emu-1/state/next/dma"}, Case{"next_video", "/api/v1/emulator/emu-1/state/next/video"},
+                          Case{"next_palette", "/api/v1/emulator/emu-1/state/next/palette?palette=sprites_1&range=0-15"},
+                          Case{"next_ports", "/api/v1/emulator/emu-1/state/next/ports?port=6B&access=w"},
+                          Case{"next_nextreg", "/api/v1/emulator/emu-1/state/next/nextreg?reg=07&changed=true"},
+                          Case{"next_copper", "/api/v1/emulator/emu-1/state/next/copper?from=16&count=8&raw=true"},
+                          Case{"next_sprites", "/api/v1/emulator/emu-1/state/next/sprites?from=16&count=8&all=true"},
+                          Case{"next_pixel", "/api/v1/emulator/emu-1/state/next/pixel?x=105&y=87&sx=1"}})
+    {
+        _caller->calls.clear();
+        Json::Value report;
+        report["available"] = true;
+        _caller->routes[std::string("GET ") + c.path] = {200, report};
+        Json::Value args;
+        args["aspects"].append(c.aspect);
+        args["nr_palette"] = "sprites_1";
+        args["nr_range"] = "0-15";
+        args["nr_port"] = "6B";
+        args["nr_access"] = "w";
+        args["nr_reg"] = "07";
+        args["nr_changed"] = true;
+        args["nr_from"] = "16";
+        args["nr_count"] = "8";
+        args["nr_raw"] = true;
+        args["nr_all"] = true;
+        args["nr_x"] = "105";
+        args["nr_y"] = "87";
+        args["nr_sx"] = "1";
+        mcp::ToolResult result = RunTool(*_registry, "inspect_state", args, *_caller);
+        ASSERT_FALSE(result.isError) << c.aspect << ": " << result.text;
+        EXPECT_TRUE(_caller->Saw("GET", c.path)) << c.aspect;
+        EXPECT_NE(result.text.find(std::string("[") + c.aspect + "]"), std::string::npos) << result.text;
+    }
+}
+
+TEST_F(McpTools_Test, InspectState_NextReportAspects_WithoutParametersAskForNoQuery)
+{
+    Json::Value report;
+    report["available"] = true;
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/palette"] = {200, report};
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/ports"] = {200, report};
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/nextreg"] = {200, report};
+    Json::Value args;
+    args["aspects"].append("next_palette");
+    args["aspects"].append("next_ports");
+    args["aspects"].append("next_nextreg");
+    mcp::ToolResult result = RunTool(*_registry, "inspect_state", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/state/next/palette"));
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/state/next/ports"));
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/state/next/nextreg"));
+}
+
+TEST_F(McpTools_Test, InspectState_NextReportAspects_SummarizeTheReports)
+{
+    Json::Value dma;
+    dma["available"] = true;
+    dma["mode"] = "zxn";
+    dma["enabled"] = true;
+    dma["direction"] = "a_to_b";
+    dma["a"]["address"] = "0x8000";
+    dma["a"]["type"] = "memory";
+    dma["b"]["address"] = "0x00FE";
+    dma["b"]["type"] = "io";
+    dma["burst"] = "burst";
+    dma["counter"] = 4;
+    dma["block_length"] = 256;
+    dma["status"] = "0x3B";
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/dma"] = {200, dma};
+    Json::Value ports;
+    ports["available"] = true;
+    ports["enable_word"]["value"] = "0xFFFFFFDF";
+    ports["describe"]["port"] = "0x006B";
+    ports["describe"]["access"] = "write";
+    ports["describe"]["device"] = "DMA (zxnDMA)";
+    ports["describe"]["enabled"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/ports"] = {200, ports};
+    Json::Value reg;
+    reg["available"] = true;
+    reg["reg"] = "0x07";
+    reg["name"] = "CPU Speed";
+    reg["value"] = "0x33";
+    reg["decoded"] = "CPU speed 28 MHz";
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/nextreg"] = {200, reg};
+    Json::Value copper;
+    copper["available"] = true;
+    copper["control"]["name"] = "restart_loop";
+    copper["pc"] = 2;
+    copper["address"] = 10;
+    copper["list_length"] = 5;
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/copper"] = {200, copper};
+    Json::Value sprites;
+    sprites["available"] = true;
+    sprites["enabled"] = true;
+    sprites["visible_count"] = 3;
+    sprites["sprites"].append(Json::Value(Json::objectValue));
+    sprites["pattern_memory"]["non_zero_bytes"] = 266;
+    sprites["flags"]["collision"] = true;
+    sprites["flags"]["too_many"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/sprites"] = {200, sprites};
+    Json::Value args;
+    args["aspects"].append("next_dma");
+    args["aspects"].append("next_ports");
+    args["aspects"].append("next_nextreg");
+    args["aspects"].append("next_copper");
+    args["aspects"].append("next_sprites");
+    mcp::ToolResult result = RunTool(*_registry, "inspect_state", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("[next_copper] restart_loop, pc 2, address 10, 5 word(s) in the list"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("[next_sprites] on, 3 visible, 1 listed, pattern memory 266 non-zero byte(s), COLLISION"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("[next_dma] zxn mode, enabled, a_to_b, A 0x8000 (memory) B 0x00FE (io), burst, counter 4/256, status 0x3B"),
+              std::string::npos)
+        << result.text;
+    EXPECT_NE(result.text.find("[next_ports] enable word 0xFFFFFFDF, 0x006B write -> DMA (zxnDMA) (DISABLED)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("[next_nextreg] NR0x07 CPU Speed = 0x33 (CPU speed 28 MHz)"), std::string::npos) << result.text;
+
+    Json::Value missing;
+    missing["message"] = "not a ZX Spectrum Next";
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/video"] = {404, missing};
+    Json::Value one;
+    one["aspects"].append("next_video");
+    result = RunTool(*_registry, "inspect_state", one, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("[next_video] not a ZX Spectrum Next"), std::string::npos) << result.text;
+}
+
+TEST_F(McpTools_Test, InspectState_SchemaListsTheNextReportAspectsAndParameters)
+{
+    const mcp::ToolDefinition* tool = _registry->Find("inspect_state");
+    ASSERT_NE(tool, nullptr);
+    const Json::Value& schema = tool->inputSchema;
+    std::string aspects;
+    for (const Json::Value& a : schema["properties"]["aspects"]["items"]["enum"])
+        aspects += a.asString() + " ";
+    for (const char* aspect : {"next_dma", "next_video", "next_palette", "next_ports", "next_nextreg", "next_copper", "next_sprites", "next_pixel"})
+        EXPECT_NE(aspects.find(aspect), std::string::npos) << aspect;
+    for (const char* parameter : {"nr_palette", "nr_range", "nr_port", "nr_access", "nr_reg", "nr_changed", "nr_from", "nr_count", "nr_raw", "nr_all", "nr_x", "nr_y", "nr_sx"})
+        EXPECT_TRUE(schema["properties"].isMember(parameter)) << parameter;
 }
 
 // ===========================================================================
@@ -1009,6 +1439,7 @@ TEST_F(McpTools_Test, InspectState_SnapshotAspect_OneRequest)
     snapshot["regs"]["special"]["pc"] = 0x8000;
     snapshot["time"]["frame"] = 100;
     snapshot["time"]["t"] = 1234;
+    snapshot["time"]["frame_t"] = 69888;
     snapshot["disasm"].append(Json::Value(Json::objectValue));
     snapshot["memory"].append(Json::Value(Json::objectValue));
     _caller->routes["GET /api/v1/emulator/emu-1/debug/snapshot?disasm=5&memory=cpu:0x8000:16&memory=ram5:0:8"] = {200, snapshot};
@@ -1024,6 +1455,8 @@ TEST_F(McpTools_Test, InspectState_SnapshotAspect_OneRequest)
     EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/debug/snapshot?disasm=5&memory=cpu:0x8000:16&memory=ram5:0:8"));
     EXPECT_NE(result.text.find("[snapshot] seq 42, paused (read paused), last stop breakpoint, PC=8000"), std::string::npos)
         << result.text;
+    // The frame length and the global time in the text: an agent that sees only the text can time code across frames
+    EXPECT_NE(result.text.find("frame 100 t 1234 of 69888 (global t 6990034)"), std::string::npos) << result.text;
     EXPECT_TRUE(result.structured.isMember("snapshot"));
 }
 
@@ -1452,6 +1885,48 @@ TEST_F(McpTools_Test, InspectState_DeviceAspects_FetchOverviewAndChips)
     EXPECT_NE(result.text.find("A: /tmp/disk.trd track 3 motor on"), std::string::npos) << result.text;
 }
 
+// device_history: read goes to /history/{device}?last=N and answers with the stats line and one line per record;
+// config posts only the fields given
+TEST_F(McpTools_Test, DeviceHistory_ReadAndConfig)
+{
+    Json::Value reply;
+    reply["device"] = "beta128";
+    reply["what"] = "FDC commands";
+    reply["mode"] = "ring";
+    reply["limit"] = 64;
+    reply["written"] = 3;
+    reply["kept"] = 3;
+    reply["dropped"] = 0;
+    Json::Value record;
+    record["name"] = "Seek";
+    record["track"] = 20;
+    reply["records"].append(record);
+    _caller->routes["GET /api/v1/emulator/emu-1/history/beta128?last=5"] = {200, reply};
+    _caller->routes["POST /api/v1/emulator/emu-1/history/beta128/config"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "read";
+    args["device"] = "beta128";
+    args["last"] = 5;
+    mcp::ToolResult result = RunTool(*_registry, "device_history", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("beta128 (FDC commands): ring limit 64, written 3, kept 3, dropped 0"), std::string::npos)
+        << result.text;
+    EXPECT_NE(result.text.find("name=Seek track=20"), std::string::npos) << result.text;
+
+    Json::Value config;
+    config["action"] = "config";
+    config["device"] = "beta128";
+    config["mode"] = "capture";
+    result = RunTool(*_registry, "device_history", config, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("POST", "/api/v1/emulator/emu-1/history/beta128/config"));
+
+    Json::Value missing;
+    missing["action"] = "read";
+    EXPECT_TRUE(RunTool(*_registry, "device_history", missing, *_caller).isError);
+}
+
 TEST_F(McpTools_Test, InspectState_ContentionAspect)
 {
     Json::Value contention;
@@ -1505,6 +1980,40 @@ TEST_F(McpTools_Test, InspectState_DeviceAspect_UnavailableIsReportedNotFatal)
     ASSERT_FALSE(result.isError);
     EXPECT_FALSE(result.structured["audio_fm"]["available"].asBool());
     EXPECT_NE(result.text.find("[audio_fm] TurboSound slot device is not TSFM"), std::string::npos) << result.text;
+}
+
+TEST_F(McpTools_Test, InspectState_DevicesAspect_ListsTheReportsWithTheirAspects)
+{
+    // The device catalog: the text names each report, its summary and the aspect that shows it
+    Json::Value catalog;
+    catalog["available"] = true;
+    Json::Value ay;
+    ay["id"] = "ay";
+    ay["title"] = "AY sound chips";
+    ay["summary"] = "TurboSound FM (2 x YM2203, SSG halves)";
+    ay["mcp"] = "audio_ay";
+    catalog["reports"].append(ay);
+    Json::Value fdc;
+    fdc["id"] = "fdc";
+    fdc["title"] = "Disk controller";
+    fdc["summary"] = "";
+    fdc["mcp"] = "fdc";
+    catalog["reports"].append(fdc);
+    _caller->routes["GET /api/v1/emulator/emu-1/state/devices"] = {200, catalog};
+
+    Json::Value args;
+    Json::Value aspects(Json::arrayValue);
+    aspects.append("devices");
+    args["aspects"] = aspects;
+    mcp::ToolResult result = RunTool(*_registry, "inspect_state", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/state/devices"));
+    EXPECT_EQ(result.structured["devices"]["reports"].size(), 2u);
+    EXPECT_NE(result.text.find("[devices] 2 reports"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("ay: AY sound chips (TurboSound FM (2 x YM2203, SSG halves)), aspect audio_ay"), std::string::npos)
+        << result.text;
+    EXPECT_NE(result.text.find("fdc: Disk controller, aspect fdc"), std::string::npos) << result.text;
 }
 
 TEST_F(McpTools_Test, InspectState_MouseAspect_FetchesMouseStatus)
@@ -1867,6 +2376,70 @@ TEST_F(McpTools_Test, AnalyzePerformance_Vdac2LineBudgetSet_PutsAndValidates)
     EXPECT_TRUE(RunTool(*_registry, "analyze_performance", empty, *_caller).isError);
 }
 
+TEST_F(McpTools_Test, AnalyzePerformance_MemoryCounters_ListsCellsInText)
+{
+    Json::Value reply;
+    reply["space"] = "phys";
+    reply["session_state"] = "capturing";
+    reply["allocated"] = true;
+    reply["totals"]["reads"] = 7;
+    reply["totals"]["writes"] = 0;
+    reply["totals"]["executes"] = 40;
+    reply["matched"] = 2;
+    reply["min"] = 1;
+    reply["kinds"] = "x";
+    Json::Value cell(Json::arrayValue);
+    cell.append(0x15C08);
+    cell.append(7);
+    cell.append(0);
+    cell.append(40);
+    cell.append("ram5");
+    reply["cells"].append(cell);
+    _caller->routes["GET /api/v1/emulator/emu-1/profiler/memory/counters?space=phys&format=top&kinds=x&limit=4"] = {200,
+                                                                                                                   reply};
+
+    Json::Value args;
+    args["action"] = "memory_counters";
+    args["space"] = "phys";
+    args["kinds"] = "x";
+    args["limit"] = 4;
+    mcp::ToolResult result = RunTool(*_registry, "analyze_performance", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("1 cell(s) of 2 at or above min 1 (x)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("0x15C08 (ram5 0x1C08) r=7 w=0 x=40"), std::string::npos) << result.text;
+
+    args["view"] = "heaviest";
+    EXPECT_TRUE(RunTool(*_registry, "analyze_performance", args, *_caller).isError);
+}
+
+TEST_F(McpTools_Test, AnalyzePerformance_MemoryWatch_AddsPortAndRefusesWithoutName)
+{
+    _caller->routes["POST /api/v1/emulator/emu-1/profiler/memory/watches"] = {200, Json::Value(Json::objectValue)};
+
+    Json::Value args;
+    args["action"] = "memory_watch";
+    args["op"] = "add";
+    args["name"] = "kempston";
+    args["port"] = "0x1F";
+    args["mask"] = 255;
+    args["values"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "analyze_performance", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/profiler/memory/watches");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["name"].asString(), "kempston");
+    EXPECT_EQ(call->body["port"].asString(), "0x1F");
+    EXPECT_EQ(call->body["mask"].asString(), "255");
+    EXPECT_TRUE(call->body["values"].asBool());
+
+    Json::Value nameless;
+    nameless["action"] = "memory_watch";
+    nameless["op"] = "remove";
+    EXPECT_TRUE(RunTool(*_registry, "analyze_performance", nameless, *_caller).isError);
+}
+
 TEST_F(McpTools_Test, ManageSymbols_List_GetsLabels)
 {
     _caller->routes["GET /api/v1/emulator/emu-1/labels"] = {200, Json::Value(Json::objectValue)};
@@ -1876,6 +2449,139 @@ TEST_F(McpTools_Test, ManageSymbols_List_GetsLabels)
     RunTool(*_registry, "manage_symbols", args, *_caller);
 
     EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/labels"));
+}
+
+TEST_F(McpTools_Test, ManageSymbols_SetsImportExport_MapToTheSymbolRoutes)
+{
+    for (const char* route : {"GET /api/v1/emulator/emu-1/symbols/sets", "GET /api/v1/emulator/emu-1/symbols/formats",
+                              "PUT /api/v1/emulator/emu-1/symbols/sets", "POST /api/v1/emulator/emu-1/symbols/import",
+                              "POST /api/v1/emulator/emu-1/symbols/export", "DELETE /api/v1/emulator/emu-1/symbols/sets?id=file%3A%2Fx%2Fa.sym"})
+        _caller->routes[route] = {200, Json::Value(Json::objectValue)};
+
+    Json::Value args;
+    args["action"] = "sets";
+    RunTool(*_registry, "manage_symbols", args, *_caller);
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/symbols/sets"));
+
+    Json::Value import;
+    import["action"] = "import";
+    import["path"] = "/x/a.sym";
+    import["set"] = "game";
+    import["policy"] = "replace";
+    RunTool(*_registry, "manage_symbols", import, *_caller);
+    const auto* call = _caller->Last("POST", "/api/v1/emulator/emu-1/symbols/import");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["set"].asString(), "game");
+    EXPECT_EQ(call->body["policy"].asString(), "replace");
+
+    Json::Value change;
+    change["action"] = "set_enable";
+    change["id"] = "file:/x/a.sym";
+    change["enabled"] = false;
+    RunTool(*_registry, "manage_symbols", change, *_caller);
+    call = _caller->Last("PUT", "/api/v1/emulator/emu-1/symbols/sets");
+    ASSERT_NE(call, nullptr);
+    EXPECT_FALSE(call->body["enabled"].asBool());
+
+    Json::Value drop;
+    drop["action"] = "drop";
+    drop["id"] = "file:/x/a.sym";
+    RunTool(*_registry, "manage_symbols", drop, *_caller);
+    EXPECT_TRUE(_caller->Saw("DELETE", "/api/v1/emulator/emu-1/symbols/sets?id=file%3A%2Fx%2Fa.sym"));
+
+    _caller->routes["POST /api/v1/emulator/emu-1/symbols/import/source"] = {200, Json::Value(Json::objectValue)};
+    Json::Value fromSource;
+    fromSource["action"] = "import_source";
+    fromSource["path"] = "disk:A/GAME.H";
+    fromSource["main"] = "GAME";
+    RunTool(*_registry, "manage_symbols", fromSource, *_caller);
+    call = _caller->Last("POST", "/api/v1/emulator/emu-1/symbols/import/source");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["main"].asString(), "GAME");
+
+    Json::Value missing;
+    missing["action"] = "export";
+    EXPECT_TRUE(RunTool(*_registry, "manage_symbols", missing, *_caller).isError);
+}
+
+TEST_F(McpTools_Test, AsmSource_ActionsMapToTheAsmRoutes)
+{
+    for (const char* route : {"GET /api/v1/asm/formats", "GET /api/v1/emulator/emu-1/asm/files?drive=B", "POST /api/v1/emulator/emu-1/asm/convert"})
+        _caller->routes[route] = {200, Json::Value(Json::objectValue)};
+
+    Json::Value formats;
+    formats["action"] = "formats";
+    RunTool(*_registry, "asm_source", formats, *_caller);
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/asm/formats"));
+
+    Json::Value files;
+    files["action"] = "files";
+    files["drive"] = "B";
+    RunTool(*_registry, "asm_source", files, *_caller);
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/asm/files?drive=B"));
+
+    Json::Value convert;
+    convert["action"] = "convert";
+    convert["path"] = "disk:A/GAME.H";
+    convert["to"] = "sjasmplus";
+    convert["z80n"] = true;
+    RunTool(*_registry, "asm_source", convert, *_caller);
+    const auto* call = _caller->Last("POST", "/api/v1/emulator/emu-1/asm/convert");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["path"].asString(), "disk:A/GAME.H");
+    EXPECT_EQ(call->body["to"].asString(), "sjasmplus");
+    EXPECT_EQ(call->body["z80n"].asString(), "true");
+
+    Json::Value bad;
+    bad["action"] = "assemble";
+    EXPECT_TRUE(RunTool(*_registry, "asm_source", bad, *_caller).isError);
+}
+
+TEST_F(McpTools_Test, AsmSource_SyncActionsMapToTheSyncRoutes)
+{
+    for (const char* route : {"GET /api/v1/emulator/emu-1/asm/sync?assembler=tasm-4.12", "POST /api/v1/emulator/emu-1/asm/sync/probe",
+                              "POST /api/v1/emulator/emu-1/asm/sync/extract"})
+        _caller->routes[route] = {200, Json::Value(Json::objectValue)};
+
+    Json::Value status;
+    status["action"] = "sync_status";
+    status["assembler"] = "tasm-4.12";
+    RunTool(*_registry, "asm_source", status, *_caller);
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/asm/sync?assembler=tasm-4.12"));
+
+    Json::Value probe;
+    probe["action"] = "sync_probe";
+    RunTool(*_registry, "asm_source", probe, *_caller);
+    EXPECT_TRUE(_caller->Saw("POST", "/api/v1/emulator/emu-1/asm/sync/probe"));
+
+    Json::Value extract;
+    extract["action"] = "sync_extract";
+    extract["as"] = "dialect";
+    extract["to"] = "sjasmplus";
+    RunTool(*_registry, "asm_source", extract, *_caller);
+    const auto* call = _caller->Last("POST", "/api/v1/emulator/emu-1/asm/sync/extract");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["as"].asString(), "dialect");
+    EXPECT_EQ(call->body["to"].asString(), "sjasmplus");
+
+    for (const char* route : {"POST /api/v1/emulator/emu-1/asm/sync/watch", "DELETE /api/v1/emulator/emu-1/asm/sync/watch",
+                              "GET /api/v1/emulator/emu-1/asm/sync/hints"})
+        _caller->routes[route] = {200, Json::Value(Json::objectValue)};
+    Json::Value watch;
+    watch["action"] = "sync_watch";
+    watch["interval"] = 100;
+    RunTool(*_registry, "asm_source", watch, *_caller);
+    call = _caller->Last("POST", "/api/v1/emulator/emu-1/asm/sync/watch");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["interval"].asString(), "100");
+    Json::Value hints;
+    hints["action"] = "sync_hints";
+    RunTool(*_registry, "asm_source", hints, *_caller);
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/asm/sync/hints"));
+    Json::Value unwatch;
+    unwatch["action"] = "sync_unwatch";
+    RunTool(*_registry, "asm_source", unwatch, *_caller);
+    EXPECT_TRUE(_caller->Saw("DELETE", "/api/v1/emulator/emu-1/asm/sync/watch"));
 }
 
 TEST_F(McpTools_Test, CaptureMedia_ScreenDigest_GetsDigestEndpoint)
@@ -2212,6 +2918,314 @@ TEST_F(McpTools_Test, CaptureMedia_TemporalSet_RejectsMissingAlgorithmAndReports
     EXPECT_NE(unknown.text.find("HTTP 400"), std::string::npos) << unknown.text;
 }
 
+TEST_F(McpTools_Test, CaptureMedia_WindowDisplay_GetsAndPutsTheWindowRoute)
+{
+    Json::Value settings;
+    settings["backend"] = "gpu";
+    settings["gpu_available"] = true;
+    settings["gpu"] = true;
+    settings["crt"] = true;
+    settings["crt_profile"] = "crt-lottes";
+    for (const char* name : {"none", "basic", "crt-lottes", "shader:crt-royale"})
+        settings["crt_profiles"].append(name);
+    settings["blending"] = false;
+    settings["blending_frames"] = 3;
+    settings["blending_weights"] = "exponential";
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+    _caller->routes["PUT /api/v1/emulator/emu-1/video/window"] = {200, settings};
+
+    Json::Value args;
+    args["action"] = "window_display";
+    mcp::ToolResult read = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(read.isError) << read.text;
+    EXPECT_NE(read.text.find("window gpu on (available), crt crt-lottes, blending off (3 frames, exponential)"),
+              std::string::npos)
+        << read.text;
+    // the words for crt_profile are in the text: an agent may see nothing else
+    EXPECT_NE(read.text.find("crt_profiles: none basic crt-lottes shader:crt-royale"), std::string::npos) << read.text;
+
+    // CRT off still names the chosen profile (switching CRT on shows it)
+    settings["crt"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+    mcp::ToolResult off = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(off.isError) << off.text;
+    EXPECT_NE(off.text.find("crt off (profile crt-lottes)"), std::string::npos) << off.text;
+
+    args["action"] = "window_display_set";
+    args["display"]["crt_profile"] = "crt-lottes";
+    args["display"]["gpu"] = true;
+    mcp::ToolResult set = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(set.isError) << set.text;
+    const auto* call = _caller->Last("PUT", "/api/v1/emulator/emu-1/video/window");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["crt_profile"].asString(), "crt-lottes");
+    EXPECT_TRUE(call->body["gpu"].asBool());
+    EXPECT_EQ(set.structured["crt_profile"].asString(), "crt-lottes");
+}
+
+TEST_F(McpTools_Test, CaptureMedia_WindowDisplay_TextNamesTheNewSettingsAndTheirWords)
+{
+    Json::Value settings;
+    settings["gpu"] = false;
+    settings["crt_profile"] = "none";
+    settings["blending_weights"] = "exponential";
+    settings["blending_decay"] = 0.3;
+    settings["fullscreen"] = false;
+    settings["scale"] = 3;
+    settings["hud"] = true;
+    settings["hud_theme"] = "retro_zx";
+    for (const char* name : {"dark_glass", "retro_zx"})
+        settings["hud_themes"].append(name);
+    settings["hud_notices"]["ram-page"] = false;
+    settings["hud_notices"]["tape-events"] = true;
+    settings["osd_keyboard"] = true;
+    settings["osd_keyboard_picture"] = "pentagon";
+    settings["osd_keyboard_pictures"].append("pentagon");
+    settings["osd_keyboard_style"] = "hybrid";
+    for (const char* name : {"photo", "schematic", "hybrid"})
+        settings["osd_keyboard_styles"].append(name);
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+
+    Json::Value args;
+    args["action"] = "window_display";
+    mcp::ToolResult read = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(read.isError) << read.text;
+    for (const char* part : {"decay 0.3", "scale 3x", "hud on (theme retro_zx)", "keyboard on (pentagon, hybrid)",
+                             "hud_themes: dark_glass retro_zx", "osd_keyboard_pictures: pentagon",
+                             "osd_keyboard_styles: photo schematic hybrid",
+                             "hud_notices (off): ram-page"})
+        EXPECT_NE(read.text.find(part), std::string::npos) << part << " in " << read.text;
+}
+
+/// The present report's timing and GPU times are in the text: an agent may see nothing else
+TEST_F(McpTools_Test, CaptureMedia_WindowDisplay_TextNamesThePresentTiming)
+{
+    Json::Value settings;
+    settings["gpu"] = true;
+    Json::Value& present = settings["present"];
+    present["presenter"] = "metal";
+    present["refresh_hz"]["max"] = 60.0;
+    present["clock"] = "audio";
+    present["timing"]["delay_clamped"] = true;
+    present["timing"]["max_delay_ms"] = 184.32;
+    present["timing"]["clamped_frames"] = 1200;
+    present["timing"]["early"] = 3;
+    present["timing"]["carried"] = 2;
+    present["timing"]["cuts"] = 1;
+    present["gpu_ms"]["smooth"]["p50"] = 0.4123;
+    present["gpu_ms"]["smooth"]["max"] = 1.25;
+    present["gpu_ms"]["smooth"]["measured"] = 600;
+    present["gpu_ms"]["smooth_cpu"]["p50"] = 3.1;
+    present["gpu_ms"]["smooth_cpu"]["max"] = 9.5;
+    present["gpu_ms"]["smooth_cpu"]["measured"] = 600;
+    present["gpu_ms"]["picture"]["measured"] = 0;
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+
+    Json::Value args;
+    args["action"] = "window_display";
+    mcp::ToolResult read = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(read.isError) << read.text;
+    for (const char* part : {"clock audio", "video delay held at 184.3 ms: the sound comes later, the picture leads it (1200 frames)",
+                             "3 refreshes before any frame was due, 2 clock steps carried, 1 cuts",
+                             "gpu smooth p50 0.41 max 1.25 ms", "smooth refresh (CPU clock) p50 3.1 max 9.5 ms"})
+        EXPECT_NE(read.text.find(part), std::string::npos) << part << " in " << read.text;
+    EXPECT_EQ(read.text.find("gpu picture"), std::string::npos) << "a pass never measured is left out: " << read.text;
+
+    // In reach: no clamp named
+    settings["present"]["timing"]["delay_clamped"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+    mcp::ToolResult fits = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(fits.isError) << fits.text;
+    EXPECT_EQ(fits.text.find("video delay held"), std::string::npos) << fits.text;
+}
+
+TEST_F(McpTools_Test, CaptureMedia_WindowDisplay_TextNamesTheVrrSupport)
+{
+    Json::Value settings;
+    settings["gpu"] = true;
+    Json::Value& present = settings["present"];
+    present["presenter"] = "gl-timed";
+    present["refresh_hz"]["max"] = 60.0;
+    present["vrr"] = false;
+    present["vrr_support"]["state"] = "unknown";
+    present["vrr_support"]["reason"] = "Wayland: the compositor decides";
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+
+    Json::Value args;
+    args["action"] = "window_display";
+    mcp::ToolResult read = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(read.isError) << read.text;
+    for (const char* part : {"on the refresh grid (vsync)", "VRR support unknown (Wayland: the compositor decides)"})
+        EXPECT_NE(read.text.find(part), std::string::npos) << part << " in " << read.text;
+
+    // A display that can follow the frames needs no word
+    settings["present"]["vrr"] = true;
+    settings["present"]["vrr_support"]["state"] = "yes";
+    settings["present"]["vrr_support"]["reason"] = "";
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window"] = {200, settings};
+    mcp::ToolResult yes = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(yes.isError) << yes.text;
+    EXPECT_NE(yes.text.find("each frame at its time (vrr)"), std::string::npos) << yes.text;
+    EXPECT_EQ(yes.text.find("VRR support"), std::string::npos) << yes.text;
+}
+
+TEST_F(McpTools_Test, CaptureMedia_CrtParamsAndViewport_UseTheirRoutes)
+{
+    Json::Value params;
+    params["profile"] = "basic";
+    params["kind"] = "profile";
+    Json::Value curvature;
+    curvature["name"] = "curvature";
+    curvature["value"] = 0.02;
+    curvature["minimum"] = 0.0;
+    curvature["maximum"] = 0.5;
+    curvature["step"] = 0.01;
+    params["parameters"].append(curvature);
+    _caller->routes["GET /api/v1/emulator/emu-1/video/window/crt_params"] = {200, params};
+    _caller->routes["PUT /api/v1/emulator/emu-1/video/window/crt_params"] = {200, params};
+
+    Json::Value args;
+    args["action"] = "window_crt_params";
+    mcp::ToolResult read = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(read.isError) << read.text;
+    EXPECT_NE(read.text.find("curvature = 0.02 (0..0.5, step 0.01)"), std::string::npos) << read.text;
+
+    args["action"] = "window_crt_params_set";
+    mcp::ToolResult missing = RunTool(*_registry, "capture_media", args, *_caller);
+    EXPECT_TRUE(missing.isError) << "needs crt_params";
+    args["crt_params"]["steps"]["curvature"] = 2;
+    mcp::ToolResult set = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(set.isError) << set.text;
+    const auto* call = _caller->Last("PUT", "/api/v1/emulator/emu-1/video/window/crt_params");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["steps"]["curvature"].asInt(), 2);
+
+    Json::Value viewport;
+    viewport["overscan"] = true;
+    viewport["viewport"] = "standard";
+    viewport["display"] = "352x288";
+    viewport["framebuffer"] = "384x304";
+    _caller->routes["PUT /api/v1/emulator/emu-1/video/viewport"] = {200, viewport};
+    Json::Value crop;
+    crop["action"] = "viewport_set";
+    crop["viewport"] = "standard";
+    mcp::ToolResult cropped = RunTool(*_registry, "capture_media", crop, *_caller);
+    ASSERT_FALSE(cropped.isError) << cropped.text;
+    EXPECT_NE(cropped.text.find("overscan on, viewport standard (352x288 of 384x304)"), std::string::npos)
+        << cropped.text;
+    EXPECT_EQ(_caller->Last("PUT", "/api/v1/emulator/emu-1/video/viewport")->body["viewport"].asString(), "standard");
+}
+
+TEST_F(McpTools_Test, CaptureMedia_WindowDisplaySet_NeedsDisplayAndReportsNoWindow)
+{
+    Json::Value args;
+    args["action"] = "window_display_set";
+    mcp::ToolResult missing = RunTool(*_registry, "capture_media", args, *_caller);
+    EXPECT_TRUE(missing.isError);
+    EXPECT_FALSE(_caller->Saw("PUT", "/api/v1/emulator/emu-1/video/window"));
+
+    Json::Value error;
+    error["error"] = "No window: the display settings exist only in the GUI (unreal-qt)";
+    error["kind"] = "no-window";
+    _caller->routes["PUT /api/v1/emulator/emu-1/video/window"] = {409, error};
+    args["display"]["crt"] = true;
+    mcp::ToolResult headless = RunTool(*_registry, "capture_media", args, *_caller);
+    EXPECT_TRUE(headless.isError);
+    EXPECT_NE(headless.text.find("HTTP 409"), std::string::npos) << headless.text;
+    EXPECT_NE(headless.text.find("only in the GUI"), std::string::npos) << headless.text;
+}
+
+TEST_F(McpTools_Test, CaptureMedia_WindowRecord_StartsRunsFramesAndStops)
+{
+    Json::Value status;
+    status["recording"] = true;
+    status["path"] = "/tmp/demo.mov";
+    status["keyboard"] = "pentagon2plus";
+    status["frames"] = 0;
+    status["width"] = 3840;
+    status["height"] = 2160;
+    status["fps"] = 48.828125;
+    status["audio"] = true;
+    status["sample_rate"] = 44100;
+    _caller->routes["POST /api/v1/emulator/emu-1/video/window/record"] = {200, status};
+    status["frames"] = 50;
+    status["ran"] = 50;
+    _caller->routes["POST /api/v1/emulator/emu-1/video/window/record/frames"] = {200, status};
+    status["recording"] = false;
+    _caller->routes["POST /api/v1/emulator/emu-1/video/window/record/stop"] = {200, status};
+
+    Json::Value args;
+    args["action"] = "window_record_start";
+    args["filename"] = "/tmp/demo.mov";
+    args["keyboard"] = "pentagon2plus";
+    args["picture_height"] = 1080;
+    args["hardware"] = true;
+    args["fit"] = true;
+    args["scale"] = 2;
+    args["width"] = 3840;
+    args["height"] = 2160;
+    args["layout"] = "side";
+    args["audio"] = "aac";
+    mcp::ToolResult start = RunTool(*_registry, "capture_media", args, *_caller);
+    ASSERT_FALSE(start.isError) << start.text;
+    const auto* call = _caller->Last("POST", "/api/v1/emulator/emu-1/video/window/record");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["path"].asString(), "/tmp/demo.mov");
+    EXPECT_EQ(call->body["keyboard"].asString(), "pentagon2plus");
+    EXPECT_EQ(call->body["picture_height"].asInt(), 1080);
+    EXPECT_TRUE(call->body["hardware"].asBool());
+    EXPECT_TRUE(call->body["fit"].asBool());
+    EXPECT_EQ(call->body["layout"].asString(), "side");
+    EXPECT_TRUE(call->body["audio"].asBool()) << "a codec word means a sound track";
+    // the text alone tells an agent the file, its size, the keyboard and what to do next
+    EXPECT_NE(start.text.find("window recording to /tmp/demo.mov: 3840x2160 at 48.828 fps, sound 44100 Hz, 0 frames, keyboard pentagon2plus"),
+              std::string::npos)
+        << start.text;
+    EXPECT_NE(start.text.find("window_record_frames"), std::string::npos) << start.text;
+
+    Json::Value frames;
+    frames["action"] = "window_record_frames";
+    mcp::ToolResult missing = RunTool(*_registry, "capture_media", frames, *_caller);
+    EXPECT_TRUE(missing.isError);
+    frames["frames"] = 50;
+    mcp::ToolResult ran = RunTool(*_registry, "capture_media", frames, *_caller);
+    ASSERT_FALSE(ran.isError) << ran.text;
+    EXPECT_EQ(_caller->Last("POST", "/api/v1/emulator/emu-1/video/window/record/frames")->body["frames"].asInt(), 50);
+    EXPECT_NE(ran.text.find("ran 50 frames, window recording to /tmp/demo.mov: 3840x2160 at 48.828 fps, sound 44100 Hz, 50 frames"), std::string::npos)
+        << ran.text;
+
+    Json::Value stop;
+    stop["action"] = "window_record_stop";
+    mcp::ToolResult stopped = RunTool(*_registry, "capture_media", stop, *_caller);
+    ASSERT_FALSE(stopped.isError) << stopped.text;
+    EXPECT_NE(stopped.text.find("window recording off, last /tmp/demo.mov"), std::string::npos) << stopped.text;
+
+    args["audio"] = "none";
+    RunTool(*_registry, "capture_media", args, *_caller);
+    EXPECT_FALSE(_caller->Last("POST", "/api/v1/emulator/emu-1/video/window/record")->body["audio"].asBool());
+}
+
+TEST_F(McpTools_Test, CaptureMedia_WindowRecord_NeedsAFileAndReportsErrors)
+{
+    Json::Value args;
+    args["action"] = "window_record_start";
+    mcp::ToolResult missing = RunTool(*_registry, "capture_media", args, *_caller);
+    EXPECT_TRUE(missing.isError);
+    EXPECT_FALSE(_caller->Saw("POST", "/api/v1/emulator/emu-1/video/window/record"));
+
+    Json::Value error;
+    error["error"] = "Pause the machine first: it runs frame by frame here";
+    error["kind"] = "not-paused";
+    _caller->routes["POST /api/v1/emulator/emu-1/video/window/record/frames"] = {409, error};
+    Json::Value frames;
+    frames["action"] = "window_record_frames";
+    frames["frames"] = 10;
+    mcp::ToolResult running = RunTool(*_registry, "capture_media", frames, *_caller);
+    EXPECT_TRUE(running.isError);
+    EXPECT_NE(running.text.find("HTTP 409"), std::string::npos) << running.text;
+    EXPECT_NE(running.text.find("Pause the machine first"), std::string::npos) << running.text;
+}
+
 // ===========================================================================
 // time_travel (TD-4 — agent bookmarks)
 // ===========================================================================
@@ -2291,7 +3305,9 @@ TEST_F(McpTools_Test, TimeTravel_BookmarkList_FormatsEntriesAndBarrierNote)
     body["count"] = 2;
     body["bookmarks"].append(bm1);
     body["bookmarks"].append(bm2);
-    _caller->routes["GET /api/v1/emulator/emu-1/ttd/bookmarks"] = {200, body};
+    // The lines are the server's (text=true): the MCP text passes them on with the advisory note
+    body["text"] = "2 bookmark(s):\n'boot' f5+0\n'umt entry' f9+300 [unpack]: PC #8000 di - the unpacker starts\n";
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/bookmarks?text=true"] = {200, body};
 
     Json::Value args;
     args["action"] = "bookmark_list";
@@ -2301,9 +3317,58 @@ TEST_F(McpTools_Test, TimeTravel_BookmarkList_FormatsEntriesAndBarrierNote)
     EXPECT_NE(result.text.find("2 bookmark(s)"), std::string::npos);
     EXPECT_NE(result.text.find("'boot'"), std::string::npos);
     EXPECT_NE(result.text.find("'umt entry'"), std::string::npos);
-    EXPECT_NE(result.text.find("t=300"), std::string::npos);
+    EXPECT_NE(result.text.find("the unpacker starts"), std::string::npos);
+    EXPECT_EQ(result.structured["bookmarks"].size(), 2u);
     // The advisory contract is part of the tool's own output.
     EXPECT_NE(result.text.find("never a replay barrier"), std::string::npos);
+}
+
+TEST_F(McpTools_Test, TimeTravel_BookmarkNote_PutsTheEditToTheLabel)
+{
+    Json::Value reply;
+    reply["updated"] = true;
+    reply["text"] = "Bookmark 'umt entry' f9+300 [unpack]: PC #8000 di - starts\nthen jumps";
+    _caller->routes["PUT /api/v1/emulator/emu-1/ttd/bookmarks/umt%20entry"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "bookmark_note";
+    args["label"] = "umt entry";
+    args["note"] = "then jumps";
+    args["append"] = true;
+    args["add_tags"].append("unpack");
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("then jumps"), std::string::npos);
+    ASSERT_FALSE(_caller->calls.empty());
+    EXPECT_EQ(_caller->calls.back().path, "/api/v1/emulator/emu-1/ttd/bookmarks/umt%20entry");
+    EXPECT_EQ(_caller->calls.back().body["note"].asString(), "then jumps");
+    EXPECT_TRUE(_caller->calls.back().body["append"].asBool());
+    EXPECT_EQ(_caller->calls.back().body["add_tags"][0].asString(), "unpack");
+    EXPECT_FALSE(_caller->calls.back().body.isMember("label")) << "the label is in the path";
+}
+
+TEST_F(McpTools_Test, TimeTravel_BookmarkExport_ReturnsTheTextAndTheFile)
+{
+    Json::Value reply;
+    reply["format"] = "markdown";
+    reply["count"] = 1;
+    reply["text"] = "## Game\n\n### boot (`f5+0`)\n";
+    reply["path"] = "/tmp/w.md";
+    reply["bytes"] = 30;
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/export-bookmarks"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "bookmark_export";
+    args["format"] = "markdown";
+    args["title"] = "Game";
+    args["path"] = "/tmp/w.md";
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("### boot"), std::string::npos);
+    EXPECT_NE(result.text.find("written to /tmp/w.md, 30 bytes"), std::string::npos);
+    EXPECT_EQ(_caller->calls.back().body["title"].asString(), "Game");
 }
 
 TEST_F(McpTools_Test, TimeTravel_BookmarkDelete_UrlEncodesLabelInPath)
@@ -2333,6 +3398,239 @@ TEST_F(McpTools_Test, TimeTravel_SeekBookmark_PostsBookmarkField)
     ASSERT_NE(call, nullptr);
     EXPECT_EQ(call->body["bookmark"].asString(), "umt entry");
     EXPECT_FALSE(call->body.isMember("frame"));
+}
+
+// ===========================================================================
+// time_travel (TTD branches)
+// ===========================================================================
+
+namespace
+{
+Json::Value BranchRow(uint64_t id, const std::string& name, bool active)
+{
+    Json::Value b;
+    b["id"] = static_cast<Json::UInt64>(id);
+    b["guid"] = "00000000-0000-0000-0000-00000000000" + std::to_string(id % 10);
+    b["name"] = name;
+    b["parent"] = id == 0 ? Json::Value() : Json::Value(0);
+    if (id != 0)
+    {
+        b["fork"]["frame"] = 108;
+        b["fork"]["tinframe"] = 0;
+    }
+    else
+    {
+        b["fork"] = Json::Value();
+    }
+    b["end"]["frame"] = 120;
+    b["end"]["tinframe"] = 0;
+    b["length"] = 12;
+    b["created_by"] = "user";
+    b["tags"] = Json::Value(Json::arrayValue);
+    b["note"] = "";
+    b["pinned"] = false;
+    b["active"] = active;
+    return b;
+}
+}  // namespace
+
+TEST_F(McpTools_Test, TimeTravel_BranchList_NamesTheActiveBranchAndTheLineage)
+{
+    Json::Value body;
+    body["branches"].append(BranchRow(0, "trunk", true));
+    body["branches"].append(BranchRow(1, "resume 1", false));
+    body["branches"][1]["tags"].append("boss");
+    body["branches"][1]["pinned"] = true;
+    body["total"] = 2;
+    body["count"] = 2;
+    body["active"] = 0;
+    body["viewed"] = 0;
+    body["lineage"][0]["branch"] = 0;
+    body["lineage"][0]["from"]["frame"] = 100;
+    body["lineage"][0]["from"]["tinframe"] = 0;
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/branches?tag=boss"] = {200, body};
+
+    Json::Value args;
+    args["action"] = "branch_list";
+    args["tag"] = "boss";
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("2 branch(es) on emu-1, active 'trunk'"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("* 'trunk' (id 0)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("'resume 1' (id 1) - 12 frames, forked at frame 108"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("[boss] pinned"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("Lineage: 'trunk'"), std::string::npos) << result.text;
+    EXPECT_EQ(result.structured["branches"].size(), 2u);
+}
+
+TEST_F(McpTools_Test, TimeTravel_BranchList_SummarisesPastTwentyRows)
+{
+    // An agent may see only the text: 30 rows become 20 lines and a count of the rest
+    Json::Value body;
+    for (uint64_t i = 0; i < 30; i++)
+        body["branches"].append(BranchRow(i, i == 0 ? "trunk" : "resume " + std::to_string(i), i == 0));
+    body["total"] = 30;
+    body["count"] = 30;
+    body["active"] = 0;
+    body["viewed"] = 0;
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/branches"] = {200, body};
+
+    Json::Value args;
+    args["action"] = "branch_list";
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("'resume 19' (id 19)"), std::string::npos) << result.text;
+    EXPECT_EQ(result.text.find("'resume 20' (id 20)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("... 10 more in the structured result"), std::string::npos) << result.text;
+    EXPECT_EQ(result.structured["branches"].size(), 30u);
+}
+
+TEST_F(McpTools_Test, TimeTravel_BranchList_WithoutBranchesSaysTheHistoryIsOneLine)
+{
+    Json::Value body;
+    body["branches"] = Json::Value(Json::arrayValue);
+    body["total"] = 0;
+    body["count"] = 1;
+    body["active"] = 0;
+    body["viewed"] = 0;
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/branches"] = {200, body};
+
+    Json::Value args;
+    args["action"] = "branch_list";
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("No branches on emu-1"), std::string::npos) << result.text;
+}
+
+TEST_F(McpTools_Test, TimeTravel_BranchSwitch_PostsTheMomentAndNamesTheBranch)
+{
+    Json::Value reply;
+    reply["switched"] = true;
+    reply["branch"] = BranchRow(1, "resume 1", true);
+    reply["state"] = "detached";
+    reply["text"] = "Switched to branch 'resume 1' at frame 115\n";
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/branches/resume%201/switch"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "branch_switch";
+    args["branch"] = "resume 1";
+    args["frame"] = 115;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("Switched to branch 'resume 1' at frame 115 on emu-1"), std::string::npos) << result.text;
+    const FakeApiCaller::RecordedCall* call =
+        _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/branches/resume%201/switch");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["frame"].asUInt(), 115u);
+    EXPECT_FALSE(call->body.isMember("branch")) << "the branch is in the path";
+}
+
+TEST_F(McpTools_Test, TimeTravel_BranchUpdate_PatchesNameTagsAndPin)
+{
+    Json::Value reply;
+    reply["updated"] = true;
+    reply["branch"] = BranchRow(1, "boss fight", false);
+    reply["branch"]["pinned"] = true;
+    _caller->routes["PATCH /api/v1/emulator/emu-1/ttd/branches/1"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "branch_update";
+    args["branch"] = 1;
+    args["rename"] = "boss fight";
+    args["pinned"] = true;
+    args["add_tags"].append("boss");
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("'boss fight' (id 1)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("pinned"), std::string::npos) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("PATCH", "/api/v1/emulator/emu-1/ttd/branches/1");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["name"].asString(), "boss fight") << "rename is the branch's name";
+    EXPECT_TRUE(call->body["pinned"].asBool());
+    EXPECT_EQ(call->body["add_tags"][0].asString(), "boss");
+}
+
+TEST_F(McpTools_Test, TimeTravel_BranchDelete_ForceInTheQueryAndNamesWhatWent)
+{
+    Json::Value reply;
+    reply["deleted"] = true;
+    reply["removed"].append(1);
+    reply["removed"].append(2);
+    reply["removed_names"].append("resume 1");
+    reply["removed_names"].append("resume 2");
+    reply["text"] = "Deleted 'resume 1', 'resume 2'\n";
+    _caller->routes["DELETE /api/v1/emulator/emu-1/ttd/branches/resume%201?force=true"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "branch_delete";
+    args["branch"] = "resume 1";
+    args["force"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("Deleted 'resume 1', 'resume 2' on emu-1 (2 branches removed)"), std::string::npos)
+        << result.text;
+}
+
+TEST_F(McpTools_Test, TimeTravel_BranchActions_WithoutBranchRejectBeforeAnyCall)
+{
+    for (const char* action : {"branch_switch", "branch_update", "branch_delete"})
+    {
+        Json::Value args;
+        args["action"] = action;
+        mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+        EXPECT_TRUE(result.isError) << action;
+        EXPECT_NE(result.text.find("requires 'branch'"), std::string::npos) << result.text;
+    }
+    EXPECT_TRUE(_caller->calls.empty());
+}
+
+TEST_F(McpTools_Test, TimeTravel_DumpLineage_PostsTheFlag)
+{
+    Json::Value dumped;
+    dumped["ok"] = true;
+    dumped["path"] = "/tmp/s.ttd";
+    dumped["bytes"] = 4096;
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/dump"] = {200, dumped};
+
+    Json::Value args;
+    args["action"] = "dump";
+    args["path"] = "/tmp/s.ttd";
+    args["lineage"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("the active lineage only"), std::string::npos) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/dump");
+    ASSERT_NE(call, nullptr);
+    EXPECT_TRUE(call->body["lineage"].asBool());
+}
+
+TEST_F(McpTools_Test, TimeTravel_Status_NamesTheActiveBranch)
+{
+    Json::Value status;
+    status["ttd_available"] = true;
+    status["state"] = "detached";
+    status["checkpoint_count"] = 3;
+    status["branch"]["id"] = 1;
+    status["branch"]["name"] = "resume 1";
+    status["viewed_branch"]["id"] = 0;
+    status["viewed_branch"]["name"] = "trunk";
+    status["branch_count"] = 2;
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/status"] = {200, status};
+
+    Json::Value args;
+    args["action"] = "status";
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("on branch 'resume 1' (2 branches, the current moment on 'trunk')"), std::string::npos)
+        << result.text;
 }
 
 // ===========================================================================
@@ -2380,6 +3678,79 @@ TEST_F(McpTools_Test, TimeTravel_Start_PostsJournalAndReportsIt)
     EXPECT_TRUE(call->body["journal"].asBool());
     EXPECT_NE(result.text.find("recording started"), std::string::npos) << result.text;
     EXPECT_NE(result.text.find("write journal on"), std::string::npos) << result.text;
+}
+
+/// probe_frames posts the probes as given and lists every probe's frames in the text (a condition error too); no
+/// probes is refused before any call
+TEST_F(McpTools_Test, TimeTravel_ProbeFrames_PostsTheProbesAndListsTheFrames)
+{
+    Json::Value reply;
+    reply["from_frame"] = 2;
+    reply["to_frame"] = 40;
+    reply["replayed_frames"] = 30;
+    reply["pruned_frames"] = 9;
+    reply["truncated"] = true;
+    reply["next_from_frame"] = 41;
+    reply["barrier_frames"].append(12);
+    reply["blocked_by_marker"]["kind"] = "tape_control";
+    reply["blocked_by_marker"]["reason"] = "tape play";
+    reply["blocked_by_marker"]["frame"] = 12;
+    reply["blocked_by_marker"]["tinframe"] = 100;
+    Json::Value shot;
+    shot["probe"] = "exec";
+    shot["address"] = "0x8A14";
+    shot["page"] = 3;
+    shot["frame_count"] = 4;
+    shot["hit_count"] = 5;
+    shot["truncated"] = false;
+    for (int f : {3, 4, 5, 20})
+        shot["frames"].append(f);
+    for (int h : {1, 2, 1, 1})
+        shot["hits"].append(h);
+    reply["probes"].append(shot);
+    Json::Value died;
+    died["probe"] = "write";
+    died["address"] = "0x5F20";
+    died["if"] = "VAL ==";
+    died["error"] = "expected an operand";
+    died["frame_count"] = 0;
+    died["hit_count"] = 0;
+    died["frames"] = Json::Value(Json::arrayValue);
+    died["hits"] = Json::Value(Json::arrayValue);
+    died["truncated"] = false;
+    reply["probes"].append(died);
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/probe-frames"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "probe_frames";
+    Json::Value probe;
+    probe["probe"] = "exec";
+    probe["address"] = "0x8A14";
+    probe["page"] = 3;
+    args["probes"].append(probe);
+    args["from_frame"] = 2;
+    args["limit"] = 4;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/probe-frames");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["probes"][0]["address"].asString(), "0x8A14");
+    EXPECT_EQ(call->body["probes"][0]["page"].asUInt(), 3u);
+    EXPECT_EQ(call->body["from_frame"].asUInt64(), 2u);
+    EXPECT_EQ(call->body["limit"].asUInt(), 4u);
+    EXPECT_NE(result.text.find("Frames 2..40: 30 replayed, 9 ruled out"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("exec 0x8A14 page 3: 4 frame(s), 5 hit(s); frames 3-5, 20"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("write 0x5F20 if VAL ==: not armed - expected an operand"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("Not searched: 1 frame(s)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("from_frame=41"), std::string::npos) << result.text;
+
+    const size_t before = _caller->calls.size();
+    args = Json::Value();
+    args["action"] = "probe_frames";
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    EXPECT_TRUE(result.isError);
+    EXPECT_NE(result.text.find("requires 'probes'"), std::string::npos) << result.text;
+    EXPECT_EQ(_caller->calls.size(), before);
 }
 
 TEST_F(McpTools_Test, TimeTravel_JournalOnAndBuild_PostAndSummarizeTheSpans)
@@ -2612,6 +3983,28 @@ TEST_F(McpTools_Test, TimeTravel_ReverseStep_NeedsExactlyOneUnit)
     EXPECT_FALSE(call->body.isMember("tstates"));
 }
 
+TEST_F(McpTools_Test, TimeTravel_ReverseStepOver_PostsTheVerbAndSaysWhatItDid)
+{
+    Json::Value reply;
+    reply["stepped"] = true;
+    reply["over_call"] = true;
+    reply["skipped"] = 6;
+    reply["pc"] = 0x8004;
+    reply["frame"] = 12;
+    reply["tinframe"] = 500;
+    reply["text"] = "Stepped back over a routine (6 instructions) to #8004";
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/reverse-step-over"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "reverse_step_over";
+    const mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    ASSERT_NE(_caller->Last("POST", "/api/v1/emulator/emu-1/ttd/reverse-step-over"), nullptr);
+    // An agent may read only the text: what happened and where
+    EXPECT_NE(result.text.find("over a routine (6 instructions) to #8004"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("12"), std::string::npos) << result.text;
+}
+
 TEST_F(McpTools_Test, TimeTravel_ReverseContinue_ConvertsHexPcs)
 {
     Json::Value reply;
@@ -2680,6 +4073,36 @@ TEST_F(McpTools_Test, TimeTravel_FindLast_ForwardsQueryAndReportsHit)
     EXPECT_EQ(call->body["before_frame"].asUInt(), 20u);
     EXPECT_NE(result.text.find("Last write at frame 7 t=3000 by PC"), std::string::npos) << result.text;
     EXPECT_NE(result.text.find("RAM page 5"), std::string::npos) << result.text;
+}
+
+/// space: find_last in the Sprinter's video / fast RAM - the space and the offset reach the WebAPI, the summary names
+/// the offset found
+TEST_F(McpTools_Test, TimeTravel_FindLast_ForwardsTheSpaceAndReportsTheOffset)
+{
+    Json::Value reply;
+    reply["found"] = true;
+    reply["frame"] = 3;
+    reply["tinframe"] = 100;
+    reply["pc"] = 0x800D;
+    reply["value"] = 9;
+    reply["phys_page"] = Json::Value();
+    reply["access"] = "write";
+    reply["space"] = "vram";
+    reply["offset"] = 0x4805;
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/find-last"] = {200, reply};
+
+    Json::Value args;
+    args["action"] = "find_last";
+    args["addr"] = "0x4805";
+    args["space"] = "vram";
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/find-last");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["space"].asString(), "vram");
+    EXPECT_EQ(call->body["addr"].asString(), "0x4805");
+    EXPECT_NE(result.text.find("vram offset 18437"), std::string::npos) << result.text;
 }
 
 /// port_events: "when did the program ..." - the event, its argument and the
@@ -3308,4 +4731,874 @@ TEST_F(McpTools_Test, RzxPlayback_Seek_PostsFrame)
     noFrame["action"] = "seek";
     EXPECT_TRUE(RunTool(*_registry, "rzx_playback", noFrame, *_caller).isError);
     EXPECT_TRUE(_caller->calls.empty());
+}
+
+/// memory_access: every memory by name. Regions go to /memory/region/{name} (list, read, write, save, load), the Z80
+/// view to /memory/read and /memory/write (hex turned into data bytes); bad requests never reach the WebAPI
+TEST_F(McpTools_Test, MemoryAccess_ReachesRegionsAndTheZ80View)
+{
+    Json::Value list;
+    Json::Value vram;
+    vram["name"] = "sprinter.vram";
+    vram["aliases"].append("vram");
+    vram["size_hex"] = "0x40000";
+    vram["writable"] = true;
+    Json::Value flash;
+    flash["name"] = "neogs.flash";
+    flash["aliases"] = Json::Value(Json::arrayValue);
+    flash["size_hex"] = "0x80000";
+    flash["writable"] = false;
+    list["regions"].append(vram);
+    list["regions"].append(flash);
+    _caller->routes["GET /api/v1/emulator/emu-1/memory/regions"] = {200, list};
+    Json::Value args;
+    args["action"] = "regions";
+    mcp::ToolResult result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("sprinter.vram (vram) 0x40000"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("neogs.flash 0x80000 read-only"), std::string::npos) << result.text;
+
+    Json::Value read;
+    read["region"] = "neogs.ram";
+    read["offset"] = "0x01000";
+    _caller->routes["GET /api/v1/emulator/emu-1/memory/region/neogs.ram?offset=0x1000&length=16&format=hex"] = {200, read};
+    args = Json::Value();
+    args["action"] = "read";
+    args["space"] = "neogs.ram";
+    args["offset"] = "0x1000";
+    args["length"] = 16;
+    result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("16 bytes of neogs.ram"), std::string::npos) << result.text;
+
+    Json::Value wrote;
+    wrote["region"] = "sprinter.vram";
+    wrote["bytes_written"] = 3;
+    _caller->routes["POST /api/v1/emulator/emu-1/memory/region/vram"] = {200, wrote};
+    args = Json::Value();
+    args["action"] = "write";
+    args["space"] = "vram";
+    args["offset"] = "#17F0";
+    args["hex"] = "00 00 A8";
+    result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/memory/region/vram");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["hex"].asString(), "00 00 A8");
+    EXPECT_EQ(call->body["offset"].asString(), "#17F0");
+
+    Json::Value poke;
+    poke["bytes_written"] = 2;
+    _caller->routes["POST /api/v1/emulator/emu-1/memory/write"] = {200, poke};
+    args = Json::Value();
+    args["action"] = "write";
+    args["offset"] = "#5C00";
+    args["hex"] = "3E07";
+    result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    call = _caller->Last("POST", "/api/v1/emulator/emu-1/memory/write");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["address"].asUInt(), 0x5C00u);
+    ASSERT_EQ(call->body["data"].size(), 2u);
+    EXPECT_EQ(call->body["data"][0].asUInt(), 0x3Eu);
+    EXPECT_EQ(call->body["data"][1].asUInt(), 0x07u);
+
+    const size_t calls = _caller->calls.size();
+    auto request = [](const char* action, const char* space, const char* offset, const char* hex, const char* path) {
+        Json::Value a;
+        a["action"] = action;
+        if (space)
+            a["space"] = space;
+        if (offset)
+            a["offset"] = offset;
+        if (hex)
+            a["hex"] = hex;
+        if (path)
+            a["path"] = path;
+        return a;
+    };
+    for (const Json::Value& bad : {request("write", "vram", nullptr, nullptr, nullptr), request("save", "cpu", nullptr, nullptr, "x"),
+                                   request("load", "vram", nullptr, nullptr, nullptr), request("peek", nullptr, nullptr, nullptr, nullptr),
+                                   request("write", nullptr, "zz", "00", nullptr), request("write", nullptr, "0", "0G", nullptr)})
+        EXPECT_TRUE(RunTool(*_registry, "memory_access", bad, *_caller).isError) << bad.toStyledString();
+    EXPECT_EQ(_caller->calls.size(), calls) << "refused before the WebAPI";
+}
+
+/// time_travel memory_at / memory_diff: a memory at a past checkpoint and what changed, through POST /ttd/memory-at
+/// and /ttd/memory-diff; coverage_scan passes space; missing options never reach the WebAPI
+TEST_F(McpTools_Test, TimeTravel_MemoryAtMemoryDiffAndCoverageSpace)
+{
+    Json::Value at;
+    at["space"] = "sprinter.vram";
+    at["offset"] = 0x4805;
+    at["length"] = 2;
+    at["at_frame"] = 7;
+    at["exact"] = true;
+    at["hex"] = "39AA";
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/memory-at"] = {200, at};
+    Json::Value args;
+    args["action"] = "memory_at";
+    args["space"] = "vram";
+    args["frame"] = 7;
+    args["offset"] = "0x4805";
+    args["length"] = 2;
+    args["tinframe"] = 25000;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/memory-at");
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->body["tinframe"].asUInt(), 25000u) << "a point inside the frame reaches the WebAPI (it was dropped)";
+    EXPECT_EQ(call->body["space"].asString(), "vram");
+    EXPECT_EQ(call->body["offset"].asString(), "0x4805");
+    EXPECT_EQ(call->body["frame"].asUInt(), 7u);
+    EXPECT_NE(result.text.find("2 bytes of sprinter.vram at offset 18437 as at frame 7: 39AA"), std::string::npos) << result.text;
+
+    Json::Value diff;
+    diff["space"] = "ram";
+    diff["changed_bytes"] = 3;
+    diff["at_from"] = 1;
+    diff["at_to"] = 9;
+    Json::Value range;
+    range["offset"] = 0x1C78;
+    range["length"] = 3;
+    diff["ranges"].append(range);
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/memory-diff"] = {200, diff};
+    args = Json::Value();
+    args["action"] = "memory_diff";
+    args["space"] = "ram5";
+    args["from_frame"] = 1;
+    args["to_frame"] = 9;
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("3 bytes differ between frame 1 and frame 9 (offset+length: 7288+3)"), std::string::npos)
+        << result.text;
+
+    Json::Value scan;
+    scan["index_available"] = true;
+    scan["frames"] = Json::Value(Json::arrayValue);
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/coverage/scan?space=vram&kind=written&addr_from=0x4805&addr_to=0x4805"] =
+        {200, scan};
+    args = Json::Value();
+    args["action"] = "coverage_scan";
+    args["space"] = "vram";
+    args["kind"] = "written";
+    args["addr_from"] = "0x4805";
+    args["addr_to"] = "0x4805";
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    EXPECT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/ttd/coverage/scan?space=vram&kind=written&addr_from=0x4805&addr_to=0x4805"));
+
+    const size_t calls = _caller->calls.size();
+    args = Json::Value();
+    args["action"] = "memory_at";
+    args["space"] = "vram";
+    EXPECT_TRUE(RunTool(*_registry, "time_travel", args, *_caller).isError) << "no frame";
+    args["action"] = "memory_diff";
+    args["from_frame"] = 1;
+    EXPECT_TRUE(RunTool(*_registry, "time_travel", args, *_caller).isError) << "no to_frame";
+    args["to_frame"] = 2;
+    args["tinframe"] = 100;
+    EXPECT_TRUE(RunTool(*_registry, "time_travel", args, *_caller).isError) << "memory_diff takes no tinframe";
+    EXPECT_EQ(_caller->calls.size(), calls);
+
+    // Space cpu without frame: the machine now, said so in the text
+    Json::Value now;
+    now["space"] = "cpu";
+    now["offset"] = 0x9000;
+    now["length"] = 2;
+    now["at_frame"] = 40;
+    now["at_tinframe"] = 1234;
+    now["live"] = true;
+    now["exact"] = true;
+    now["hex"] = "A15A";
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/memory-at"] = {200, now};
+    args = Json::Value();
+    args["action"] = "memory_at";
+    args["space"] = "cpu";
+    args["offset"] = "0x9000";
+    args["length"] = 2;
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_FALSE(_caller->Last("POST", "/api/v1/emulator/emu-1/ttd/memory-at")->body.isMember("frame"));
+    EXPECT_NE(result.text.find("as at frame 40 t=1234 (the machine now): A15A"), std::string::npos) << result.text;
+}
+
+// reverse_continue first_per_pc reaches the WebAPI; the PCs without a hit are in the text; find_last refuses it
+TEST_F(McpTools_Test, TimeTravel_ReverseContinueFirstPerPc)
+{
+    Json::Value reply;
+    reply["matched"] = true;
+    reply["pc"] = 0x8200;
+    reply["count"] = 1;
+    reply["truncated"] = false;
+    Json::Value hit;
+    hit["frame"] = 12;
+    hit["tinframe"] = 300;
+    hit["t"] = 840300;
+    hit["pc"] = 0x8200;
+    hit["phys_page"] = 2;
+    reply["hits"].append(hit);
+    reply["pcs_without_hit"].append(0x9999);
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/reverse-continue"] = {200, reply};
+    Json::Value args;
+    args["action"] = "reverse_continue";
+    args["pcs"].append("0x8200");
+    args["pcs"].append("0x9999");
+    args["first_per_pc"] = true;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Last("POST", "/api/v1/emulator/emu-1/ttd/reverse-continue")->body["first_per_pc"].asBool());
+    EXPECT_NE(result.text.find("PC 0x8200"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("No hit in the window: 0x9999"), std::string::npos) << result.text;
+
+    args = Json::Value();
+    args["action"] = "find_last";
+    args["addr"] = "0x8000";
+    args["first_per_pc"] = true;
+    EXPECT_TRUE(RunTool(*_registry, "time_travel", args, *_caller).isError);
+}
+
+// The loopback client sends the path the tools built: their percent-encoding is kept, not
+// encoded a second time (a screenshot "scratch/a.png" was saved as "scratch%2Fa.png")
+TEST(McpRequestPath_Test, EncodedQueryIsSentAsBuilt)
+{
+    const std::string path = "/api/v1/emulator/id/capture/screen?path=" + mcp::UrlEncodeSegment("scratch/a b.png") + "&area=screen";
+
+    EXPECT_EQ(mcp::PrepareRequestPath(path), "/api/v1/emulator/id/capture/screen?path=scratch%2Fa%20b.png&area=screen");
+}
+
+TEST(McpRequestPath_Test, RawCharactersAreStillEscaped)
+{
+    EXPECT_EQ(mcp::PrepareRequestPath("/symbols/lookup?address=#5800"), "/symbols/lookup?address=%235800");
+    EXPECT_EQ(mcp::PrepareRequestPath("/x?name=a+b c"), "/x?name=a%2Bb%20c");
+}
+
+// capture_media screenshot with layer (design-layer-capture.md): the words go to the route, the answer says which layer of which Next frame
+TEST_F(McpTools_Test, CaptureMedia_Screenshot_ForwardsTheLayerAndAlphaAndNamesTheFrame)
+{
+    Json::Value body;
+    body["status"] = "success";
+    body["layer"] = "ids";
+    body["format"] = "png";
+    body["alpha"] = false;
+    body["width"] = 640;
+    body["height"] = 512;
+    body["size"] = 321;
+    body["frame"]["sequence"] = 42;
+    body["frame"]["frame_number"] = 1234;
+    body["legend"][0]["id"] = 0;
+    body["legend"][0]["name"] = "fallback";
+    body["legend"][0]["colour"] = "#404040";
+    body["legend"][1]["id"] = 5;
+    body["legend"][1]["name"] = "sprite";
+    body["legend"][1]["colour"] = "#FF3030";
+    body["data"] = "iVBORw0KGgo=";
+    const std::string route = "/api/v1/emulator/emu-1/capture/screen?layer=ids&alpha=false";
+    _caller->routes["GET " + route] = {200, body};
+
+    Json::Value args;
+    args["action"] = "screenshot";
+    args["layer"] = "ids";
+    args["alpha"] = false;
+    mcp::ToolResult result = RunTool(*_registry, "capture_media", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", route));
+    EXPECT_NE(result.text.find("layer ids of Next frame #42"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("layer ids of Next frame #42, opaque"), std::string::npos) << "the ids image has no alpha: " << result.text;
+    EXPECT_NE(result.text.find("5=sprite(#FF3030)"), std::string::npos) << "the legend of the ids image is in the text: " << result.text;
+    EXPECT_FALSE(result.structured.isMember("data"));
+}
+
+TEST_F(McpTools_Test, CaptureMedia_Screenshot_ALayerRefusalIsAnErrorWithItsReason)
+{
+    Json::Value refusal;
+    refusal["error"] = "Conflict";
+    refusal["message"] = "Layer capture is off: switch it on";
+    refusal["kind"] = "layer-capture-off";
+    _caller->routes["GET /api/v1/emulator/emu-1/capture/screen?layer=tilemap"] = {409, refusal};
+
+    Json::Value args;
+    args["action"] = "screenshot";
+    args["layer"] = "tilemap";
+    mcp::ToolResult result = RunTool(*_registry, "capture_media", args, *_caller);
+
+    EXPECT_TRUE(result.isError);
+    EXPECT_NE(result.text.find("Layer capture is off"), std::string::npos) << result.text;
+}
+
+TEST_F(McpTools_Test, InspectState_NextPixelAspect_SummarizesTheWinnerAndEachLayersReason)
+{
+    Json::Value report;
+    report["available"] = true;
+    report["ok"] = true;
+    report["pixel"]["x"] = 105;
+    report["pixel"]["y"] = 87;
+    report["pixel"]["subpixel"] = 0;
+    report["winner"]["layer"] = "sprite";
+    report["colour"]["rgb"] = "#FF0000";
+    report["layer_order"] = "SLU";
+    report["layers"]["ula"]["opaque"] = true;
+    report["layers"]["ula"]["rgb"] = "#000000";
+    report["layers"]["ula"]["why"] = "layer order SLU: sprite above ula";
+    report["layers"]["layer2"]["opaque"] = false;
+    report["layers"]["layer2"]["why"] = "Layer 2 disabled (port #123B bit 1 / NR #69 bit 7)";
+    report["layers"]["tilemap"]["opaque"] = false;
+    report["layers"]["tilemap"]["why"] = "tilemap disabled (NR #6B bit 7)";
+    report["layers"]["sprites"]["opaque"] = true;
+    report["layers"]["sprites"]["rgb"] = "#FF0000";
+    report["layers"]["sprites"]["why"] = "wins (layer order SLU)";
+    _caller->routes["GET /api/v1/emulator/emu-1/state/next/pixel?x=105&y=87"] = {200, report};
+    Json::Value args;
+    args["aspects"].append("next_pixel");
+    args["nr_x"] = "105";
+    args["nr_y"] = "87";
+    mcp::ToolResult result = RunTool(*_registry, "inspect_state", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("[next_pixel] (105,87) sub 0: sprite #FF0000, layer order SLU"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("ula: painted #000000 - layer order SLU: sprite above ula"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("layer2: - - Layer 2 disabled"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("sprites: painted #FF0000 - wins (layer order SLU)"), std::string::npos) << result.text;
+}
+
+TEST_F(McpTools_Test, CaptureMedia_Screenshot_ALayerWithoutAlphaSaysItIsFlattened)
+{
+    Json::Value body;
+    body["status"] = "success";
+    body["layer"] = "tilemap";
+    body["format"] = "rgba";
+    body["alpha"] = false;
+    body["width"] = 640;
+    body["height"] = 512;
+    body["size"] = 1310720;
+    body["frame"]["sequence"] = 7;
+    body["data"] = "AAAA";
+    const std::string route = "/api/v1/emulator/emu-1/capture/screen?format=rgba&layer=tilemap&alpha=false";
+    _caller->routes["GET " + route] = {200, body};
+
+    Json::Value args;
+    args["action"] = "screenshot";
+    args["layer"] = "tilemap";
+    args["alpha"] = false;
+    args["format"] = "rgba";
+    mcp::ToolResult result = RunTool(*_registry, "capture_media", args, *_caller);
+
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", route));
+    EXPECT_NE(result.text.find("layer tilemap of Next frame #7, flattened"), std::string::npos) << result.text;
+}
+
+/// memory_access read carries the bytes in the text (clients that hand the model only content[] see them); 'address'
+/// is an alias of 'offset' (an agent writing it read from 0 before), both at once is an error
+TEST_F(McpTools_Test, MemoryAccess_ReadBytesInTheTextAndAddressAlias)
+{
+    Json::Value dump;
+    dump["address"] = "0x5C00";
+    dump["format"] = "hexdump";
+    dump["hexdump"] = "0x5C00: FF 00 3E 07  |..>.|\n";
+    _caller->routes["GET /api/v1/emulator/emu-1/memory/read/0x5C00?length=4"] = {200, dump};
+    Json::Value args;
+    args["action"] = "read";
+    args["address"] = "0x5C00";
+    args["length"] = 4;
+    mcp::ToolResult result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/memory/read/0x5C00?length=4")) << "address is the offset";
+    EXPECT_NE(result.text.find("0x5C00: FF 00 3E 07"), std::string::npos) << result.text;
+
+    Json::Value region;
+    region["region"] = "neogs.ram";
+    region["offset"] = "0x10000";
+    for (unsigned b : {0x01u, 0x02u, 0xA8u})
+        region["data"].append(b);
+    _caller->routes["GET /api/v1/emulator/emu-1/memory/region/neogs.ram?offset=0x10000&length=3&format=hex"] = {200, region};
+    args = Json::Value();
+    args["action"] = "read";
+    args["space"] = "neogs.ram";
+    args["offset"] = "0x10000";
+    args["length"] = 3;
+    result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("0x010000: 01 02 A8"), std::string::npos) << "offsets past 64K keep their digits\n" << result.text;
+
+    const size_t calls = _caller->calls.size();
+    args = Json::Value();
+    args["action"] = "read";
+    args["address"] = "0x5C00";
+    args["offset"] = "0x4000";
+    result = RunTool(*_registry, "memory_access", args, *_caller);
+    EXPECT_TRUE(result.isError);
+    EXPECT_EQ(_caller->calls.size(), calls) << "a conflicting request never reaches the WebAPI";
+}
+
+/// bp_list writes one line per breakpoint: id, address, access, hits; non-defaults (off, mode, group, note) only
+TEST_F(McpTools_Test, ControlExecution_BpListOneLinePerBreakpoint)
+{
+    Json::Value list;
+    Json::Value bp;
+    bp["id"] = 1;
+    bp["address"] = 0x38;
+    bp["type"] = "memory";
+    bp["execute"] = true;
+    bp["read"] = false;
+    bp["write"] = false;
+    bp["hit_count"] = 3;
+    bp["active"] = true;
+    bp["hit_mode"] = "always";
+    bp["group"] = "default";
+    bp["note"] = "";
+    list["breakpoints"].append(bp);
+    bp["id"] = 2;
+    bp["address"] = 0x5C3A;
+    bp["execute"] = false;
+    bp["write"] = true;
+    bp["hit_count"] = 0;
+    bp["active"] = false;
+    bp["note"] = "sysvars";
+    list["breakpoints"].append(bp);
+    list["count"] = 2;
+    _caller->routes["GET /api/v1/emulator/emu-1/breakpoints"] = {200, list};
+
+    Json::Value args;
+    args["action"] = "bp_list";
+    mcp::ToolResult result = RunTool(*_registry, "control_execution", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("\n#1 0x0038 X hits 3\n"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("\n#2 0x5C3A W hits 0 off \"sysvars\""), std::string::npos) << result.text;
+    EXPECT_EQ(result.structured["count"].asUInt(), 2u);
+}
+
+/// A small structured result as key=value text: nested keys joined with '.', scalar arrays inline, the rest counted
+TEST(McpToolUtils_Test, FlatFieldsShowsTheValues)
+{
+    Json::Value v;
+    v["model"] = "Pentagon";
+    v["ram_kb"] = 128;
+    v["port_0x7FFD"]["value_hex"] = "0x10";
+    v["pages"].append(5);
+    v["pages"].append(7);
+    v["name"] = "Screen 0 (normal)";
+    v["hz"] = 3584000.0;
+    EXPECT_EQ(mcp::FlatFields(v),
+              "hz=3584000 model=Pentagon name=\"Screen 0 (normal)\" pages=[5,7] port_0x7FFD.value_hex=0x10 ram_kb=128");
+    const std::string cut = mcp::FlatFields(v, 30);
+    EXPECT_NE(cut.find("more field(s)"), std::string::npos) << cut;
+    EXPECT_LE(cut.find(" ..."), 30u) << cut;
+}
+
+/// Calls whose text was a headline only carry their fields as key=value (AppendFields)
+TEST_F(McpTools_Test, JoystickStatus_FieldsInTheText)
+{
+    Json::Value body;
+    body["kempston"]["connected"] = true;
+    body["kempston"]["state_hex"] = "0x10";
+    _caller->routes["GET /api/v1/emulator/emu-1/joystick"] = {200, body};
+    Json::Value args;
+    args["action"] = "status";
+    mcp::ToolResult result = RunTool(*_registry, "joystick_input", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("Joystick status [target emu-1]\nkempston.connected=true kempston.state_hex=0x10"),
+              std::string::npos) << result.text;
+}
+
+/// screen_attributes writes the grid as attribute bytes, one row of cells per line
+TEST_F(McpTools_Test, InspectState_ScreenAttributesGridInTheText)
+{
+    Json::Value body;
+    body["available"] = true;
+    body["model"] = "Pentagon";
+    body["cols"] = 2;
+    body["rows"] = 2;
+    Json::Value screen;
+    for (int i = 0; i < 4; ++i)
+    {
+        Json::Value cell;
+        cell["ink"] = i;
+        cell["paper"] = 7;
+        cell["bright"] = i == 1;
+        cell["flash"] = i == 3;
+        screen["cells"].append(cell);
+    }
+    body["screens"].append(screen);
+    _caller->routes["GET /api/v1/emulator/emu-1/state/screen/attributes"] = {200, body};
+    Json::Value args;
+    args["aspects"].append("screen_attributes");
+    mcp::ToolResult result = RunTool(*_registry, "inspect_state", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("screen 0:\n  3879\n  3ABB"), std::string::npos) << result.text;
+}
+
+/// manage_symbols list: from / to go to the WebAPI as numbers, name filters by substring, the text lists the labels
+TEST_F(McpTools_Test, ManageSymbols_ListFiltersAndWritesTheLabels)
+{
+    Json::Value body;
+    body["total"] = 3;
+    for (const auto& [name, address] : {std::pair<const char*, int>{"PRINT_OUT", 0x09F4}, {"PO_CHAR", 0x0B65}, {"CLS", 0x0D6B}})
+    {
+        Json::Value label;
+        label["name"] = name;
+        label["address"] = address;
+        label["type"] = "code";
+        body["labels"].append(label);
+    }
+    body["count"] = 3;
+    _caller->routes["GET /api/v1/emulator/emu-1/labels?from=2048&to=4095"] = {200, body};
+    Json::Value args;
+    args["action"] = "list";
+    args["from"] = "0x0800";
+    args["to"] = "$0FFF";
+    args["name"] = "print";
+    mcp::ToolResult result = RunTool(*_registry, "manage_symbols", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_TRUE(_caller->Saw("GET", "/api/v1/emulator/emu-1/labels?from=2048&to=4095"));
+    EXPECT_NE(result.text.find(": 1 of 3\n0x09F4 PRINT_OUT code"), std::string::npos) << result.text;
+    EXPECT_EQ(result.structured["count"].asUInt(), 1u);
+
+    args["from"] = "zz";
+    EXPECT_TRUE(RunTool(*_registry, "manage_symbols", args, *_caller).isError);
+}
+
+/// bp_add switches the breakpoints feature on when it is off (a breakpoint never fires without it) and says so
+TEST_F(McpTools_Test, ControlExecution_BpAddSwitchesTheBreakpointsFeatureOn)
+{
+    _caller->routes["POST /api/v1/emulator/emu-1/breakpoints"] = {200, Json::Value(Json::objectValue)};
+    Json::Value off;
+    off["enabled"] = false;
+    _caller->routes["GET /api/v1/emulator/emu-1/feature/breakpoints"] = {200, off};
+    _caller->routes["PUT /api/v1/emulator/emu-1/feature/breakpoints"] = {200, Json::Value(Json::objectValue)};
+    Json::Value args;
+    args["action"] = "bp_add";
+    args["address"] = "0x0038";
+    mcp::ToolResult result = RunTool(*_registry, "control_execution", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* put = _caller->Last("PUT", "/api/v1/emulator/emu-1/feature/breakpoints");
+    ASSERT_NE(put, nullptr) << "the feature is switched on";
+    EXPECT_TRUE(put->body["enabled"].asBool());
+    EXPECT_NE(result.text.find("switched on"), std::string::npos) << result.text;
+
+    Json::Value on;
+    on["enabled"] = true;
+    _caller->routes["GET /api/v1/emulator/emu-1/feature/breakpoints"] = {200, on};
+    auto puts = [this] {
+        size_t n = 0;
+        for (const auto& call : _caller->calls)
+            n += call.method == "PUT" ? 1 : 0;
+        return n;
+    };
+    const size_t putsBefore = puts();
+    result = RunTool(*_registry, "control_execution", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_EQ(result.text.find("feature"), std::string::npos) << "nothing to say when it is on\n" << result.text;
+    EXPECT_EQ(puts(), putsBefore) << "no PUT when the feature is on";
+}
+
+/// resolve writes the answer: name, address, bank, type, comment
+TEST_F(McpTools_Test, ManageSymbols_ResolveAnswerInTheText)
+{
+    Json::Value body;
+    body["found"] = true;
+    body["label"]["name"] = "CLS";
+    body["label"]["address"] = 0x0D6B;
+    body["label"]["bank"] = 3;
+    body["label"]["bankType"] = "rom";
+    body["label"]["type"] = "code";
+    body["label"]["comment"] = "CLS command";
+    _caller->routes["GET /api/v1/emulator/emu-1/labels/resolve?name=CLS"] = {200, body};
+    Json::Value args;
+    args["action"] = "resolve";
+    args["name"] = "CLS";
+    mcp::ToolResult result = RunTool(*_registry, "manage_symbols", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("CLS = 0x0D6B rom3 code ; CLS command"), std::string::npos) << result.text;
+}
+
+/// A region read answering a hex string without spaces still lists every byte
+TEST_F(McpTools_Test, MemoryAccess_RegionHexWithoutSpaces)
+{
+    Json::Value region;
+    region["region"] = "neogs.ram";
+    region["offset"] = "0x00000";
+    region["hex"] = "FF00A8";
+    _caller->routes["GET /api/v1/emulator/emu-1/memory/region/neogs.ram?offset=0&length=3&format=hex"] = {200, region};
+    Json::Value args;
+    args["action"] = "read";
+    args["space"] = "neogs.ram";
+    args["length"] = 3;
+    mcp::ToolResult result = RunTool(*_registry, "memory_access", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("0x0000: FF 00 A8"), std::string::npos) << result.text;
+}
+
+/// inspect_state registers shows the full set: the alternate registers, I, R, MEMPTR, IM and the flip-flops
+TEST(McpToolUtils_Test, FormatRegistersFull)
+{
+    Json::Value r;
+    r["special"]["pc"] = 0x8000;
+    r["special"]["sp"] = 0x5BFF;
+    r["special"]["i"] = 0x3F;
+    r["special"]["r"] = 0x12;
+    r["special"]["memptr"] = 0x0038;
+    r["main"]["af"] = 0x1D74;
+    r["alternate"]["af_"] = 0x0044;
+    r["interrupt"]["im"] = 1;
+    r["interrupt"]["iff1"] = 1;
+    r["interrupt"]["iff2"] = 1;
+    const std::string brief = mcp::FormatRegisters(r);
+    EXPECT_EQ(brief.find("AF'"), std::string::npos) << "steps stay one line: " << brief;
+    const std::string full = mcp::FormatRegisters(r, true);
+    EXPECT_NE(full.find("AF'=0x0044"), std::string::npos) << full;
+    EXPECT_NE(full.find("I=0x3F R=0x12 MEMPTR=0x0038 IM 1 IFF1=1 IFF2=1"), std::string::npos) << full;
+}
+
+/// RunSeries frees its chain when the series ends: the closure used to hold itself, so the steps and the `done`
+/// callback (and whatever they captured) leaked on every series tool call (BUGS.md 2026-10-11 #7)
+TEST(McpToolUtils_Test, RunSeriesFreesTheChainWhenItEnds)
+{
+    auto sentinel = std::make_shared<int>(0);
+    const std::weak_ptr<int> watch = sentinel;
+    std::function<void(bool)> pending;   // an asynchronous step: it answers later
+    bool doneCalled = false;
+    {
+        std::vector<mcp::SeriesStep> steps;
+        steps.push_back([](Json::Value& acc, std::function<void(bool)> next) {
+            acc["a"] = 1;
+            next(true);
+        });
+        steps.push_back([&pending](Json::Value& acc, std::function<void(bool)> next) {
+            acc["b"] = 2;
+            pending = std::move(next);
+        });
+        mcp::RunSeries(std::move(steps), [sentinel, &doneCalled](Json::Value acc) {
+            doneCalled = acc["a"].asInt() == 1 && acc["b"].asInt() == 2;
+        });
+    }
+    sentinel.reset();
+    ASSERT_TRUE(pending);
+    EXPECT_FALSE(watch.expired()) << "a pending step keeps the chain";
+
+    pending(true);
+    pending = nullptr;
+    EXPECT_TRUE(doneCalled);
+    EXPECT_TRUE(watch.expired()) << "the ended chain is freed";
+}
+
+// ===========================================================================
+// companion_manage (docs/inprogress/2026-10-16-companion-client)
+// ===========================================================================
+
+TEST_F(McpTools_Test, CompanionManage_ListsAndRevokes)
+{
+    Json::Value list;
+    Json::Value c;
+    c["id"] = "c-5f2a91";
+    c["name"] = "Desk panel";
+    c["scopes"].append("run");
+    c["scopes"].append("input");
+    c["source"] = "paired";
+    list["companions"].append(c);
+    Json::Value p;
+    p["pairing_id"] = "p-7c41d2";
+    p["name"] = "Phone";
+    p["peer"] = "192.168.1.40";
+    list["pairings"].append(p);
+    list["approval_available"] = true;
+    _caller->routes["GET /api/v1/companions"] = {200, list};
+
+    Json::Value args;
+    args["action"] = "list";
+    mcp::ToolResult result = RunTool(*_registry, "companion_manage", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("1 companion(s)"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("c-5f2a91 'Desk panel' [run, input] paired"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("1 pairing(s) waiting for the user"), std::string::npos) << result.text;
+
+    Json::Value revoked;
+    revoked["revoked"] = true;
+    revoked["id"] = "c-5f2a91";
+    _caller->routes["DELETE /api/v1/companions/Desk%20panel"] = {200, revoked};
+    Json::Value revoke;
+    revoke["action"] = "revoke";
+    revoke["id"] = "Desk panel";
+    result = RunTool(*_registry, "companion_manage", revoke, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("c-5f2a91 revoked"), std::string::npos) << result.text;
+
+    Json::Value noId;
+    noId["action"] = "revoke";
+    EXPECT_TRUE(RunTool(*_registry, "companion_manage", noId, *_caller).isError);
+
+    Json::Value all;
+    all["revoked"] = 3;
+    _caller->routes["DELETE /api/v1/companions"] = {200, all};
+    Json::Value revokeAll;
+    revokeAll["action"] = "revoke_all";
+    result = RunTool(*_registry, "companion_manage", revokeAll, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("3 companion(s) revoked"), std::string::npos) << result.text;
+}
+
+/// The analysis lists (2026-10-28-ttd-analysis-feedback): an agent may read only the text, so the hits, the frames,
+/// the cursor and the banks are in it; the new options reach the WebAPI
+TEST_F(McpTools_Test, TimeTravel_AnalysisListsAreInTheText)
+{
+    Json::Value rc;
+    rc["matched"] = true;
+    rc["pc"] = 0xC000;
+    rc["count"] = 2;
+    rc["truncated"] = true;
+    rc["next_before"] = 9999;
+    for (int page : {3, 1})
+    {
+        Json::Value hit;
+        hit["frame"] = 20 - page;
+        hit["tinframe"] = 100;
+        hit["t"] = 10000 + page;
+        hit["pc"] = 0xC000;
+        hit["phys_page"] = page;
+        rc["hits"].append(hit);
+    }
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/reverse-continue"] = {200, rc};
+    Json::Value args;
+    args["action"] = "reverse_continue";
+    args["pcs"].append("0xC000");
+    args["all"] = true;
+    args["limit"] = 2;
+    args["phys_page"] = "rom";
+    args["before_frame"] = 30;
+    mcp::ToolResult result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    const FakeApiCaller::RecordedCall* call = _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/reverse-continue");
+    ASSERT_NE(call, nullptr);
+    EXPECT_TRUE(call->body["all"].asBool());
+    EXPECT_EQ(call->body["limit"].asUInt(), 2u);
+    EXPECT_EQ(call->body["phys_page"].asString(), "rom");
+    EXPECT_EQ(call->body["before_frame"].asUInt(), 30u);
+    EXPECT_NE(result.text.find("frame 17 t=100 PC 0xC000 page 3"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("frame 19 t=100 PC 0xC000 page 1"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("before=9999"), std::string::npos) << result.text;
+
+    Json::Value fl;
+    fl["found"] = true;
+    fl["count"] = 1;
+    fl["truncated"] = false;
+    Json::Value write;
+    write["frame"] = 5;
+    write["tinframe"] = 700;
+    write["t"] = 4242;
+    write["pc"] = 0x8013;
+    write["value"] = 5;
+    write["old_value"] = 0;
+    write["access"] = "write";
+    write["space"] = "ram";
+    write["addr"] = 0x8101;
+    write["phys_page"] = 2;
+    fl["hits"].append(write);
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/find-last"] = {200, fl};
+    args = Json::Value();
+    args["action"] = "find_last";
+    args["addr"] = "0x8101";
+    args["changes_only"] = true;
+    args["all"] = true;
+    args["before"] = 123456;
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    call = _caller->Last("POST", "/api/v1/emulator/emu-1/ttd/find-last");
+    ASSERT_NE(call, nullptr);
+    EXPECT_TRUE(call->body["changes_only"].asBool());
+    EXPECT_EQ(call->body["before"].asUInt64(), 123456u);
+    EXPECT_NE(result.text.find("frame 5 t=700 write PC 0x8013 value 5 (was 0) addr 0x8101 page 2"), std::string::npos)
+        << result.text;
+
+    Json::Value scan;
+    scan["index_available"] = true;
+    scan["index_available"] = true;
+    scan["scanned_frames"] = 40;
+    scan["matching_frames"] = 9;
+    scan["first_match"] = 2;
+    scan["last_match"] = 39;
+    scan["order"] = "newest";
+    scan["exact"] = false;
+    scan["truncated"] = true;
+    scan["next_to_frame"] = 29;
+    for (int f : {39, 38, 37, 33, 30})
+        scan["frames"].append(f);
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/coverage/scan?addr_from=0x8200&addr_to=0x8200&limit=5&order=newest"] =
+        {200, scan};
+    args = Json::Value();
+    args["action"] = "coverage_scan";
+    args["addr_from"] = "0x8200";
+    args["addr_to"] = "0x8200";
+    args["limit"] = 5;
+    args["order"] = "newest";
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("39-37, 33, 30"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("to_frame=29"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("Not exact"), std::string::npos) << result.text;
+
+    // coverage_rare: the blocks in the text, a CPU address or the page offsets
+    Json::Value rare;
+    rare["index_available"] = true;
+    rare["kind"] = "executed";
+    rare["max_frames"] = 2;
+    rare["scanned_frames"] = 40;
+    rare["unindexed_frames"] = 0;
+    rare["distinct_keys"] = 310;
+    rare["rare_keys"] = 12;
+    rare["rare_blocks"] = 2;
+    rare["truncated"] = false;
+    Json::Value routine;
+    routine["addr_from"] = "0x8200";
+    routine["addr_to"] = "0x8212";
+    routine["phys_page"] = 2;
+    routine["page_offset_from"] = "0x0200";
+    routine["page_offset_to"] = "0x0212";
+    routine["keys"] = 9;
+    for (int f : {3, 4, 5})
+        routine["frames"].append(f);
+    rare["blocks"].append(routine);
+    Json::Value unmapped;
+    unmapped["phys_page"] = 3;
+    unmapped["page_offset_from"] = "0x0000";
+    unmapped["page_offset_to"] = "0x0000";
+    unmapped["keys"] = 1;
+    unmapped["frames"].append(17);
+    rare["blocks"].append(unmapped);
+    _caller->routes["GET /api/v1/emulator/emu-1/ttd/coverage/rare?addr_from=0x8000&max_frames=2"] = {200, rare};
+    args = Json::Value();
+    args["action"] = "coverage_rare";
+    args["addr_from"] = "0x8000";
+    args["max_frames"] = 2;
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("12 of 310 executed addresses in at most 2 frames, 2 blocks"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("0x8200..0x8212 page 2 (9 addr): frames 3-5"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("offset 0x0000..0x0000 page 3 (1 addr): frames 17"), std::string::npos) << result.text;
+
+    Json::Value at;
+    at["space"] = "cpu";
+    at["offset"] = 0x8000;
+    at["length"] = 2;
+    at["at_frame"] = 7;
+    at["exact"] = true;
+    at["hex"] = "F30E";
+    for (int w = 0; w < 4; ++w)
+    {
+        Json::Value bank;
+        bank["window"] = w;
+        bank["addr"] = std::vector<std::string>{"0x0000", "0x4000", "0x8000", "0xC000"}[w];
+        bank["name"] = std::vector<std::string>{"ROM 3", "RAM 5", "RAM 2", "RAM 1"}[w];
+        at["banks"].append(bank);
+    }
+    _caller->routes["POST /api/v1/emulator/emu-1/ttd/memory-at"] = {200, at};
+    args = Json::Value();
+    args["action"] = "memory_at";
+    args["space"] = "cpu";
+    args["frame"] = 7;
+    args["offset"] = "0x8000";
+    args["length"] = 2;
+    result = RunTool(*_registry, "time_travel", args, *_caller);
+    ASSERT_FALSE(result.isError) << result.text;
+    EXPECT_NE(result.text.find("0xC000 RAM 1"), std::string::npos) << result.text;
+    EXPECT_NE(result.text.find("F30E"), std::string::npos) << result.text;
 }

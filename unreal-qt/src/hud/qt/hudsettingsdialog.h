@@ -8,7 +8,6 @@
 #include <functional>
 #include <vector>
 
-class EmulatorContext;
 
 /// Notification category identifiers (stable string keys for persistence and filtering)
 namespace HudNotificationCategory
@@ -67,7 +66,7 @@ class HudSettingsDialog : public QDialog
     Q_OBJECT
 
 public:
-    explicit HudSettingsDialog(EmulatorContext* context, QWidget* parent = nullptr);
+    explicit HudSettingsDialog(QWidget* parent = nullptr);
     ~HudSettingsDialog() override;
 
     /// Get all registered categories
@@ -78,6 +77,10 @@ public:
 
     /// Get all enabled category IDs
     static QSet<QString> enabledCategories();
+
+    /// Show or hide one category (the automation's hud_notice.<id>): saved, the change callback called, an open
+    /// dialog's check box follows. False for an unknown id
+    static bool setCategoryEnabled(const QString& categoryId, bool enabled);
 
     /// Save current settings to persistent storage
     static void saveSettings();
@@ -101,7 +104,6 @@ private:
     void onResetToDefaults();
 
 private:
-    EmulatorContext* _context = nullptr;
     QVBoxLayout* _mainLayout = nullptr;
     std::vector<QCheckBox*> _categoryCheckboxes;
 };

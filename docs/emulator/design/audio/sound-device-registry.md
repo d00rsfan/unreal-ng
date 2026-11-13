@@ -46,7 +46,7 @@ The source keys stay `ay1`, `ay2`, `fm1`, `fm2`. A board AY shadowed by a card k
 A ZX-MultiSound in a slot shows its YM2203 pair the same way, per chip: `MS SSG 1` / `MS SSG 2` and `MS FM 1` /
 `MS FM 2` (keys `ms_ssg1`, `ms_ssg2`, `ms_fm1`, `ms_fm2`), then `MS SAA`, `MS PCM` (its GS + SounDrive DACs) and
 `MS MIDI` (`ms_saa`, `ms_pcm`, `ms_midi`), one HUD indicator per row. One FM calibration for every YM2203 FM in the
-machine: `[SOUND] TSFM_FmTrimDb` (the audio settings' FM trim, `SoundManager::setFmTrimDb`) drives the TSFM and the
+machine: `[SOUND] TSFM_FmLevelDb` (the audio settings' FM trim, `SoundManager::setFmTrimDb`) drives the TSFM and the
 card alike.
 
 ```cpp
@@ -128,12 +128,13 @@ out[i] = Σ audible(d) · d.volume · d.buffer[i]   (saturating add)
   and host-mute do not affect capture (UX doc open question #3: the mix
   above runs in `handleFrameEnd` regardless of the audio callback).
 
-### 3.4 Channel-level layer (AY)
+### 3.4 Channel-level layer
 
-Channel mute/solo/volume stay on `SoundChip_AY8910` (already implemented
-for mute/volume; solo added the same way). Channel-split capture buffers
-(`getChannelBuffer(ch)`) come in milestone M5 and are only rendered while
-a channel-split recording or channel solo is active (zero cost otherwise).
+Implemented for every chip with channels (AY, YM2203 FM, Covox / SounDrive, GS / NeoGS, OPL4 FM and PCM, the
+ZX-MultiSound's parts, the Next): one store in SoundManager, the user's mute / solo (within the row) / volume per
+channel applied to the device at the frame start - see
+[mixer-channels-and-settings.md](mixer-channels-and-settings.md). Channel-split capture buffers
+(`getChannelBuffer(ch)`) remain milestone M5.
 
 ## 4. Device stubs and implementation order
 
@@ -174,8 +175,10 @@ class Covox : public SoundDevice   // + PortDevice
 - **DC handling:** digi playback leaves the DAC at an arbitrary level —
   a `FilterDC` on the device output (same one the AY path uses), exposed
   as the "DC-offset removal" toggle in its UI section (UX doc §3.1).
-- **Registration:** present iff `config.covoxFB`; volume seeds from
-  `covoxFB_vol`.
+- **Registration:** one instance whatever ports it answers (`#FB` on the
+  Pentagon-style card, the SounDrive sets, `#DD` - the Scorpion's only
+  Covox port); its volume is the mixer's COVOX row and channels, no
+  per-port volume.
 - **Recording:** appears automatically as a capture source via the
   registry — no recording-side changes needed.
 

@@ -151,7 +151,7 @@ TEST_F(ScreenSprinter_Test, Geometry_736x288_320Lines)
     EXPECT_EQ(rd.screenHeight, 256);
     EXPECT_EQ(rd.screenOffsetLeft, 48);
     EXPECT_EQ(rd.screenOffsetTop, 16);
-    EXPECT_TRUE(StoresHalfHeightLines(M_SPRINTER));
+    EXPECT_EQ(DisplayGeometry::Picture(736, 288).lineRepeat, 2) << "recordings double the stored lines";
 
     // The frame's own geometry names the same picture, and it is the square grid the renderer draws: square
     // (0, 0) sits at its top-left corner (SquareX / SquareY are measured by the pixel tests below)
@@ -585,6 +585,9 @@ TEST_F(ScreenSprinter_Test, SpectrumScreen_MulticolorRace_SameAttributesAsPentag
     Z80* pz = pc->pCore->GetZ80();
     Memory* pm = pc->pMemory;
     Screen* ps = pc->pScreen;
+    // Drawn by hand below, outside the step loop: the per-step draw, not the event rule (ScreenZX::CatchesUpOnEvents)
+    ASSERT_NE(dynamic_cast<ScreenZX*>(ps), nullptr);
+    dynamic_cast<ScreenZX*>(ps)->SetCatchUpOnEvents(false);
     auto pentagonWrite = [&](uint16_t addr, uint8_t value) { (pm->*(pz->MemIf->MemoryWrite))(addr, value); };
     for (int j = 0; j < 8; j++)
         pentagonWrite(static_cast<uint16_t>(0x5801 + j), RefAttr(j));
@@ -991,7 +994,7 @@ TEST_F(ScreenSprinterTemporal_Test, NativeMode_NotApplicable)
     EXPECT_FALSE(stats.active);
     EXPECT_FALSE(stats.applicable);
     EXPECT_EQ(stats.inactiveReason.rfind("not applicable: Sprinter native mode", 0), 0u) << stats.inactiveReason;
-    EXPECT_EQ(_screen->GetEffectivePresentDelayFrames(), _screen->GetPresentDelayFrames()) << "no delay for nothing";
+    EXPECT_EQ(_screen->GetEffectivePresentDelayFrames(), Screen::kAudioPathDelayFrames) << "no delay for nothing";
     ASSERT_TRUE(_screen->SetTemporalAlgorithm(""));
     EXPECT_TRUE(_screen->GetTemporalStats().applicable) << "off: nothing to apply";
 }

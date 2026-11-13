@@ -3,15 +3,24 @@
 // video recording. Mirrors the WebAPI handlers (analyzers_api, profiler_api,
 // state_screen_api, recording_api) so every interface exposes the same features.
 
+#include "cli-analysis.h"
+#include "cli-markup.h"
+#include "cli-cpuprofile.h"
 #include "cli-audio-mixer.h"
 #include "cli-processor.h"
 
 #include <3rdparty/tinywav/tinywav.h>
+#include <debugger/analyzers/analysis/analysiscontrol.h>
 #include <debugger/analyzers/analyzermanager.h>
 #include <debugger/analyzers/audiocapture/audiocaptureanalyzer.h>
 #include <debugger/analyzers/aylog/ayloganalyzer.h>
 #include <debugger/analyzers/coverage/coverageanalyzer.h>
+#include <debugger/analyzers/coverage/coverageexport.h>
+#include <debugger/analyzers/profile/profilecontrol.h>
+#include <debugger/analyzers/sectiontimer/sectiontimeranalyzer.h>
 #include <debugger/debugmanager.h>
+#include <debugger/memory/memoryread.h>
+#include <debugger/markup/markupcontrol.h>
 #include <emulator/config.h>
 #include <emulator/cpu/z80.h>
 #include <emulator/emulator.h>
@@ -25,6 +34,7 @@
 #include <emulator/sound/soundmanager.h>
 #include <emulator/sound/audio.h>
 #include <emulator/state/devicestate.h>
+#include <emulator/state/statenodejson.h>
 #include <emulator/video/screendigest.h>
 
 #include <algorithm>
@@ -38,7 +48,11 @@
 #ifdef ENABLE_RECORDING
 #include "recordingmanager.h"
 #include "cli-videorecord-options.h"
+#include <emulator/capture/recordingcontrol.h>
 #include "../../../temporalstatus.h"
+#include "emulator/video/viewportcontrol.h"
+#include "emulator/video/windowrecording.h"
+#include "../../../windowdisplay.h"
 #endif
 
 namespace
@@ -60,26 +74,6 @@ bool parseAddress16(const std::string& value, uint16_t& out)
     }
 }
 
-/// Default recording output: temp dir / unreal-cli / <id>_<timestamp>.<ext>
-std::string defaultRecordingPath(const std::string& id, const std::string& extension)
-{
-    std::string safeId = id;
-    for (char& c : safeId)
-    {
-        if (c == '-')
-            c = '_';
-    }
-
-    static unsigned counter = 0;
-    const long long stamp = static_cast<long long>(std::time(nullptr)) * 1000 + (counter++ % 1000);
-
-    std::error_code ec;
-    std::filesystem::path directory = std::filesystem::temp_directory_path(ec) / "unreal-cli";
-    if (!ec)
-        std::filesystem::create_directories(directory, ec);
-    const std::string name = "video-" + safeId + "-" + std::to_string(stamp) + "." + extension;
-    return ec ? name : (directory / name).string();
-}
 }  // namespace
 
 // HandleDigest — FNV-1a-64 digest of the screen area (change detection without
@@ -265,7 +259,7 @@ void CLIProcessor::HandlePorts(const ClientSession& session, const std::vector<s
     ss << "  TR-DOS active: " << (((state.flags & (CF_TRDOS | CF_DOSPORTS)) != 0) ? "yes" : "no") << NEWLINE;
     ss << "  Mouse ports: " << (mouseDecoded ? "" : "shadowed - ") << mouseNote << NEWLINE;
 
-    const bool scorpion = (config.mem_model == MM_SCORP || config.mem_model == MM_PROFSCORP);
+    const bool scorpion = IsScorpionModel(config.mem_model);
     if (scorpion)
         ss << "  Shadow monitor paged: " << (((state.p1FFD & 0x02) != 0) ? "yes" : "no") << NEWLINE;
     else
@@ -343,11 +337,11 @@ void CLIProcessor::HandlePaging(const ClientSession& session, const std::vector<
             uint8_t* pagePtr = memory.ROMPageHostAddress(romPage);
             if (pagePtr)
             {
-                std::string sig = rom->CalculateSignature(pagePtr, 0x4000);
-                // GetROMTitle carries the "Unknown ROM, <digest>" fallback;
-                // role comes from the core layout table (ROM::GetROMPageRole,
-                // §5.2) - a role/name mismatch is the wrong-ROM signal
-                ss << "  \"" << rom->GetROMTitle(sig) << "\"";
+                // GetROMPageTitle carries the "Unknown ROM, <digest>" fallback
+                // and names blank pages and copies; role comes from the core
+                // layout table (ROM::GetROMPageRole, §5.2) - a role/name
+                // mismatch is the wrong-ROM signal
+                ss << "  \"" << rom->GetROMPageTitle(romPage) << "\"";
                 ss << "  [" << rom->GetROMPageRole(romPage) << "]";
             }
         }
@@ -370,6 +364,10 @@ void CLIProcessor::HandlePaging(const ClientSession& session, const std::vector<
     ss << "  #1  0x4000-0x7FFF  RAM p" << (int)memory.GetRAMPageForBank1() << contended(1) << "  [Screen 0]" << NEWLINE;
     ss << "  #2  0x8000-0xBFFF  RAM p" << (int)memory.GetRAMPageForBank2() << contended(2) << NEWLINE;
     ss << "  #3  0xC000-0xFFFF  RAM p" << (int)memory.GetRAMPageForBank3() << contended(3) << NEWLINE;
+
+    // GMX: the card's register file (the /state/paging `gmx` view)
+    if (context->config.mem_model == MM_GMX)
+        ss << NEWLINE << "GMX card:" << NEWLINE << DeviceState::ToText(DeviceState::GmxPaging(context), 1);
 
     session.SendResponse(ss.str());
 }
@@ -416,6 +414,24 @@ void CLIProcessor::HandleVideo(const ClientSession& session, const std::vector<s
         "  video temporal list            - algorithms that can be switched on\n"
         "  video temporal off             - switch the de-flicker off\n"
         "  video temporal <algorithm>     - switch it on (e.g. mod-tpgwafsd)\n"
+        "  video window [status]          - GUI window display: GPU, CRT, blending, full screen, scale, HUD, keyboard\n"
+        "  video window <key>=<value> ... - change them: gpu, crt, blending, fullscreen, toolbar, status_bar, hud,\n"
+        "                                   osd_keyboard, next_layers on|off; crt_profile <name>; blending_frames 2..5;\n"
+        "                                   blending_weights equal|exponential; blending_decay 0.1..0.9; scale 1..4;\n"
+        "                                   view full|screen|content (the part of the frame shown);\n"
+        "                                   hud_theme <name>; hud_notice.<id> on|off; osd_keyboard_picture <id>;\n"
+        "                                   osd_keyboard_style photo|schematic|hybrid;\n"
+        "                                   next_layers_mode layers|composed|winner; next_layer.<ula|layer2|tilemap|sprites>\n"
+        "  video window crt_params [...]  - the active CRT profile's parameters; <name>=<v>, <name>+=<steps>,\n"
+        "                                   <name>-=<steps>, reset, reset=<name>\n"
+        "  video window record [status]   - the GUI window recording: file, size, rate, frames, keyboard\n"
+        "  video window record <path> [<key>=<value> ...] - record the window as drawn (CRT, on-screen keyboard,\n"
+        "                                   sound) to a .mov (prores) / .mp4 (h264): keyboard default|<picture id>,\n"
+        "                                   codec prores|h264, audio on|off, fps 1..100 (audio off), scale 1..4,\n"
+        "                                   hardware on|off, fit on|off, picture_height 0..4320, width / height, layout below|side\n"
+        "  video window record frames <N> - a paused machine runs N frames, every one recorded\n"
+        "  video window record stop       - finish the file (waits for ffmpeg, muxes the sound in)\n"
+        "  video viewport [<name>]        - the overscan frame's crop: full, symmetric, standard, screen_only, next, prev\n"
         "Numbers are decimal or 0x-hex.";
 
     auto emulator = GetSelectedEmulator(session);
@@ -448,6 +464,16 @@ void CLIProcessor::HandleVideo(const ClientSession& session, const std::vector<s
     if (sub == "temporal")
     {
         HandleVideoTemporal(session, context, args);
+        return;
+    }
+    if (sub == "window")
+    {
+        HandleVideoWindow(session, args);
+        return;
+    }
+    if (sub == "viewport")
+    {
+        HandleVideoViewport(session, *emulator, args);
         return;
     }
     unsigned a = 0, b = 0, c = 0;
@@ -512,6 +538,158 @@ void CLIProcessor::HandleVideoTemporal(const ClientSession& session, EmulatorCon
     session.SendResponse(TemporalStatus::Summary(context) + NEWLINE + DeviceState::ToText(TemporalStatus::Report(context)));
 }
 
+// HandleVideoWindow — `video window [status | <key>=<value> ...]`: the GUI window's display settings (GPU
+// acceleration, CRT effects and profile, temporal blending). Mirrors GET / PUT /api/v1/emulator/{id}/video/window
+// (the same WindowDisplay report); headless there is no window.
+void CLIProcessor::HandleVideoWindow(const ClientSession& session, const std::vector<std::string>& args)
+{
+    // `video window record [status | <path> [<key>=<value> ...] | frames <N> | stop]`: the window recording
+    // (POST / GET /video/window/record, .../frames, .../stop)
+    if (args.size() >= 2 && args[1] == "record")
+    {
+        HandleVideoWindowRecord(session, args);
+        return;
+    }
+    // `video window crt_params [<name>=<value> | <name>+=<steps> | <name>-=<steps> | reset | reset=<name> ...]`: the
+    // active CRT profile's parameters (GET / PUT /video/window/crt_params)
+    if (args.size() >= 2 && args[1] == "crt_params")
+    {
+        CrtParameterChange change;
+        for (size_t i = 2; i < args.size(); ++i)
+        {
+            std::string error;
+            if (!WindowDisplay::ApplyCrtParameterWord(change, args[i], error))
+            {
+                session.SendResponse(error);
+                return;
+            }
+        }
+        const WindowDisplay::ParametersResult r = WindowDisplay::SetCrtParameters(change);
+        if (!r.Ok())
+        {
+            session.SendResponse(std::string("Error (") + WindowDisplay::StatusName(r.status) + "): " + r.error);
+            return;
+        }
+        session.SendResponse(WindowDisplay::CrtParametersSummary(r.parameters));
+        return;
+    }
+    WindowDisplayChange change;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        if (i == 1 && args[i] == "status" && args.size() == 2)
+            break;
+        const size_t eq = args[i].find('=');
+        std::string error;
+        if (eq == std::string::npos)
+            error = "Expected <key>=<value>, not '" + args[i] + "': keys " + WindowDisplay::kKeys;
+        else
+            WindowDisplay::ApplyWord(change, args[i].substr(0, eq), args[i].substr(eq + 1), error);
+        if (!error.empty())
+        {
+            session.SendResponse(error);
+            return;
+        }
+    }
+    const WindowDisplay::Result r = WindowDisplay::Set(change);
+    if (!r.Ok())
+    {
+        session.SendResponse(std::string("Error (") + WindowDisplay::StatusName(r.status) + "): " + r.error);
+        return;
+    }
+    session.SendResponse("Window " + WindowDisplay::Summary(r.settings) + NEWLINE +
+                         DeviceState::ToText(WindowDisplay::Report(r.settings)));
+}
+
+// HandleVideoWindowRecord — `video window record [status | <path> [<key>=<value> ...] | frames <N> | stop]`: the GUI
+// window recording (the picture as drawn, CRT and all, the on-screen keyboard, the machine's sound). Mirrors
+// /api/v1/emulator/{id}/video/window/record* (the same WindowRecording checks and report); headless there is no window.
+void CLIProcessor::HandleVideoWindowRecord(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto respond = [&session](const WindowRecording::Result& r, const std::string& prefix = {}) {
+        if (!r.Ok())
+        {
+            session.SendResponse(std::string("Error (") + WindowRecording::StatusName(r.status) + "): " + r.error);
+            return;
+        }
+        session.SendResponse(prefix + WindowRecording::Summary(r.recording) + NEWLINE +
+                             DeviceState::ToText(WindowRecording::Report(r.recording)));
+    };
+    const std::string op = args.size() >= 3 ? args[2] : "status";
+    if (op == "status" && args.size() <= 3)
+    {
+        respond(WindowRecording::Get());
+        return;
+    }
+    if (op == "stop" && args.size() == 3)
+    {
+        respond(WindowRecording::Stop());
+        return;
+    }
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse("No emulator selected.");
+        return;
+    }
+    if (op == "frames")
+    {
+        int frames = 0;
+        double number = 0;
+        if (args.size() != 4 || !WindowDisplay::ParseNumber(args[3], number) || number < 1 ||
+            number > WindowRecording::kMaxFrames || number != static_cast<double>(static_cast<int>(number)))
+        {
+            session.SendResponse("Usage: video window record frames <1.." + std::to_string(WindowRecording::kMaxFrames) +
+                                 ">");
+            return;
+        }
+        frames = static_cast<int>(number);
+        if (RunControlHeld(session, emulator))
+            return;
+        respond(WindowRecording::RunFrames(*emulator, frames), "Ran " + std::to_string(frames) + " frames, ");
+        return;
+    }
+    WindowRecordingRequest request;
+    request.path = op;
+    for (size_t i = 3; i < args.size(); ++i)
+    {
+        const size_t eq = args[i].find('=');
+        std::string error;
+        if (eq == std::string::npos)
+            error = "Expected <key>=<value>, not '" + args[i] + "': keys " + WindowRecording::kKeys;
+        else
+            WindowRecording::ApplyWord(request, args[i].substr(0, eq), args[i].substr(eq + 1), error);
+        if (!error.empty())
+        {
+            session.SendResponse(error);
+            return;
+        }
+    }
+    respond(WindowRecording::Start(emulator->GetId(), request));
+}
+
+// HandleVideoViewport — `video viewport [status | full | symmetric | standard | screen_only | next | prev]`: the crop of
+// the Pentagon's overscan frame. Mirrors GET / PUT /api/v1/emulator/{id}/video/viewport (VideoViewport); overscan
+// itself: `feature overscan on` or PUT /state/screen/overscan.
+void CLIProcessor::HandleVideoViewport(const ClientSession& session, Emulator& emulator,
+                                       const std::vector<std::string>& args)
+{
+    if (args.size() > 2)
+    {
+        session.SendResponse("Usage: video viewport [status | " + VideoViewport::NameList() + " | next | prev]");
+        return;
+    }
+    if (args.size() == 2 && args[1] != "status")
+    {
+        const VideoViewport::Result r = VideoViewport::SetViewport(emulator, args[1]);
+        if (!r.Ok())
+        {
+            session.SendResponse("Error: " + r.error);
+            return;
+        }
+    }
+    session.SendResponse(VideoViewport::Summary(emulator) + NEWLINE + DeviceState::ToText(VideoViewport::Report(emulator)));
+}
+
 // HandleFrameCost — halt/active cost of the last frame plus session averages.
 // Mirrors GET /api/v1/emulator/{id}/frame_cost.
 void CLIProcessor::HandleFrameCost(const ClientSession& session, const std::vector<std::string>& args)
@@ -565,8 +743,92 @@ void CLIProcessor::HandleFrameCost(const ClientSession& session, const std::vect
     session.SendResponse(ss.str());
 }
 
+// HandleAnalysis - the analysis layers through analysis::Execute (analysiscontrol.h), the same verbs as
+// POST /analysis/{start,stop}, GET /analysis/{status,explain} and MCP `analysis`
+void CLIProcessor::HandleAnalysis(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse("No emulator selected.");
+        return;
+    }
+    std::string action;
+    std::map<std::string, std::string> options;
+    bool json = false;
+    std::string error;
+    if (!CliAnalysis::ParseArgs(args, action, options, json, error))
+    {
+        session.SendResponse("Error: " + error + NEWLINE + CliAnalysis::kUsage + NEWLINE);
+        return;
+    }
+    const analysis::Reply reply = analysis::Execute(*emulator, action, options);
+    if (json)
+    {
+        session.SendResponse(StateNodeToJsonText(reply.ToValue()) + NEWLINE);
+        return;
+    }
+    session.SendResponse((reply.Ok() ? reply.text : "Error: " + reply.message) + NEWLINE);
+}
+
+// HandleMarkup - the memory markup through markup::Execute (markupcontrol.h), the same verbs as GET / PUT / DELETE
+// /markup, /markup/layers, /markup/comment, POST /markup/save-profile and MCP debug_code markup actions
+void CLIProcessor::HandleMarkup(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse("No emulator selected.");
+        return;
+    }
+    std::string action;
+    std::map<std::string, std::string> options;
+    bool json = false;
+    std::string error;
+    if (!CliMarkup::ParseArgs(args, action, options, json, error))
+    {
+        session.SendResponse("Error: " + error + NEWLINE + CliMarkup::kUsage + NEWLINE);
+        return;
+    }
+    const markup::Reply reply = markup::Execute(*emulator, action, options);
+    if (json)
+    {
+        session.SendResponse(StateNodeToJsonText(reply.ToValue()) + NEWLINE);
+        return;
+    }
+    session.SendResponse((reply.Ok() ? reply.text : "Error: " + reply.message) + NEWLINE);
+}
+
+// HandleCpuProfile - the CPU time profile through profile::Execute (profilecontrol.h), the same operations as
+// /cpuprofile/{op} and MCP analyze_performance cpuprofile
+void CLIProcessor::HandleCpuProfile(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse("No emulator selected.");
+        return;
+    }
+    std::string op;
+    std::map<std::string, std::string> options;
+    bool json = false;
+    std::string error;
+    if (!CliCpuProfile::ParseArgs(args, op, options, json, error))
+    {
+        session.SendResponse("Error: " + error + NEWLINE + CliCpuProfile::kUsage + NEWLINE);
+        return;
+    }
+    const profile::Reply reply = profile::Execute(*emulator, op, options);
+    if (json)
+    {
+        session.SendResponse(StateNodeToJsonText(reply.ToValue()) + NEWLINE);
+        return;
+    }
+    session.SendResponse((reply.Ok() ? reply.text : "Error: " + reply.message) + NEWLINE);
+}
+
 // HandleCoverage — code coverage analyzer control and queries. Mirrors
-// POST /coverage/{start,stop,clear} and GET /coverage[,/gaps].
+// POST /coverage/{start,stop,clear,export} and GET /coverage[,/gaps].
 void CLIProcessor::HandleCoverage(const ClientSession& session, const std::vector<std::string>& args)
 {
     auto emulator = GetSelectedEmulator(session);
@@ -620,6 +882,36 @@ void CLIProcessor::HandleCoverage(const ClientSession& session, const std::vecto
     {
         coverage->clear();
         session.SendResponse("Coverage data cleared.");
+        return;
+    }
+
+    if (subcommand == "export")
+    {
+        // coverage export [<path>] [--format skoolkit-map] [--start A] [--end B] [--merge]
+        coverageexport::Options options;
+        for (size_t i = 1; i < args.size(); i++)
+        {
+            const std::string& arg = args[i];
+            if (arg == "--merge")
+                options["merge"] = "true";
+            else if ((arg == "--format" || arg == "--start" || arg == "--end") && i + 1 < args.size())
+                options[arg.substr(2)] = args[++i];
+            else if (arg.rfind("--", 0) == 0 || options.count("path"))
+            {
+                session.SendResponse("Usage: coverage export [<path>] [--format skoolkit-map] [--start A] [--end B] [--merge]");
+                return;
+            }
+            else
+                options["path"] = arg;
+        }
+        const coverageexport::Result result = coverageexport::Export(coverage, options);
+        if (!result.Ok())
+        {
+            session.SendResponse("Error: " + result.message);
+            return;
+        }
+        // Without a path the map itself (one $HHHH line per instruction start)
+        session.SendResponse(result.path.empty() ? result.text + result.message : result.message);
         return;
     }
 
@@ -852,16 +1144,37 @@ void CLIProcessor::HandleAudioCapture(const ClientSession& session, const std::v
                 return;
             }
         }
-        if (seconds < 0.01 || seconds > 30.0)
+
+        // "... [source] file <path.wav>": the samples go to the WAV while they come (no memory ceiling)
+        std::string file;
+        std::string sourceArg = args.size() >= 3 ? args[2] : std::string();
+        for (size_t i = 2; i < args.size(); i++)
         {
-            session.SendResponse("Duration must be within [0.01, 30.0] seconds.");
+            if (args[i] == "file")
+            {
+                if (i + 1 >= args.size())
+                {
+                    session.SendResponse("Usage: audiocapture start <seconds> [source] [file <path.wav>]");
+                    return;
+                }
+                file = args[i + 1];
+                if (i == 2)
+                    sourceArg.clear();
+                break;
+            }
+        }
+        const double maxSeconds = file.empty() ? 30.0 : AudioCaptureAnalyzer::MAX_STREAM_SECONDS;
+        if (seconds < 0.01 || seconds > maxSeconds)
+        {
+            session.SendResponse(file.empty() ? "Duration must be within [0.01, 30.0] seconds (use 'file <path>' for longer)."
+                                              : "Duration must be within [0.01, 86400] seconds.");
             return;
         }
 
         // One mixer device instead of the master mix (core AudioMixer::Capturable; GET /audio/mixer lists them)
         AudioSourceType source = AudioSourceType::MasterMix;
         std::string sourceError;
-        if (!AudioMixer::Capturable(context, args.size() >= 3 ? args[2] : std::string(), source, sourceError))
+        if (!AudioMixer::Capturable(context, sourceArg, source, sourceError))
         {
             session.SendResponse("Error: " + sourceError);
             return;
@@ -871,10 +1184,20 @@ void CLIProcessor::HandleAudioCapture(const ClientSession& session, const std::v
         const size_t target = static_cast<size_t>(seconds * static_cast<double>(rate)) * 2;  // interleaved stereo
 
         analyzerManager->activate("audiocapture");
-        capture->startCapture(target, source);
+        if (!file.empty())
+        {
+            std::string streamError;
+            if (!capture->startStreamCapture(file, static_cast<uint32_t>(rate), target, source, streamError))
+            {
+                session.SendResponse("Error: " + streamError);
+                return;
+            }
+        }
+        else
+            capture->startCapture(target, source);
 
         std::stringstream ss;
-        ss << std::dec << "Audio capture armed: " << seconds << "s (" << target << " stereo samples @ " << rate
+        ss << std::dec << "Audio capture armed" << (file.empty() ? "" : " to " + file) << ": " << seconds << "s (" << target << " stereo samples @ " << rate
            << " Hz), source " << AudioMixer::Key(source) << ".";
         session.SendResponse(ss.str());
         return;
@@ -895,10 +1218,27 @@ void CLIProcessor::HandleAudioCapture(const ClientSession& session, const std::v
         return;
     }
 
+    if ((subcommand == "result" || subcommand == "save") && capture->isStreaming())
+    {
+        // The audio is in the WAV, not in memory
+        if (!capture->isStreamClosed())
+        {
+            session.SendResponse("The capture file is still being written - use 'audiocapture stop' or wait for the target.");
+            return;
+        }
+        const size_t streamRate = context->pSoundManager ? context->pSoundManager->getCoreRate() : 44100;
+        std::stringstream ss;
+        ss << std::dec << "Audio capture written to " << capture->getStreamPath() << ": "
+           << capture->getCapturedSamples() / 2 << " frames @ " << streamRate << " Hz"
+           << (capture->hasStreamFailed() ? " (write failed)" : "") << NEWLINE;
+        session.SendResponse(ss.str());
+        return;
+    }
+
     if (subcommand == "result" || subcommand == "save")
     {
         const auto& buffer = capture->getBuffer();
-        const size_t frames = buffer.size() / 2;
+        const size_t frames = std::min(buffer.size(), capture->getCapturedSamples()) / 2;
 
         if (frames == 0)
         {
@@ -966,8 +1306,128 @@ void CLIProcessor::HandleAudioCapture(const ClientSession& session, const std::v
     ss << "  Armed: " << (capture->isCaptureArmed() ? "yes" : "no") << NEWLINE;
     ss << "  Complete: " << (capture->isCaptureComplete() ? "yes" : "no") << NEWLINE;
     ss << "  Samples: " << capture->getCapturedSamples() << " / " << capture->getTargetSamples() << NEWLINE;
+    if (capture->isStreaming())
+        ss << "  File: " << capture->getStreamPath() << (capture->isStreamClosed() ? " (closed)" : " (writing)")
+           << NEWLINE;
 
     session.SendResponse(ss.str());
+}
+
+// HandleSectionTimer - section timing via SectionTimerAnalyzer (the machine never stops, interrupts accounted).
+// Mirrors POST /analyzers/section-timer and GET /analyzers/section-timer/result.
+void CLIProcessor::HandleSectionTimer(const ClientSession& session, const std::vector<std::string>& args)
+{
+    static const char* usage =
+        "Usage: sectiontimer start [SECTION ...] [extra A,B] [break-if [net:]NAME<op>T] [recursive] [frame-t T] "
+        "[capacity N] | stop | clear | status | result [offset] [limit]\n"
+        "  SECTION = NAME (labels NAME and NAME.End) or name=ENTRY:EXIT[,EXIT]; none = every label X with an X.End";
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse("No emulator selected.");
+        return;
+    }
+    SectionTimerAnalyzer* timer = SectionTimerAnalyzer::Find(emulator->GetContext());
+    if (!timer)
+    {
+        session.SendResponse("Section timer not available.");
+        return;
+    }
+
+    const std::string subcommand = args.empty() ? "status" : args[0];
+    if (subcommand == "start")
+    {
+        SectionTimerAnalyzer::Spec spec;
+        for (size_t i = 1; i < args.size(); i++)
+        {
+            const std::string& a = args[i];
+            const bool hasValue = i + 1 < args.size();
+            if (a == "recursive")
+                spec.recursive = true;
+            else if ((a == "extra" || a == "break-if" || a == "frame-t" || a == "capacity") && !hasValue)
+            {
+                session.SendResponse(usage);
+                return;
+            }
+            else if (a == "extra")
+            {
+                std::stringstream list(args[++i]);
+                std::string one;
+                while (std::getline(list, one, ','))
+                    spec.extra.push_back(one);
+            }
+            else if (a == "break-if")
+                spec.breakIf.push_back(args[++i]);
+            else if (a == "frame-t" || a == "capacity")
+            {
+                uint32_t value = 0;
+                if (!MemoryRead::ParseNumber(args[++i], value))
+                {
+                    session.SendResponse(usage);
+                    return;
+                }
+                if (a == "frame-t")
+                    spec.frameT = value;
+                else
+                    spec.capacity = value;
+            }
+            else
+                spec.sections.push_back(a);
+        }
+        std::string error;
+        if (!timer->Start(spec, error))
+        {
+            session.SendResponse("Error: " + error);
+            return;
+        }
+        const SectionTimerAnalyzer::Result r = timer->GetResult(0, 0);
+        std::string names;
+        for (const auto& section : r.sections)
+            names += (names.empty() ? "" : ", ") + section.name;
+        session.SendResponse("Section timer on: " + std::to_string(r.sections.size()) + " sections (" + names + ")" +
+                             (spec.breakIf.empty() ? "" : ", pauses on a break condition") + ".");
+        return;
+    }
+    if (subcommand == "stop")
+    {
+        session.SendResponse(timer->Stop() ? "Section timer off; 'sectiontimer status' shows the results."
+                                           : "Section timer was not running.");
+        return;
+    }
+    if (subcommand == "clear")
+    {
+        timer->Clear();
+        session.SendResponse("Section timer results cleared.");
+        return;
+    }
+    if (subcommand == "status")
+    {
+        std::string text = SectionTimerAnalyzer::ToText(timer->GetResult(0, 0));
+        while (!text.empty() && text.back() == '\n')
+            text.pop_back();
+        size_t at = 0;
+        while ((at = text.find('\n', at)) != std::string::npos)
+        {
+            text.replace(at, 1, NEWLINE);
+            at += std::string(NEWLINE).size();
+        }
+        session.SendResponse(text);
+        return;
+    }
+    if (subcommand == "result")
+    {
+        uint32_t offset = 0;
+        uint32_t limit = 1000;
+        if ((args.size() > 1 && !MemoryRead::ParseNumber(args[1], offset)) ||
+            (args.size() > 2 && !MemoryRead::ParseNumber(args[2], limit)))
+        {
+            session.SendResponse(usage);
+            return;
+        }
+        session.SendResponse(SectionTimerAnalyzer::ToJson(timer->GetResult(offset, limit)));
+        return;
+    }
+    session.SendResponse(usage);
 }
 
 // HandleVideoRecord — video recording via RecordingManager. Mirrors
@@ -992,6 +1452,24 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
 
     const std::string subcommand = args.empty() ? "status" : args[0];
 
+    if (subcommand == "presets")
+    {
+        std::stringstream ss;
+        ss << "Recording presets (videorecord start --preset ID):" << NEWLINE;
+        for (const capture::RecordingPreset& preset : capture::RecordingPresets())
+        {
+            ss << "  " << std::left << std::setw(11) << preset.id << " " << preset.title << " - " << preset.mode
+               << ", ." << preset.container;
+            if (preset.format[0] != '\0')
+                ss << ", " << preset.format;
+            if (preset.audio[0] != '\0')
+                ss << " + " << preset.audio;
+            ss << NEWLINE;
+        }
+        session.SendResponse(ss.str());
+        return;
+    }
+
     if (subcommand == "start")
     {
         if (rm->IsRecording() || rm->IsPaused())
@@ -1000,9 +1478,10 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
             return;
         }
 
-        // videorecord start [format] [filename] [--fps N] [--scale N] [--region full|screen] [--audio-rate N|auto]
-        //                   [--audio CODEC] [--video-bitrate KBPS] [--audio-bitrate KBPS]
-        //                   [--profile native|1080p|1440p|4k] [--acceleration auto|hardware|software]
+        // videorecord start [format] [filename] [--preset NAME] [--mode single|multi|audio] [--container EXT]
+        //                   [--fps N] [--scale N] [--region full|screen] [--audio-rate N|auto] [--audio CODEC]
+        //                   [--video-bitrate KBPS] [--audio-bitrate KBPS] [--profile native|1080p|1440p|4k]
+        //                   [--acceleration auto|hardware|software]
         CliVideoRecord::StartOptions options;
         std::string optionError;
         if (!CliVideoRecord::ParseStart(args, options, optionError))
@@ -1011,35 +1490,11 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
             return;
         }
 
-        if (options.filename.empty())
-            options.filename = defaultRecordingPath(emulator->GetId(), CliVideoRecord::DefaultExtension(options.format));
-
-        // Audio codec vs container (gif has no audio) and bitrate ranges, before anything changes
-        if (!CliVideoRecord::Validate(options, optionError))
-        {
-            session.SendResponse(optionError);
-            return;
-        }
-
-        const std::string& format = options.format;
-        const std::string& filename = options.filename;
-        const float fps = options.fps;
-        const uint32_t scale = options.scale;
-        const bool hasAudioRate = options.hasAudioRate;
-        const uint32_t audioRate = options.audioRate;
-
-        // Configuration setters refuse changes mid-recording — apply while idle
-        rm->SetVideoFrameRate(fps);
-        rm->SetScaleFactor(scale);
-        rm->SetCaptureRegion(options.screenRegion ? VideoCaptureRegion::MainScreen : VideoCaptureRegion::FullFrame);
-        rm->SetOutputProfile(options.profile);
-        rm->SetEncoderAcceleration(EncoderAccelerationFromName(options.acceleration));
-
         // Optional core-rate pin before the first sample is stamped: the
         // recording must start (and stay) at the requested audio rate. The
         // pin applies at the next frame boundary - wait for it so a paused
         // emulator fails here instead of producing a mislabeled file.
-        if (hasAudioRate)
+        if (options.hasAudioRate)
         {
             SoundManager* sound = context->pSoundManager;
             if (!sound)
@@ -1048,7 +1503,7 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
                 return;
             }
 
-            sound->setCoreRatePin(audioRate);
+            sound->setCoreRatePin(options.audioRate);
             for (int attempt = 0; attempt < 100 && sound->getCoreRate() != sound->getTargetCoreRate(); attempt++)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1061,23 +1516,52 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
             }
         }
 
-        if (!rm->StartRecording(filename, format, options.audio, options.videoBitrate, options.audioBitrate))
+        // The rules (presets, codecs vs containers, bitrates) are capture::RecordingControl's, as on every plane
+        std::error_code ec;
+        const std::string folder = (std::filesystem::temp_directory_path(ec) / "unreal-cli").string();
+        const capture::RecordingReply reply = capture::RecordingControl(*emulator, folder).Execute("start", options.given);
+        if (!reply.ok)
         {
-            session.SendResponse("Failed to start recording: " + rm->GetLastRecordingError());
+            session.SendResponse((reply.error == "Recording start failed" ? "Failed to start recording: " : "") +
+                                 reply.message);
             return;
         }
 
+        auto text = [&reply](const char* name) {
+            const StateNode* node = reply.body.find(name);
+            if (node == nullptr)
+                return std::string();
+            if (node->kind == StateNode::Kind::String)
+                return node->s;
+            if (node->kind == StateNode::Kind::Int)
+                return std::to_string(node->i);
+            if (node->kind == StateNode::Kind::Double)
+            {
+                std::ostringstream number;
+                number << node->d;
+                return number.str();
+            }
+            return std::string();
+        };
         std::stringstream ss;
-        ss << std::dec << "Recording started: " << filename << " (" << format << ", " << fps << " fps, x" << scale << ", "
-           << (options.screenRegion ? "screen" : "full") << " region";
+        ss << std::dec << "Recording started: " << text("output") << " (";
+        if (!text("preset").empty())
+            ss << "preset " << text("preset") << ", ";
+        if (text("mode") == "audio")
+            ss << "audio only";
+        else
+            ss << text("format") << ", " << text("fps") << " fps, x" << text("scale") << ", " << text("region")
+               << " region";
         if (rm->HasFixedOutput())
             ss << ", profile " << rm->GetOutputProfile() << " " << rm->GetOutputWidth() << "x" << rm->GetOutputHeight();
-        ss << ", acceleration " << options.acceleration;
+        ss << ", acceleration " << text("acceleration");
         if (rm->HasAudio())
             ss << ", audio " << rm->GetAudioCodec() << " " << rm->GetAudioSampleRate() << " Hz "
                << rm->GetAudioChannels() << " ch";
         else
             ss << ", no audio";
+        if (text("mode") == "multi")
+            ss << ", " << text("audio_tracks") << " tracks";
         if (context->pSoundManager)
             ss << ", core " << context->pSoundManager->getCoreRate() << " Hz";
         ss << ")";
@@ -1085,15 +1569,26 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
         return;
     }
 
-    if (subcommand == "stop")
+    if (subcommand == "stop" || subcommand == "pause" || subcommand == "resume" || subcommand == "toggle")
     {
-        if (!rm->IsRecording() && !rm->IsPaused())
+        std::error_code ec;
+        const std::string folder = (std::filesystem::temp_directory_path(ec) / "unreal-cli").string();
+        const capture::RecordingReply reply = capture::RecordingControl(*emulator, folder).Execute(subcommand);
+        if (!reply.ok)
         {
-            session.SendResponse("No recording is active.");
+            session.SendResponse(reply.message.empty() ? reply.error : reply.message);
             return;
         }
-
-        rm->StopRecording();
+        if (subcommand == "pause" || subcommand == "resume")
+        {
+            session.SendResponse(subcommand == "pause" ? "Recording paused." : "Recording resumed.");
+            return;
+        }
+        if (rm->IsRecording())
+        {
+            session.SendResponse("Recording started: " + rm->GetOutputFilename());
+            return;
+        }
         const RecordingManager::RecordingStats stats = rm->GetStats();
         std::stringstream ss;
         ss << std::dec << "Recording stopped: " << rm->GetOutputFilename() << " (" << stats.framesRecorded
@@ -1103,32 +1598,6 @@ void CLIProcessor::HandleVideoRecord(const ClientSession& session, const std::ve
                << rm->GetAudioDuration() << " s audio";
         ss << ")";
         session.SendResponse(ss.str());
-        return;
-    }
-
-    if (subcommand == "pause")
-    {
-        if (!rm->IsRecording())
-        {
-            session.SendResponse("No active recording to pause.");
-            return;
-        }
-
-        rm->PauseRecording();
-        session.SendResponse("Recording paused.");
-        return;
-    }
-
-    if (subcommand == "resume")
-    {
-        if (!rm->IsPaused())
-        {
-            session.SendResponse("No paused recording to resume.");
-            return;
-        }
-
-        rm->ResumeRecording();
-        session.SendResponse("Recording resumed.");
         return;
     }
 

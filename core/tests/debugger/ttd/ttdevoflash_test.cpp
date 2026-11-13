@@ -16,7 +16,7 @@
 #include "base/featuremanager.h"
 #include "debugger/assembler/z80textassembler.h"
 #include "debugger/ttd/timetravelcontroller.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/cpu/core.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/emulator.h"
@@ -141,8 +141,8 @@ IDLE    JR IDLE
         ~Detach()
         {
             t->StopRecording();
-            c->pTimeTravelHooks = c->pTimeTravelManager;
-            c->ttdWriteSink = c->pTimeTravelManager;
+            c->pTimeTravelHooks = c->pTimeTravelController;
+            c->ttdWriteSink = c->pTimeTravelController;
         }
     } detach{context, controller.get()};
 
@@ -179,7 +179,9 @@ IDLE    JR IDLE
         sawProgrammedInArrayMode = sawProgrammedInArrayMode || (m.programmed == value && m.arrayMode);
         EXPECT_EQ(m.erased, sectorByte) << "checkpoint " << i << ": the erase never finished";
         if (m.programmed == original)
+        {
             EXPECT_TRUE(m.arrayMode) << "checkpoint " << i << ": nothing started before the program";
+        }
         EXPECT_EQ(decoder->GetFlash().IsInstalled(), !m.arrayMode || decoder->GetFlash().WriteWindows() != 0);
     }
     EXPECT_TRUE(sawOriginal) << "a checkpoint before the program";

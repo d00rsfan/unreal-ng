@@ -1,0 +1,41 @@
+# The debugger on any pad (debug-and-ttd.md §4.2): the layer key on the view+menu chord, bookmarks on lb / rb with
+# the d-pad. The pad follows its instance's context as every surface does (control surfaces profiles.md §1): in
+# `debug` / `debug.*`, or a `ttd` somebody set (the Stream Deck's Time page, the TTD panel focused), it drives the
+# debugger with no key held, and its layer key sets `debug` for all of them. Above `debug`, the context's layer:
+#   ttd           the d-pad steps the history by frames
+#   ttd.timecode  by seconds
+schema: 1
+kind: debug
+id: builtin/debug/pad-default
+label: Debugger on a pad
+layer_key: { control: view+menu, mode: hold }
+layers:
+  debug:
+    lt:              { action: ttd.scrub_back, curve: scrub }
+    rt:              { action: ttd.scrub_forward, curve: scrub }
+    south:           { action: run.step_in }
+    rb:              { action: run.step_over }
+    lb:              { action: run.step_out }
+    lb+dpad.left:    { action: ttd.bookmark_prev }
+    rb+dpad.right:   { action: ttd.bookmark_next }
+    dpad.left:       { action: ttd.step_back_instruction, repeat: { delay: 15, rate: 4 } }
+    dpad.right:      { action: run.step_in, repeat: { delay: 15, rate: 4 } }
+    dpad.up:         { action: run.frame_step }
+    dpad.down:       { action: ttd.step_back_frame }
+    north:           { action: ttd.reverse_continue }
+    west:            { action: ttd.bookmark_add }
+    east:            { action: ttd.resume_live }
+    menu:            { action: run.pause_toggle }
+    view:            { action: debugger.focus_next }
+    lstick.up:       { action: debugger.cursor_move, params: { dir: up } }
+    lstick.down:     { action: debugger.cursor_move, params: { dir: down } }
+    lstick.left:     { action: debugger.cursor_move, params: { dir: left } }
+    lstick.right:    { action: debugger.cursor_move, params: { dir: right } }
+    rstick.click:    { action: dbg.breakpoint_toggle_pc }
+    lstick.click:    { action: debugger.activate }
+  "@ttd":
+    dpad.left:       { action: ttd.step_back_frame, repeat: { delay: 15, rate: 4 } }
+    dpad.right:      { action: ttd.step_forward_frame, repeat: { delay: 15, rate: 4 } }
+  "@ttd.timecode":
+    dpad.left:       { action: ttd.unit_back, curve: { unit: seconds }, repeat: { delay: 15, rate: 4 } }
+    dpad.right:      { action: ttd.unit_forward, curve: { unit: seconds }, repeat: { delay: 15, rate: 4 } }

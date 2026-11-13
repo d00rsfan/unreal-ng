@@ -4,14 +4,74 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
-#include "debugger/ttd/timetravelhooks.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/emulatormanager.h"
 #include "emulator/media/modelswitch.h"
 #include "emulator/platform.h"
+#include "loaders/nex/loadernex.h"
 #include "loaders/snapshot/loaderspg.h"
+#include "loaders/snapshot/snapshotimage.h"
+#include "loaders/snapshot/snapshotpipeline.h"
+#include "loaders/snapshot/szx/loaderszx.h"
+
+namespace
+{
+/// The machine for a snapshot whose plan the running machine refused for want of memory (a 128K z80 on a 48K, a
+/// Pentagon 512 sna on a Pentagon 128): the one the file says it was made on, else what the refusal needs
+/// ("model:128K", "ram:512K"). False: neither names a machine this emulator has
+bool MachineForRefusal(const snapshot::Image& image, const snapshot::Report& plan, const CONFIG& running,
+                       std::string& model, uint32_t& ramKb)
+{
+    static const struct
+    {
+        const char* hint;
+        const char* model;
+        uint32_t ramKb;
+    } kMadeOn[] = {{"128k", "128k", 128},          {"plus2", "PLUS2", 128},
+                   {"plus2a", "PLUS2A", 128},      {"plus3", "PLUS3", 128},
+                   {"pentagon128", "PENTAGON", 128}, {"pentagon512", "PENTAGON", 512},
+                   {"pentagon1024", "PENTAGON", 1024}, {"scorpion256", "SCORPION", 256}};
+    for (const auto& m : kMadeOn)
+    {
+        if (image.machineHint == m.hint)
+        {
+            model = m.model;
+            ramKb = m.ramKb;
+            return true;
+        }
+    }
+    if (plan.needs.rfind("model:", 0) == 0)
+    {
+        const TMemModel* found = Config::FindModelByShortName(plan.needs.substr(6));
+        if (!found)
+            return false;
+        model = found->ShortName;
+        ramKb = found->defaultRAM;
+        return true;
+    }
+    if (plan.needs.rfind("ram:", 0) == 0)
+    {
+        const uint32_t wanted = static_cast<uint32_t>(std::strtoul(plan.needs.c_str() + 4, nullptr, 10));
+        // The running model with more RAM, else a Pentagon: the smallest size that holds the banks
+        for (const TMemModel* candidate : {Config::FindModelByEnum(running.mem_model), Config::FindModelByShortName("PENTAGON")})
+        {
+            for (uint32_t size = 128; candidate && size <= 4096; size *= 2)
+            {
+                if (size >= wanted && (candidate->AvailRAMs & size))
+                {
+                    model = candidate->ShortName;
+                    ramKb = size;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+}  // namespace
 
 bool SnapshotLauncher::RequiredModel(const std::string& path, std::string& model, uint32_t& ramKb, std::string& error)
 {
@@ -25,6 +85,51 @@ bool SnapshotLauncher::RequiredModel(const std::string& path, std::string& model
             return false;
         model = LoaderSPG::kModel;
         ramKb = LoaderSPG::kRamKb;
+    }
+    else if (ext == "nex" || ext == "snx")
+    {
+        model = LoaderNex::kModel;
+        ramKb = LoaderNex::kRamKb;
+    }
+    return true;
+}
+
+bool SnapshotLauncher::NeedOf(const std::string& path, MEM_MODEL runningModel, uint32_t runningRamKb, Need& need,
+                              std::string& error)
+{
+    need = Need{};
+    std::string ext = path.substr(path.find_last_of('.') == std::string::npos ? path.size() : path.find_last_of('.') + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext == "spg")
+    {
+        if (!LoaderSPG::Probe(path, error))
+            return false;
+        need.model = LoaderSPG::kModel;
+        need.ramKb = LoaderSPG::kRamKb;
+        need.programOnly = true;
+        need.description = "TS-Conf";
+        const TMemModel* tsconf = Config::FindModelByShortName(need.model);
+        need.differs = tsconf && runningModel != tsconf->Model;
+    }
+    else if (ext == "nex" || ext == "snx")
+    {
+        need.model = LoaderNex::kModel;
+        need.ramKb = LoaderNex::kRamKb;
+        need.programOnly = true;
+        need.description = "ZX Spectrum Next";
+        const TMemModel* next = Config::FindModelByShortName(need.model);
+        need.differs = next && runningModel != next->Model;
+    }
+    else if (ext == "szx")
+    {
+        szx::Machine machine;
+        if (!LoaderSZX::ProbeMachine(path, machine, error))
+            return false;
+        const TMemModel* target = Config::FindModelByEnum(machine.model);
+        need.model = target ? target->ShortName : "";
+        need.ramKb = machine.ramKb;
+        need.description = szx::DescribeModel(machine.model, machine.ramKb);
+        need.differs = !LoaderSZX::Suits(runningModel, runningRamKb, machine);
     }
     return true;
 }
@@ -41,27 +146,66 @@ SnapshotLoadResult SnapshotLauncher::Load(const SnapshotLoadRequest& request)
     }
     out.emulator = emulator;
 
+    // A ZX-Poly module takes a .zxp only and is never replaced by another model (the group would lose a module)
+    if (snapshot::IsZXPolyModule(*emulator->GetContext()))
+    {
+        const std::string::size_type dot = request.path.find_last_of('.');
+        out.message = snapshot::ZXPolyRefusal(dot == std::string::npos ? std::string("snapshot") : request.path.substr(dot + 1));
+        return out;
+    }
+
     std::string error;
-    if (!RequiredModel(request.path, out.requiredModel, out.requiredRamKb, error))
+    const CONFIG& running = emulator->GetContext()->config;
+    Need need;
+    if (!NeedOf(request.path, running.mem_model, running.ramsize, need, error))
     {
         out.message = error;
         return out;
     }
-
-    const TMemModel* required = out.requiredModel.empty() ? nullptr : Config::FindModelByShortName(out.requiredModel);
-    const CONFIG& running = emulator->GetContext()->config;
-    if (required && running.mem_model != required->Model)
+    if (need.model.empty())
     {
-        if (!request.switchModel)
+        // A z80 / sna names no model up front: the dry plan says whether this machine can hold it, and the file's
+        // machine hint which one can
+        snapshot::Image image;
+        snapshot::Report plan;
+        bool proceeds = true;
+        std::string planError;
+        snapshot::Options dryRun;
+        dryRun.commit = request.commit;
+        if (emulator->PlanSnapshot(request.path, dryRun, image, plan, proceeds, planError) && !proceeds &&
+            plan.refused && MachineForRefusal(image, plan, running, need.model, need.ramKb))
+        {
+            const TMemModel* target = Config::FindModelByShortName(need.model);
+            need.differs = true;
+            need.description = target ? szx::DescribeModel(target->Model, need.ramKb) : need.model;
+        }
+        else
+        {
+            need.model.clear();
+        }
+    }
+    out.requiredModel = need.model;
+    out.requiredRamKb = need.ramKb;
+
+    if (need.differs && !need.model.empty())
+    {
+        // Not asked: a TS-Conf program switches (it runs nowhere else); a snapshot of another machine does only when the
+        // configuration says so
+        const bool allowed = request.switchModel ? *request.switchModel : (need.programOnly || running.snapshot_switch_model);
+        if (!allowed)
         {
             out.modelMismatch = true;
-            out.message = "the file runs on " + out.requiredModel + " only (this machine is " +
-                          Config::GetModelFullName(running.mem_model) + "); switch the model first";
+            out.message = need.programOnly
+                              ? "the file runs on " + need.model + " only (this machine is " +
+                                    Config::GetModelFullName(running.mem_model) + "); switch the model first"
+                              : "the snapshot was saved on a " + need.description + ", this machine is a " +
+                                    szx::DescribeModel(running.mem_model, running.ramsize) +
+                                    ": switch the model first, or load with switch_model=true (or set [SNAPSHOT] SwitchModel=1)";
             return out;
         }
 
-        // The recorded history belongs to this machine (D26): not while TTD records
-        if (std::string refusal = emulator->RecordingGuard(ttd::TTDGuardedAction::SwitchModel); !refusal.empty())
+        // The recorded history belongs to this machine (D26): the coordinator decides (logged)
+        if (std::string refusal = emulator->AskModelSwitch("to " + out.requiredModel); !refusal.empty())
         {
             out.message = refusal;
             return out;

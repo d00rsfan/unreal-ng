@@ -24,7 +24,9 @@ enum class Op : uint8_t
     // binary
     Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr,
     ShrUnsigned,                   ///< sjasmplus ">>>": shift right filling with zeros
-    RotateLeft16, RotateRight16,   ///< ALASM's "<" / ">": cyclic shifts of a 16-bit word
+    // Not RotateLeft16 / RotateRight16: winnt.h defines those as macros (_rotl16 / _rotr16), so a file that had windows.h
+    // before this header saw other enumerator names than one that had not (gcc -flto, -Wodr)
+    CyclicLeft16, CyclicRight16,   ///< ALASM's "<" / ">": cyclic shifts of a 16-bit word
     Equal, NotEqual, Less, Greater, LessEqual, GreaterEqual, LogicalAnd, LogicalOr,
     // unary
     Negate, Plus, Not, High, Low,
@@ -41,6 +43,7 @@ struct Expr
         Symbol,        ///< text = the name
         Current,       ///< $: the current (displaced) address
         CurrentPage,   ///< $$: the current page
+        CurrentPhysical,   ///< where the code is put now while a displacement (DISP / PHASE) is active (sjasmplus $$$)
         Unary,         ///< op, args[0]
         Binary,        ///< op, args[0] op args[1]
         Group,         ///< (args[0]): parentheses the source wrote
@@ -87,7 +90,7 @@ enum class DirectiveKind : uint8_t
     Defl,         ///< the label = args[0], redefinable
     Db,           ///< operands: bytes and strings
     Dw,
-    Ds,           ///< args: count [, fill bytes...]
+    Ds,           ///< args: count [, fill bytes...]; operands: a fill sequence repeated count times; params "cyclic": count bytes of the sequence repeated and cut (STORM)
     Include,      ///< text: file; args: [page]
     Incbin,       ///< text: file; args: [offset [, length]]; params "sector-slack": the rest of the file's last disk sector is written after it without moving the address (TASM)
     If,           ///< args: condition (true when not zero)
@@ -103,6 +106,8 @@ enum class DirectiveKind : uint8_t
     UntilZero,    ///< args: expression
     Disp,         ///< args: address
     Ent,          ///< text "if-displaced": only when a displacement is active (Program::displacementAcrossFiles)
+    IfUsed,       ///< text: a label; the block is assembled when the label is used (params "not": when it is not, IFNUSED)
+    SaveBinary,   ///< text: file; args: start, length: the bytes written there saved to the file while assembling
     LocalBlock,   ///< ALASM LOCAL ... ENDL: labels inside are local to the block
     EndLocalBlock,
     Display,      ///< operands: strings and expressions; params: per-item format keys
@@ -138,6 +143,9 @@ struct Line
     std::string comment;           ///< without the comment character
     bool hasComment = false;
     uint32_t sourceLine = 0;       ///< 1-based line of the source document
+    /// A line the frontend made from a part of its source line (a macro on one line, sjasmplus' label+N): the part's
+    /// text as a line of its own ("" = the source line is the line's text)
+    std::string ownText;
 };
 
 struct Program
@@ -151,5 +159,11 @@ struct Program
     /// The displacement (PHASE / DISP) may continue across INCLUDE: a file cannot know whether one is active where it
     /// starts (TASM). An `Ent` statement with text "if-displaced" ends one only when it is active
     bool displacementAcrossFiles = false;
+    /// What a comparison or a logical not gives when true: 1 (STORM), -1 (sjasmplus); 0 = not said (the source has no
+    /// comparisons whose value is used: the target's own)
+    int trueValue = 0;
+    /// The source is written for the ZX Spectrum Next: the Z80N mnemonics (swapnib, nextreg ...) are instructions. The
+    /// sjasmplus frontend sets it from DEVICE ZXSPECTRUMNEXT / OPT --zxnext (or SourceDocument::z80n)
+    bool z80n = false;
 };
 }  // namespace unrealasm::ir

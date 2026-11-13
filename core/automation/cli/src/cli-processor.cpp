@@ -1,4 +1,7 @@
 #include "cli-processor.h"
+#include "emulator/coordinator/machineop.h"
+#include "emulator/execution/automationgate.h"
+#include "emulator/execution/companionregistry.h"
 
 #include <3rdparty/message-center/eventqueue.h>
 #include <3rdparty/message-center/messagecenter.h>
@@ -13,6 +16,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -83,6 +87,7 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"list", &CLIProcessor::HandleList},
                         {"select", &CLIProcessor::HandleSelect},
                         {"reset", &CLIProcessor::HandleReset},
+                        {"ops", &CLIProcessor::HandleOps},        // Operation log (machine state coordinator)
                         {"nmi", &CLIProcessor::HandleNmi},    // Pulse the NMI line
                         {"mni", &CLIProcessor::HandleMni},    // Scorpion magic button (NMI + service monitor)
                         {"switch", &CLIProcessor::HandleSwitch},  // Front-panel switches (Profi TURBO)
@@ -94,6 +99,9 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"stepover", &CLIProcessor::HandleStepOver},  // Execute instruction, skip calls
                         {"stepout", &CLIProcessor::HandleStepOut},      // Run until current subroutine returns
                         {"skip_until", &CLIProcessor::HandleSkipUntil},  // Fast-forward until PC reaches target
+                        {"run_until", &CLIProcessor::HandleRunUntil},    // Whole frames until a frame watch's rules hold
+                        {"watch", &CLIProcessor::HandleWatch},           // Armed frame watches: add, list, del
+                        {"watches", &CLIProcessor::HandleWatch},         // Alias for watch (list by default)
                         {"run_tstates", &CLIProcessor::HandleRunTStates},        // Run N t-states
                         {"run_to_scanline", &CLIProcessor::HandleRunToScanline}, // Run to scanline N
                         {"run_scanlines", &CLIProcessor::HandleRunNScanlines},   // Run N scanlines
@@ -102,7 +110,10 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"run_frame", &CLIProcessor::HandleRunFrame},               // Run one frame
                         {"run_frames", &CLIProcessor::HandleRunFrames},             // Run N frames
                         {"run_ncycles", &CLIProcessor::HandleRunNCycles},           // Run N CPU cycles
+                        {"pace", &CLIProcessor::HandlePace},                        // The paced run (RunPacer)
                         {"memory", &CLIProcessor::HandleMemory},
+                        {"session", &CLIProcessor::HandleSession},  // automation session: take / release run control
+                        {"companion", &CLIProcessor::HandleCompanion},  // companion client: act as the user's hands
                         {"rtc", &CLIProcessor::HandleRtc},   // CMOS clock: report, read / write cells
                         {"cmos", &CLIProcessor::HandleRtc},
                         {"romflash", &CLIProcessor::HandleRomFlash},  // ZX-Evo flash ROM: the saved flash
@@ -111,6 +122,7 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"net", &CLIProcessor::HandleNetwork},
                         {"find", &CLIProcessor::HandleFind},  // Search Z80 memory for a byte pattern
                         {"debug-snapshot", &CLIProcessor::HandleDebugSnapshot},  // One coherent debugger snapshot (DebugSnapshot)
+                        {"next", &CLIProcessor::HandleNext},  // ZX Spectrum Next: write a NextREG (NextRegWriteControl), `next dma` ...
                         {"out", &CLIProcessor::HandlePortOut},  // A debugger's port write through the decoder (PortWrite)
                         {"debug-wait", &CLIProcessor::HandleDebugWait},  // Long-poll on the debugger snapshot's seq
                         {"pchist", &CLIProcessor::HandlePcHistory},      // PC history with pages (PcHistory)
@@ -124,11 +136,23 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"bplist", &CLIProcessor::HandleBPList},          // List all breakpoints
                         {"wp", &CLIProcessor::HandleWatchpoint},          // Set memory read/write watchpoint
                         {"bport", &CLIProcessor::HandlePortBreakpoint},   // Set port breakpoint
+                        {"bnextreg", &CLIProcessor::HandleNextRegBreakpoint},  // Set ZX Next register breakpoint
+                        {"bbeam", &CLIProcessor::HandleBeamBreakpoint},        // Set ZX Next beam position breakpoint
+                        {"bmagic", &CLIProcessor::HandleMagicBreakpoint},      // Set ZX Next magic-opcode (ED FF / DD 01) breakpoint
+                        {"bcopper", &CLIProcessor::HandleCopperBreakpoint},    // Set ZX Next copper instruction breakpoint
                         {"bphits", &CLIProcessor::HandleBPHits},          // Breakpoint hit counters (reset)
                         {"bpclear", &CLIProcessor::HandleBPClear},        // Clear breakpoints
                         {"bpgroup", &CLIProcessor::HandleBPGroup},        // Manage breakpoint groups
                         {"bpon", &CLIProcessor::HandleBPActivate},        // Activate breakpoints
                         {"bpoff", &CLIProcessor::HandleBPDeactivate},     // Deactivate breakpoints
+                        {"bptoggle", &CLIProcessor::HandleBPToggle},      // Toggle a selection of breakpoints
+                        {"bkey", &CLIProcessor::HandleKeyBreakpoint},     // Keyboard breakpoint (the program sees a key)
+                        {"bevent", &CLIProcessor::HandleEventBreakpoint}, // General Sound protocol event breakpoint
+                        {"bchip", &CLIProcessor::HandleChipRegisterBreakpoint}, // sound chip register write breakpoint
+                        {"bpnote", &CLIProcessor::HandleBPNote},          // Set a breakpoint's note
+                        {"bpcond", &CLIProcessor::HandleBPCondition},     // Set a breakpoint's condition
+                        {"callback", &CLIProcessor::HandleCallback},      // The scripts' callbacks: list, resume, remove, policy
+                        {"callbacks", &CLIProcessor::HandleCallback},     // Alias for callback (list by default)
 
                         {"open", &CLIProcessor::HandleOpen},
                         {"exit", &CLIProcessor::HandleExit},
@@ -149,7 +173,8 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
 
                         // Assembler and source-listing commands
                         {"assemble", &CLIProcessor::HandleAssemble},  // Assemble Z80 text into memory
-                        {"asm", &CLIProcessor::HandleAssemble},      // Alias for assemble
+                        {"asm", &CLIProcessor::HandleAsm},           // Assembler sources (asm decode ...), else assemble
+                        {"signature", &CLIProcessor::HandleSignature},  // Media signatures (file, media, compare)
                         {"listing", &CLIProcessor::HandleListing},    // Source-listing navigation
 
                         // Analysis commands (screen digest, beam, frame cost, analyzers)
@@ -160,10 +185,15 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"video", &CLIProcessor::HandleVideo},                // Video debug translation (layout/pixel/address/text)
                         {"frame_cost", &CLIProcessor::HandleFrameCost},      // Halt/active frame cost stats
                         {"coverage", &CLIProcessor::HandleCoverage},          // Code coverage control/queries
+                        {"analysis", &CLIProcessor::HandleAnalysis},          // Analysis layers: start/stop/status/explain
+                        {"markup", &CLIProcessor::HandleMarkup},              // Memory markup: show/layers/mark/unmark/save
+                        {"cpuprofile", &CLIProcessor::HandleCpuProfile},      // CPU time profile: start/stop/report/frames/export
                         {"aylog", &CLIProcessor::HandleAyLog},                // AY register-write logging
                         {"audiocapture", &CLIProcessor::HandleAudioCapture},  // Buffered stereo capture
+                        {"sectiontimer", &CLIProcessor::HandleSectionTimer},  // Section timing (entry / exit markers)
                         {"mixer", &CLIProcessor::HandleMixer},                // Per-device mixer (mute, solo, volume)
                         {"videorecord", &CLIProcessor::HandleVideoRecord},    // Video recording control
+                        {"recent", &CLIProcessor::HandleRecent},              // Files opened lately (RecentFiles)
 
                         // BASIC commands
                         {"basic", &CLIProcessor::HandleBasic},
@@ -180,6 +210,7 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
 
                         // TS-Conf VDAC2 card (FT812): bus capture
                         {"vdac2", &CLIProcessor::HandleVdac2},
+                        {"bus", &CLIProcessor::HandleBus},
 
                         // General Sound coprocessor triage (activity counters + port/DAC trace)
                         {"gsporttrace", &CLIProcessor::HandleGSPortTrace},
@@ -216,9 +247,21 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
 
                         // ZX-bus slots: buses, slots, cards (plug / remove / set restart the machine)
                         {"slots", &CLIProcessor::HandleSlots},
+                        {"history", &CLIProcessor::HandleHistory},
+                        // Joystick connectors: the retro devices plugged into them, live input (ControllerControl)
+                        {"controllers", &CLIProcessor::HandleControllers},
+                        {"action", &CLIProcessor::HandleAction},
+                        // The GUI control plane's methods (windows, views), when the program registered them
+                        {"gui", &CLIProcessor::HandleGui},
+                        {"surface", &CLIProcessor::HandleSurface},
+                        // The Stream Deck daemon's supervision by unreal-qt, settings, pairing, brightness
+                        {"streamdeck", &CLIProcessor::HandleStreamDeck},
+                        // Monitoring: host process, clients, each instance's pace and summaries (monitoring::Call)
+                        {"monitor", &CLIProcessor::HandleMonitor},
 
                         // ZX-MultiSound card and its MIDI synthesizer
                         {"multisound", &CLIProcessor::HandleMultiSound},
+                        {"wildsound", &CLIProcessor::HandleWildSound},
                         {"midi", &CLIProcessor::HandleMidi},
 
                         // CD audio of the ATAPI CD drives
@@ -256,10 +299,7 @@ CLIProcessor::CLIProcessor() : _emulator(nullptr), _isFirstCommand(true)
                         {"joystick", &CLIProcessor::HandleJoystick},
 
                         // Time-Travel Debug commands
-                        {"ttd", &CLIProcessor::HandleTTD},
-                        
-                        // Videowall commands
-                        {"videowall", &CLIProcessor::HandleVideowall}};
+                        {"ttd", &CLIProcessor::HandleTTD}};
 }
 
 void CLIProcessor::ProcessCommand(ClientSession& session, const std::string& command)
@@ -345,14 +385,58 @@ void CLIProcessor::ProcessCommand(ClientSession& session, const std::string& com
         return;
     }
 
+    // The user took control back from this connection's session at the GUI (execution arbiter design §6a): the
+    // command does not run, the session is over - final, the client must not retry or take control again by itself
+    if (!_controlSession.isNil() && _controlEmulator && _controlEmulator->GetContext() &&
+        _controlEmulator->GetContext()->IsRunControlRevoked(_controlSession))
+    {
+        _controlSession = unreal::UUID();
+        _controlEmulator.reset();
+        session.SendResponse(
+            std::string("Error: revoked_by_user - the user took control back (at the GUI or from a companion); "
+                        "this session has ended. Do not retry, and do not take control again "
+                        "without asking the user.") +
+            NEWLINE);
+        if (cmd != "session")
+            return;
+    }
+
+    // A companion connection whose companion was revoked: the command does not run (as an ordinary one it would open
+    // a session the user did not expect); the connection is ordinary from now on
+    if (!_companionId.empty() && !companion::CompanionRegistry::Instance().Find(_companionId))
+    {
+        _companionId.clear();
+        session.SendResponse(std::string("Error: companion_unknown - this companion was revoked; the connection is an "
+                                         "ordinary one again") + NEWLINE);
+        return;
+    }
+
     // Find and execute the command handler
     auto it = _commandHandlers.find(cmd);
     if (it != _commandHandlers.end())
     {
+        if (!_companionId.empty() ? !PassCompanionGate(session, cmd, args) : !PassAutomationGate(session, cmd, args))
+            return;
         try
         {
+            // A companion's operations are the companion's in the operation log
+            std::optional<coordinator::SourceScope> companionSource;
+            if (!_companionId.empty())
+                companionSource.emplace(coordinator::OpSource::Companion);
             // Call the member function using 'this' pointer to provide context to the handler
             (this->*(it->second))(session, args);
+            // Taken back while this command ran (a long run_frames ends at once): the same final answer
+            if (!_controlSession.isNil() && _controlEmulator && _controlEmulator->GetContext() &&
+                _controlEmulator->GetContext()->IsRunControlRevoked(_controlSession))
+            {
+                _controlSession = unreal::UUID();
+                _controlEmulator.reset();
+                session.SendResponse(
+                    std::string("Error: revoked_by_user - the user took control back (at the "
+                                "GUI or from a companion); this session has ended. Do not retry, and do not "
+                                "take control again without asking the user.") +
+                    NEWLINE);
+            }
         }
         catch (const std::exception& e)
         {
@@ -606,7 +690,8 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "  models        - List available ZX Spectrum models" << NEWLINE;
     oss << "  zxpoly start <model> [file] [--ram-power-on random|zero] - Start a ZX-Poly machine (4 synchronized <model>s; file: .zxp/.prom/disk)" << NEWLINE;
     oss << "  zxpoly status [id|index]    - ZX-Poly group status (modules, registers, lock, video mode, lockstep)" << NEWLINE;
-    oss << "  reset [id|index]    - Reset the emulator (auto-select if only one, or by ID/index)" << NEWLINE;
+    oss << "  reset [hard] [id|index] - Reset the emulator: soft (the reset button); hard = power cycle (Next: boot ROM + firmware)" << NEWLINE;
+    oss << "  ops [n|all] | ops since <seq> [n] - Operation log: reset, snapshot, media changes, refusals (newest 20)" << NEWLINE;
     oss << "  pause [id|index]    - Pause emulation (auto-select if only one, or by ID/index)" << NEWLINE;
     oss << "  switch [turbo|cpm [on|off]] - Front-panel switches (Profi TURBO, v5 CP/M; recorded by TTD like a key)" << NEWLINE;
     oss << "  resume [id|index]   - Resume emulation (auto-select if only one, or by ID/index)" << NEWLINE;
@@ -615,10 +700,16 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "  steps <count> - Execute 1 to N CPU instructions" << NEWLINE;
     oss << "  stepover      - Execute instruction, skip calls and subroutines" << NEWLINE;
     oss << "  stepout       - Run until the current subroutine returns" << NEWLINE;
+    oss << "  ... --cpu gs|ms - step [count] / steps / stepover / stepout of the sound card CPU: the machine runs" << NEWLINE;
+    oss << "                  until the card's step ends (the main CPU moves on to the card's catch-up point)" << NEWLINE;
     oss << "  skip_until <pc> [max_tstates] - Fast-forward until PC reaches target" << NEWLINE;
+    oss << "  run_until key=value ...       - Frames until if= / text= / screen= / event= holds ('run_until help')" << NEWLINE;
+    oss << "  watch add|list|del            - Armed frame watches: a hit pauses and is pushed as watch_hit" << NEWLINE;
+    oss << "  pace [show|presets|set <preset> [ms]|interval <ms>|next|prev|start|stop|toggle|step] - Run at a pace (25 / 5 / 1 fps, a frame, lines, an instruction per interval); stops at a breakpoint" << NEWLINE;
     oss << "  memory <addr> - View memory at address" << NEWLINE;
     oss << "  find <hex-pattern, ?? = any> [--space S] [--mask HEX] [--from N] [--to N] [--align 1|2] [--max N] - Search memory" << NEWLINE;
     oss << "  debug-snapshot [--disasm N] [--stack N] [--memory space:addr:len]... [--pchist N] - Registers, pages, time, code, stack, memory, PC history at one moment" << NEWLINE;
+    oss << "  next nextreg <reg> <value> [nextreg|port|internal] - ZX Spectrum Next: write a NextREG through the board's write choke point (the journal sees it); `next dma|video|palette|ports|nextreg|copper|sprites` read the reports; `next pixel <x> <y> [sx]` says which layer draws a pixel of the last frame and why; `next layer-capture [on|off]` switches the per-layer record (images: `capture screen --layer=ula|layer2|tilemap|sprites|ids`)" << NEWLINE;
     oss << "  out <port> <value> - Write a port like a CPU OUT (paging, TS-Conf registers); no breakpoints, a TTD tool edit" << NEWLINE;
     oss << "  pchist [depth] | pchist on|off - PC history: the newest instructions with their window's page" << NEWLINE;
     oss << "  debug-wait [since] [--timeout ms] - Wait until something a debugger shows changes (a stop, a run start, an edit)" << NEWLINE;
@@ -628,11 +719,20 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "  bp <addr>     - Set execution breakpoint at address" << NEWLINE;
     oss << "  wp <addr> <type> - Set memory watchpoint (r/w/rw)" << NEWLINE;
     oss << "  bport <port> <type> - Set port breakpoint (i/o/io)" << NEWLINE;
+    oss << "  bnextreg <reg> <type> - Set ZX Next register breakpoint (r/w/rw; --via, --value)" << NEWLINE;
+    oss << "  bbeam <line> [--hc N] - Break when the beam passes a place (ZX Next)" << NEWLINE;
+    oss << "  bmagic <edff|dd01>    - Break after the magic opcode ED FF / DD 01 ran (ZX Next)" << NEWLINE;
+    oss << "  bcopper <index> - Break when the copper completes a list instruction (ZX Next)" << NEWLINE;
+    oss << "  bevent <kind> [--value V] - Break on a General Sound / NeoGS event (card_command, host_data, int, ...)" << NEWLINE;
+    oss << "  bchip <chip> <reg> [--value V] - Break on a sound chip register write (ay, fm, saa, opl4, opl4wave, dac, cbl)" << NEWLINE;
     oss << "  bplist        - List all breakpoints" << NEWLINE;
+    oss << "  --cpu gs|ms   - On bp / wp / bport / bplist / bpclear / bpon / bpoff / bptoggle / bphits / bpgroup /" << NEWLINE;
+    oss << "                  bpnote / bpcond: the sound card CPU's breakpoints, ms the MultiSound's GS (default: main)" << NEWLINE;
     oss << "  bpclear       - Clear breakpoints" << NEWLINE;
     oss << "  bpgroup <add|remove|list> <group> [bp_id] - Manage breakpoint groups" << NEWLINE;
     oss << "  bpon <all|group <name>|id <id>>        - Activate breakpoints" << NEWLINE;
     oss << "  bpoff <all|group <name>|id <id>>       - Deactivate breakpoints" << NEWLINE;
+    oss << "  callback [list|resume <id>|remove <id>|policy <id> <suspend|disable|ignore|unpaced>] - Script callbacks (Lua / Python on_tap ...)" << NEWLINE;
     oss << "  memory <hex address> [length]          - Dump memory contents" << NEWLINE;
     oss << "  debugmode <on|off>                     - Toggle debug memory mode (affects performance)" << NEWLINE;
     oss << NEWLINE;
@@ -652,6 +752,9 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << NEWLINE;
     oss << "CMOS clock (ATM3 / ZX-Evo, Profi, Scorpion with SMUC):" << NEWLINE;
     oss << "  rtc | cmos | state rtc       - Time, registers A-D, alarms, every cell" << NEWLINE;
+    oss << "  session take [name] | release - Automation session: hold run control (the GUI shows it; the user can" << NEWLINE;
+    oss << "                                  take it back - then: revoked_by_user, do not retry)" << NEWLINE;
+    oss << "  state execution | exec       - Execution arbiter: intent and who set it, the command holding the CPU, queue, claim" << NEWLINE;
     oss << "  rtc read <start> [count]     - Read cells as the guest reads them (no side effects)" << NEWLINE;
     oss << "  rtc write <start> <b> [b..]  - Write cells like the guest (time registers set the clock)" << NEWLINE;
     oss << "  romflash [status]            - ZX-Evo (TS-Conf, ATM3) flash ROM: the saved flash file, unsaved changes" << NEWLINE;
@@ -675,6 +778,11 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "                                 kbc_firmware=none|v22-7..v41 (ATM Turbo 2+ keyboard controller, RS-232 from v31)" << NEWLINE;
     oss << "                                 atm2ioesp=at|espnet|... atm2ioesp_address=0xF0|0xF8 (ATM2IOESP on the ATM Turbo 2+ INTERNAL I/O)" << NEWLINE;
     oss << "                                 zifi=none|at[,firmware]|zifi-native[,s3|esp01s]|loopback|tcp:..|serial:.. (TS-Conf / ZX-Evo TS firmware: the ZiFi board's ESP)" << NEWLINE;
+    oss << NEWLINE;
+    oss << "Bus analyzer (SPI buses: zc.spi, next.spi, divmmc.spi, neogs.*):" << NEWLINE;
+    oss << "  bus [list] | bus <id|all> on [checks|nochecks]|off|clear | bus <id> events|findings [...]" << NEWLINE;
+    oss << "  bus <id> sd-timing [ideal|realistic|slow] [seed=N] | bus <id> export <vcd|jsonl> <file>" << NEWLINE;
+    oss << "                                - transactions, SD protocol events, driver checks, SD card timing ('bus help')" << NEWLINE;
     oss << NEWLINE;
     oss << "TS-Conf VDAC2 card (FT812):" << NEWLINE;
     oss << "  vdac2 capture <start <path>|stop|status>" << NEWLINE;
@@ -701,7 +809,7 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "  memcounters save [opts] - Save memory access data to file" << NEWLINE;
     oss << NEWLINE;
     oss << "Disassembly:" << NEWLINE;
-    oss << "  disasm [addr] [count]   - Disassemble at address (or, u for short)" << NEWLINE;
+    oss << "  disasm [addr] [count] [before] - Disassemble at address, [before] rows above (or, u for short)" << NEWLINE;
     oss << "  disasm_page <ram|rom> <page> [offset] [count] - Disassemble from physical page" << NEWLINE;
     oss << NEWLINE;
     oss << "Call Trace:" << NEWLINE;
@@ -726,9 +834,16 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "  video temporal [status|list|off|<name>] - ZX DLSS de-flicker: status, algorithms, switch" << NEWLINE;
     oss << "  frame_cost             - Halt/active cost of the last frame + averages" << NEWLINE;
     oss << "  coverage start|stop|clear|status|gaps [args] - Code coverage" << NEWLINE;
+    oss << "  cpuprofile start|stop|reset|mark|status|report|frames|export - CPU time per routine" << NEWLINE;
+    oss << "  coverage export [<path>] [--start A] [--end B] [--merge] - SkoolKit code execution map ($HHHH lines)" << NEWLINE;
+    oss << "  analysis start [facts|counters] [z80|physical]|stop|status - Analysis layers: L0 access facts" << NEWLINE;
+    oss << "  analysis explain <addr> [page] [--json] - What L0 knows of a byte: kinds, last reader/writer, frames, values" << NEWLINE;
+    oss << "  markup [show] [range] | layers | mark <range> <kind> [title] | unmark <range> | comment <addr> [text] | clear [layer] | save [profile] [keep] - Memory markup" << NEWLINE;
     oss << "  aylog start [cap]|stop|clear|status|dump [N]  - AY register-write log" << NEWLINE;
     oss << "  audiocapture start <s>|stop|clear|status|result|save <wav> - Audio" << NEWLINE;
-    oss << "  videorecord start|stop|pause|resume|status [opts]      - Video (--region full|screen, --audio aac, --profile 4k)" << NEWLINE;
+    oss << "  sectiontimer start [SECTION..] [break-if NAME>T]|stop|clear|status|result - Section timing" << NEWLINE;
+    oss << "  videorecord start|stop|pause|resume|toggle|status|presets [opts] - Video (--preset gameplay, --mode audio, --audio aac, --profile 4k)" << NEWLINE;
+    oss << "  recent [kind] | recent clear [kind]                     - Files opened lately (open: action run media.open_recent index=N)" << NEWLINE;
     oss << NEWLINE;
     oss << "BASIC Program Tools:" << NEWLINE;
     oss << "  basic                  - Show BASIC command help" << NEWLINE;
@@ -753,9 +868,26 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "  slots plug <slot> <card> [opt=val ..] [--replace] [--dry-run] - e.g. plug zxbus.next multisound" << NEWLINE;
     oss << "  slots remove <slot> | set <slot> opt=val .. | gs <gs|gs-lw|neogs> | matrix [table]" << NEWLINE;
     oss << "  slots help             - All verbs and flags" << NEWLINE;
+    oss << "  history [<device> [N]]  - Device histories (FDC commands, ...): list, or a device's newest N" << NEWLINE;
+    oss << "  history <device> mode <off|ring|capture> [limit=N] [stream=<file>] [stream_limit=N] | clear | pause | resume" << NEWLINE;
+    oss << NEWLINE;
+    oss << "Controllers (joystick connectors and the retro devices in them):" << NEWLINE;
+    oss << "  controllers [list]     - Connectors, devices, what is held" << NEWLINE;
+    oss << "  controllers plug <connector|auto> <device> [opt=val ..] | unplug <connector>" << NEWLINE;
+    oss << "  controllers input <connector> press=up+fire | release=fire | set=none" << NEWLINE;
+    oss << "  controllers help       - All verbs and flags" << NEWLINE;
+    oss << "  signature <file> [--details] [--external] - Media signatures: exact, tape content, TR-DOS file set, memory" << NEWLINE;
+    oss << "  signature media | compare <known> <candidate> - Of the loaded media; how two files relate" << NEWLINE;
+    oss << "  action [list]          - Host actions (run control, time travel, machine) and whether they can run" << NEWLINE;
+    oss << "  action run <id> [value] - Run one, e.g. action run run.pause_toggle, action run ttd.jog_frames -10" << NEWLINE;
+    oss << "  surface [views]        - Control surface targets: views, target, sessions, pin, readouts, activity" << NEWLINE;
+    oss << "  monitor [name]         - Host CPU / memory / threads, clients, fps / speed, breakpoints, media, TTD ..." << NEWLINE;
+    oss << "  gui [list]             - The GUI programs, their windows and views; gui catalogue, gui state <target>" << NEWLINE;
+    oss << "  gui <method> [k=v ..]  - Drive a window or view, e.g. gui memory.goto addr=0x6000 (gui help)" << NEWLINE;
     oss << NEWLINE;
     oss << "ZX-MultiSound and MIDI:" << NEWLINE;
     oss << "  multisound [--full|--json] - The card: options, CPLD, YM2203 pair, SAA1099, GS, DACs, MIDI" << NEWLINE;
+    oss << "  wildsound [--json]         - Sprinter ISA Wild Sound: mode, stream, storage, track, XM player, AY" << NEWLINE;
     oss << "  midi [--json]          - MIDI line, bank, 16 parts (program, volume, notes sounding)" << NEWLINE;
     oss << "  midi panic             - Every voice of the synthesizer stops" << NEWLINE;
     oss << NEWLINE;
@@ -774,7 +906,7 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << NEWLINE;
     oss << "Snapshot Commands:" << NEWLINE;
     oss << "  snapshot load <file>           - Load snapshot (.sna, .z80, .szx; .rzx plays)" << NEWLINE;
-    oss << "  snapshot save <file> [--force] - Save snapshot (.sna, .z80, .szx: by extension)" << NEWLINE;
+    oss << "  snapshot save <file> [--force] - Save snapshot (.sna, .z80, .szx, .nex on the Next: by extension)" << NEWLINE;
     oss << "  snapshot info                  - Show current snapshot status" << NEWLINE;
     oss << NEWLINE;
     oss << "RZX Playback:" << NEWLINE;
@@ -824,4 +956,129 @@ void CLIProcessor::HandleHelp(const ClientSession& session, const std::vector<st
     oss << "Type any command followed by -h or --help for more information.";
 
     session.SendResponse(oss.str());
+}
+
+CLIProcessor::~CLIProcessor()
+{
+    // The session ends with the connection
+    if (!_controlSession.isNil() && _controlEmulator && _controlEmulator->GetContext())
+        _controlEmulator->GetContext()->ReleaseRunControl(_controlSession);
+}
+
+bool CLIProcessor::HoldsControl(EmulatorContext* context) const
+{
+    return context && !_controlSession.isNil() && context->HasRunControl(_controlSession);
+}
+
+bool CLIProcessor::PassAutomationGate(const ClientSession& session, const std::string& command,
+                                      const std::vector<std::string>& args)
+{
+    if (!automation_gate::CliCommandChangesMachine(command, args))
+        return true;
+    auto emulator = GetSelectedEmulator(session);
+    EmulatorContext* context = emulator ? emulator->GetContext() : nullptr;
+    if (!context || HoldsControl(context))
+        return true;
+    const std::string peer = PeerAddressOf(session.GetSocket());
+    const EmulatorContext::ImplicitControl gate =
+        context->EnterImplicitRunControl("cli", "cli|" + peer, "cli", std::chrono::milliseconds(0), peer);
+    if (!gate.allowed)
+    {
+        session.SendResponse("Error: " + gate.error + " - " + gate.message + NEWLINE);
+        return false;
+    }
+    if (gate.opened)
+    {
+        _controlSession = gate.owner;
+        _controlEmulator = emulator;
+        session.SendResponse(std::string("Note: ") + automation_gate::kAdvice + NEWLINE);
+    }
+    return true;
+}
+
+execution::Requester CLIProcessor::CliRequester(EmulatorContext* context) const
+{
+    if (!_companionId.empty())
+        return execution::Requester{execution::Origin::Companion, {}};
+    if (HoldsControl(context))
+        return execution::Requester{execution::Origin::Cli, _controlSession.toString()};
+    return execution::Requester{execution::Origin::Cli, {}};
+}
+
+void CLIProcessor::HandleSession(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto emulator = GetSelectedEmulator(session);
+    EmulatorContext* context = emulator ? emulator->GetContext() : nullptr;
+    if (!context)
+    {
+        session.SendResponse(std::string("Error: no emulator selected") + NEWLINE);
+        return;
+    }
+    const std::string sub = args.empty() ? std::string() : args[0];
+    if (sub == "take" && !_companionId.empty())
+    {
+        session.SendResponse(std::string("Error: companion_session - a companion acts as the user and takes no "
+                                         "session ('companion logout' first)") + NEWLINE);
+        return;
+    }
+    if (sub == "take")
+    {
+        // The gate's implicit session for this connection gives way to the explicit one
+        if (HoldsControl(context) && context->GetRunControlState().implicit)
+        {
+            context->ReleaseRunControl(_controlSession);
+            _controlSession = unreal::UUID();
+            _controlEmulator.reset();
+        }
+        if (HoldsControl(context))
+        {
+            session.SendResponse(std::string("This connection already holds run control") + NEWLINE);
+            return;
+        }
+        const std::string client = args.size() > 1 ? args[1] : std::string("cli");
+        const unreal::UUID owner = unreal::UUID::Generate();
+        // Another client's implicit session gives way to an explicit take (the reply says whose)
+        const EmulatorContext::RunControlState before = context->GetRunControlState();
+        std::string reason;
+        if (!context->TakeRunControl(owner, "cli", &reason, client, std::chrono::milliseconds(0),
+                                     PeerAddressOf(session.GetSocket())))
+        {
+            session.SendResponse("Error: " + reason + " (do not retry)" + NEWLINE);
+            return;
+        }
+        _controlSession = owner;
+        _controlEmulator = emulator;
+        const std::string tookOver = before.claimed && before.implicit
+                                         ? " Took over the implicit session of " + before.surfaceLabel +
+                                               (before.client.empty() ? std::string() : " (" + before.client + ")") + "."
+                                         : std::string();
+        session.SendResponse(std::string("Run control taken: the user sees it at the GUI and can take it back. ") +
+                             "'session release' ends it; closing the connection does too." + tookOver + NEWLINE);
+        return;
+    }
+    if (sub == "release")
+    {
+        const bool held = HoldsControl(context);
+        if (!_controlSession.isNil() && _controlEmulator && _controlEmulator->GetContext())
+            _controlEmulator->GetContext()->ReleaseRunControl(_controlSession);
+        _controlSession = unreal::UUID();
+        _controlEmulator.reset();
+        session.SendResponse((held ? std::string("Run control released")
+                                   : "This connection holds no session here. " +
+                                         EmulatorContext::DescribeHolder(context->GetRunControlState())) +
+                             NEWLINE);
+        return;
+    }
+    const EmulatorContext::RunControlState state = context->GetRunControlState();
+    std::string text = state.claimed ? "Run control held by " + state.surfaceLabel +
+                                           (state.client.empty() ? std::string() : " (" + state.client + ")") +
+                                           (state.implicit ? ", implicit" : ", explicit") +
+                                           (state.leaseMs ? ", lease ends in " +
+                                                                std::to_string((state.leaseLeftMs + 999) / 1000) + " s"
+                                                          : std::string()) +
+                                           (HoldsControl(context) ? " - this connection" : std::string())
+                                     : std::string("Run control: free");
+    for (const auto& [key, secondsLeft] : state.cooldowns)
+        text += std::string(NEWLINE) + "  cooldown after a take-back: " + key + ", " + std::to_string(secondsLeft) + " s";
+    session.SendResponse(text + NEWLINE);
 }

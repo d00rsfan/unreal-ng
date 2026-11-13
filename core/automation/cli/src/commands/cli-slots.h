@@ -6,7 +6,7 @@
 /// MCP, Lua and Python. Header-only so core-tests drive it without a CLI socket.
 ///
 ///   slots [list]                                     buses, slots, fitted cards, built-ins
-///   slots catalog                                    every card, its options and how it fits this machine
+///   slots catalog [slot]                             every card, its options and how it fits this machine (or that slot)
 ///   slots matrix [table]                             the compatibility tables (markdown)
 ///   slots plug <slot> <card> [opt=val ...]           a card into a slot (zxbus.next, ay-socket, auto)
 ///   slots remove <slot>                              the card out of a slot
@@ -60,6 +60,8 @@ inline bool ParseArgs(const std::vector<std::string>& args, SlotControlRequest& 
     };
     if (out.verb == "matrix")
         take(out.table);
+    else if (out.verb == "catalog")
+        take(out.slot);  // every card planned into that slot
     else if (out.verb == "plug")
     {
         take(out.slot);
@@ -167,6 +169,25 @@ inline std::string ListText(const StateNode& report)
                    std::to_string(bus.find("physicalSlots")->i) + " slot(s), arbitration " + Text(bus.find("arbitration"));
             if (const StateNode* retrofit = bus.find("retrofit"); retrofit != nullptr && retrofit->b)
                 out += " - " + Text(bus.find("retrofitNote"));
+            const std::string host = Text(bus.find("host"));
+            if (!host.empty())
+                out += " - hosted by the card in " + host;
+            out += "\n";
+        }
+    }
+    if (const StateNode* machineSlots = report.find("machineSlots"); machineSlots != nullptr && machineSlots->size() > 0)
+    {
+        out += "machine slots (the board's own cards):\n";
+        for (const StateNode& slot : machineSlots->items)
+        {
+            out += "  " + Text(slot.find("slot")) + " = " + Text(slot.find("card")) + " (" + Text(slot.find("name"));
+            const std::string details = Text(slot.find("details"));
+            if (!details.empty())
+                out += ", " + details;
+            out += ") from " + Text(slot.find("source"));
+            const std::string hosted = Text(slot.find("hostsBus"));
+            if (!hosted.empty())
+                out += " - hosts " + hosted + ": " + Text(slot.find("hostedCard"));
             out += "\n";
         }
     }
@@ -183,7 +204,7 @@ inline std::string ListText(const StateNode& report)
                 out += " [" + options + "]";
             const std::string adapter = Text(slot.find("adapter"));
             if (!adapter.empty())
-                out += " behind " + adapter;
+                out += " behind " + adapter + " (on " + Text(slot.find("bus")) + ")";
             out += "  fit " + Text(slot.find("fit")) + ", " + Text(slot.find("state"));
             const std::string reason = Text(slot.find("reason"));
             if (!reason.empty())
@@ -195,7 +216,17 @@ inline std::string ListText(const StateNode& report)
     {
         out += "built-in devices:\n";
         for (const StateNode& builtIn : builtIns->items)
-            out += "  " + Text(builtIn.find("id")) + " (" + Text(builtIn.find("name")) + "): " + Text(builtIn.find("state")) + "\n";
+        {
+            out += "  " + Text(builtIn.find("id")) + " (" + Text(builtIn.find("name")) + "): " + Text(builtIn.find("state"));
+            // Its ports from the machine's declaration (the registry a debugger attributes port accesses by)
+            if (const StateNode* ports = builtIn.find("ports"); ports != nullptr && ports->size() > 0)
+            {
+                out += "  ports";
+                for (const StateNode& port : ports->items)
+                    out += " " + Text(port.find("range"));
+            }
+            out += "\n";
+        }
     }
     if (const StateNode* log = report.find("log"); log != nullptr && log->size() > 0)
     {
@@ -269,7 +300,7 @@ inline std::string Render(const SlotControlRequest& request, const SlotControlRe
 
 inline const char* Usage()
 {
-    return "Usage: slots [list] | catalog | matrix [table] | plug <slot> <card> [opt=val ...] | remove <slot> |\n"
+    return "Usage: slots [list] | catalog [slot] | matrix [table] | plug <slot> <card> [opt=val ...] | remove <slot> |\n"
            "       set <slot> opt=val ... | gs <gs|gs-lw|neogs>\n"
            "       plug / remove / set / gs: [--replace] [--dry-run] [--media save|discard] [--adapter <id>]; any: [--json]\n"
            "A change is planned first: one that removes a card or fits it unrealistically needs --replace (the plan\n"

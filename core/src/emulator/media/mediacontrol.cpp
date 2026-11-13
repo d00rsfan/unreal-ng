@@ -1,6 +1,20 @@
 #include "stdafx.h"
 
+#include <optional>
+
 #include "mediacontrol.h"
+#include "emulator/media/recentfiles.h"
+
+#include "emulator/media/mediachanges.h"
+#include "emulator/io/storage/fs/diskfs.h"
+#include "common/base64.h"
+#include "emulator/io/storage/compose/composedlayout.h"
+#include "emulator/io/storage/fat/fatsynthvolume.h"
+#include "emulator/io/storage/partitioneddisk.h"
+#include "emulator/io/storage/sessionwritemap.h"
+#include "emulator/io/storage/subrangedevice.h"
+#include "emulator/media/composedescriptor.h"
+#include "emulator/media/compositemediumfactory.h"
 
 #include "emulator/io/ide/idecontroller.h"
 #include "emulator/io/storage/cd/cdimage.h"
@@ -9,13 +23,17 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <ctime>
+#include <fstream>
 #include <limits>
+#include <optional>
 #include <set>
 
 #include "common/filehelper.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/io/storage/memorydisk.h"
+#include "emulator/io/storage/sparsememorydisk.h"
 #include "emulator/media/floppyformats.h"
 #include "emulator/media/mediaformatregistry.h"
 #include "emulator/media/mediatargets.h"
@@ -29,6 +47,73 @@ namespace
         for (const std::string& item : items)
             array.push(item);
         return array;
+    }
+
+    /// "{...}": a composition descriptor's JSON text instead of a path
+    bool IsInlineDescriptor(const std::string& path)
+    {
+        const size_t first = path.find_first_not_of(" \t\r\n");
+        return first != std::string::npos && path[first] == '{';
+    }
+
+    std::string Hex64(uint64_t value)
+    {
+        char text[24];
+        std::snprintf(text, sizeof text, "%016llx", static_cast<unsigned long long>(value));
+        return text;
+    }
+
+    /// The `compose` / `layers` body: the layout and every layer
+    StateNode CompositeValue(const CompositeInfo& info)
+    {
+        info.CompleteCounts();  // C4b: a graft's unread base directories are counted now
+        StateNode value = StateNode::Object();
+        value["descriptor"] = info.descriptor;
+        value["fs"] = info.fsName;
+        value["build"] = info.build;
+        value["sectors"] = info.sectors;
+        value["bytes"] = info.sectors * 512;
+        value["clusters"] = static_cast<uint64_t>(info.clusterCount);
+        value["sectorsPerCluster"] = static_cast<uint64_t>(info.sectorsPerCluster);
+        value["contentId"] = Hex64(info.contentId);
+        value["files"] = info.files;
+        value["fileBytes"] = info.bytes;
+        value["sourceDevices"] = static_cast<uint64_t>(info.sourceDevices);
+        value["writesSave"] = info.writesSave;  // what `save` runs without a path (D-7): the GUI preselects it
+        value["writesCommit"] = info.writesCommit;  // none: commit and write-back are refused (FR-45)
+        StateNode layers = StateNode::Array();
+        for (const CompositeLayerInfo& layer : info.layers)
+        {
+            StateNode l = StateNode::Object();
+            l["name"] = layer.name;
+            l["kind"] = layer.kind;
+            l["path"] = layer.path;
+            l["mount"] = layer.mount;
+            l["from"] = layer.from;
+            l["files"] = layer.files;
+            l["bytes"] = layer.bytes;
+            l["writable"] = layer.writable;
+            layers.push(std::move(l));
+        }
+        value["layers"] = std::move(layers);
+        if (!info.partitions.empty())
+        {
+            StateNode partitions = StateNode::Array();
+            for (const CompositePartitionInfo& p : info.partitions)
+            {
+                StateNode n = StateNode::Object();
+                n["name"] = p.name;
+                n["kind"] = p.kind;
+                n["fs"] = p.fs;
+                n["build"] = p.build;
+                n["type"] = static_cast<uint64_t>(p.type);
+                n["start"] = p.start;
+                n["sectors"] = p.sectors;
+                partitions.push(std::move(n));
+            }
+            value["partitions"] = std::move(partitions);
+        }
+        return value;
     }
 
     std::string Lower(std::string text)
@@ -96,33 +181,55 @@ namespace
     }
 
     const std::vector<std::string> kInsertOptions = {"access", "format", "fs", "codepage", "free", "wp", "kind", "device",
-                                                     "save", "export", "discard", "end_recording", "async", "immediate"};
+                                                     "save", "export", "discard", "strategy", "onConflict", "strict",
+                                                     "end_recording", "async", "immediate", "journal"};
+
+    /// The save policy of a disposition (D-8): `strategy`, `onConflict`, `strict` (they go with `save`)
+    struct SavePolicy
+    {
+        std::string strategy;
+        bool keepBoth = false;
+        bool strict = false;
+    };
+
+    MediaResult ParseSavePolicy(const std::map<std::string, std::string>& options, SavePolicy& policy)
+    {
+        if (auto it = options.find("strategy"); it != options.end())
+        {
+            policy.strategy = Lower(Trim(it->second));
+            if (policy.strategy != "delta" && policy.strategy != "commit" && policy.strategy != "write-back" &&
+                policy.strategy != "discard" && policy.strategy != "ask")
+                return MediaResult::Fail(MediaError::BadRequest, "strategy '" + it->second +
+                                                                     "': expected delta, commit, write-back, discard or ask");
+        }
+        if (auto it = options.find("onConflict"); it != options.end())
+        {
+            const std::string v = Lower(Trim(it->second));
+            if (v != "refuse" && v != "keep-both")
+                return MediaResult::Fail(MediaError::BadRequest, "onConflict '" + it->second + "': expected refuse or keep-both");
+            policy.keepBoth = v == "keep-both";
+        }
+        if (auto it = options.find("strict"); it != options.end() && !ParseBool(it->second, policy.strict))
+            return MediaResult::Fail(MediaError::BadRequest, "option 'strict': expected true or false, got '" + it->second + "'");
+        return MediaResult::Success();
+    }
 
     /// The parked emulator: a save or export reads the medium while the guest
     /// cannot write to it (the same thing SaveDisk does)
+    /// The CPU held for a media operation (Emulator::CpuHold); the pause is left as it was
     class ParkedEmulator
     {
     public:
-        explicit ParkedEmulator(EmulatorContext* context) : _emulator(context ? context->pEmulator : nullptr)
+        explicit ParkedEmulator(EmulatorContext* context)
         {
-            if (_emulator && _emulator->IsRunning() && !_emulator->IsPaused())
-            {
-                _emulator->Pause(false);
-                _emulator->WaitForPauseConfirmation(1000);
-                _parked = true;
-            }
-        }
-        ~ParkedEmulator()
-        {
-            if (_parked)
-                _emulator->Resume(false);
+            if (Emulator* emulator = context ? context->pEmulator : nullptr)
+                _hold.emplace(*emulator, "media");
         }
         ParkedEmulator(const ParkedEmulator&) = delete;
         ParkedEmulator& operator=(const ParkedEmulator&) = delete;
 
     private:
-        Emulator* _emulator = nullptr;
-        bool _parked = false;
+        std::optional<Emulator::CpuHold> _hold;
     };
 
     std::string SlotList(const MediaManager& manager)
@@ -195,7 +302,9 @@ MediaControl::MediaControl(EmulatorContext* context)
 const std::vector<std::string>& MediaControl::Verbs()
 {
     static const std::vector<std::string> verbs = {"list", "info", "formats", "targets", "insert", "eject", "swap",
-                                                   "save", "export", "discard", "rescan", "create", "protect"};
+                                                   "save", "export", "discard", "rescan", "create", "protect",
+                                                   "compose", "layers", "changes", "flatten", "volumes", "files",
+                                                   "read", "write", "delete", "rename", "mkdir", "attrib", "label"};
     return verbs;
 }
 
@@ -208,13 +317,27 @@ const std::vector<std::string>& MediaControl::OptionsFor(const std::string& verb
         {"targets", {}},
         {"insert", kInsertOptions},
         {"swap", kInsertOptions},
-        {"eject", {"save", "export", "discard", "end_recording", "async"}},
-        {"save", {"retarget", "compression"}},
-        {"export", {"compression", "parent"}},
+        {"eject", {"save", "export", "discard", "strategy", "onConflict", "strict", "end_recording", "async"}},
+        {"save", {"retarget", "compression", "compact", "fs", "size", "vhd", "strategy", "force", "plan", "onConflict", "commit"}},
+        {"export", {"compression", "parent", "compact", "fs", "size", "vhd"}},
         {"discard", {"async"}},
-        {"rescan", {"async"}},
-        {"create", {"format", "cylinders", "sides", "size", "save", "export", "discard", "end_recording", "async"}},
+        {"rescan", {"save", "export", "discard", "strategy", "onConflict", "strict", "async"}},
+        {"create", {"format", "cylinders", "sides", "size", "save", "export", "discard", "strategy", "onConflict", "strict",
+                    "end_recording", "async"}},
         {"protect", {"on"}},
+        {"compose", {"fs", "codepage", "free"}},
+        {"layers", {}},
+        {"changes", {}},
+        {"flatten", {"strategy", "plan", "force", "onConflict", "commit", "compression", "compact", "fs", "size", "vhd"}},
+        {"volumes", {}},
+        {"files", {"volume", "recursive"}},
+        {"read", {"volume", "out"}},
+        {"write", {"volume", "in", "data", "start", "header", "type", "param2", "attributes"}},
+        {"delete", {"volume", "recursive"}},
+        {"mkdir", {"volume", "parents", "continuous", "blocks"}},
+        {"rename", {"volume", "to"}},
+        {"attrib", {"volume", "attributes", "time"}},
+        {"label", {"volume", "label"}},
     };
     static const std::vector<std::string> none;
     auto it = options.find(verb);
@@ -272,6 +395,8 @@ MediaReply MediaControl::Run(const MediaRequest& request)
         reply = Insert(request, true);
     else if (verb == "eject")
         reply = Eject(request);
+    else if (verb == "flatten")
+        reply = Flatten(request);
     else if (verb == "save")
         reply = Save(request);
     else if (verb == "export")
@@ -282,10 +407,535 @@ MediaReply MediaControl::Run(const MediaRequest& request)
         reply = Rescan(request);
     else if (verb == "create")
         reply = Create(request);
+    else if (verb == "compose")
+        reply = Compose(request);
+    else if (verb == "layers")
+        reply = Layers(request);
+    else if (verb == "changes")
+        reply = Changes(request);
+    else if (verb == "volumes" || verb == "files" || verb == "read")
+        reply = Files(request, verb);
+    else if (verb == "write" || verb == "delete" || verb == "rename" || verb == "mkdir" || verb == "attrib" || verb == "label")
+        reply = EditFiles(request, verb);
     else
         reply = Protect(request);
     return reply;
 }
+
+/// region <Composite media>
+
+MediaReply MediaControl::Compose(const MediaRequest& request)
+{
+    MediaReply reply;
+    const Options& o = request.options;
+    CompositeBuildOptions options;
+    if (auto it = o.find("fs"); it != o.end())
+    {
+        const std::string fs = Lower(Trim(it->second));
+        if (fs == "fat16")
+            options.fs = FatType::Fat16;
+        else if (fs == "fat32")
+            options.fs = FatType::Fat32;
+        else
+            return Fail(MediaError::BadRequest, "fs '" + it->second + "': expected fat16 or fat32");
+    }
+    if (auto it = o.find("codepage"); it != o.end())
+    {
+        CodePage page;
+        if (!UnicodeHelper::ParseCodePage(it->second, page))
+            return Fail(MediaError::BadRequest, "codepage '" + it->second + "': expected cp866 or cp1251");
+        options.codePage = page;
+    }
+    if (auto it = o.find("free"); it != o.end())
+    {
+        uint64_t bytes = 0;
+        if (!ComposeDescriptor::ParseSize(it->second, bytes))
+            return Fail(MediaError::BadRequest, "free '" + it->second + "': expected a size (256MiB, 1048576)");
+        options.freeBytes = bytes;
+    }
+    if (Trim(request.path).empty())
+        return Fail(MediaError::BadRequest, "name a descriptor file (*.ucompose.yaml) or give its JSON text");
+
+    const ComposeDescriptor descriptor = IsInlineDescriptor(request.path)
+                                             ? ComposeDescriptor::Parse(request.path, std::filesystem::current_path(), ComposeDescriptor::kInlineName)
+                                             : ComposeDescriptor::Load(FileHelper::ToFsPath(request.path));
+    std::unique_ptr<IBlockDevice> volume;
+    CompositeInfo info;
+    reply.result = CompositeMediumFactory::Build(descriptor, options, volume, info);
+    if (reply.result.Ok())
+        reply.body["compose"] = CompositeValue(info);
+    return reply;
+}
+
+MediaReply MediaControl::Layers(const MediaRequest& request)
+{
+    MediaReply reply;
+    reply.result = ResolveSelector(*_manager, request.selector, reply.slot);
+    if (!reply.result.Ok())
+        return reply;
+    Medium* medium = _manager->GetMedium(reply.slot);
+    if (!medium || !medium->Composite())
+        return Fail(MediaError::NotSupported, "slot '" + reply.slot + "' does not hold a composite medium");
+    reply.body["layers"] = CompositeValue(*medium->Composite());
+    reply.result.report = medium->Report();
+    return reply;
+}
+
+MediaReply MediaControl::Changes(const MediaRequest& request)
+{
+    MediaReply reply;
+    reply.result = ResolveSelector(*_manager, request.selector, reply.slot);
+    if (!reply.result.Ok())
+        return reply;
+    Medium* medium = _manager->GetMedium(reply.slot);
+    if (!medium)
+        return Fail(MediaError::NotSupported, "slot '" + reply.slot + "' is empty");
+    MediumChanges list;
+    {
+        ParkedEmulator parked(_context);
+        reply.result = ListMediumChanges(*medium, list);
+    }
+    if (!reply.result.Ok())
+        return Fail(reply.result.error, "slot '" + reply.slot + "': " + reply.result.message);
+
+    StateNode changes = StateNode::Array();
+    for (const MediumChange& change : list.changes)
+    {
+        StateNode c = StateNode::Object();
+        c["op"] = change.op;
+        c["path"] = change.path;
+        if (change.op == "rename")
+            c["oldPath"] = change.oldPath;
+        c["layer"] = change.layer;
+        c["sizeBefore"] = change.sizeBefore;
+        c["sizeAfter"] = change.sizeAfter;
+        changes.push(std::move(c));
+    }
+    reply.body["changes"] = std::move(changes);
+    reply.body["warnings"] = Strings(list.warnings);
+    reply.body["changedSectors"] = list.changedSectors;
+    reply.body["directoriesRead"] = static_cast<uint64_t>(list.directoriesRead);
+    reply.body["fullScan"] = list.fullScan;
+    return reply;
+}
+
+/// endregion <Composite media>
+
+/// region <Files on a medium>
+
+namespace
+{
+    StateNode VolumeValue(const DiskFsVolume& v)
+    {
+        StateNode n = StateNode::Object();
+        n["id"] = v.id;
+        n["fs"] = v.fs;
+        n["system"] = v.system;
+        n["label"] = v.label;
+        n["writable"] = v.writable;
+        if (!v.attributes.empty())
+            n["attributes"] = v.attributes;
+        n["times"] = v.times;
+        n["labels"] = v.labels;
+        n["offset"] = v.offset;
+        n["bytes"] = v.bytes;
+        if (v.freeBytes >= 0)
+            n["freeBytes"] = v.freeBytes;
+        return n;
+    }
+
+    StateNode EntryValue(const DiskFsEntry& e)
+    {
+        StateNode n = StateNode::Object();
+        n["path"] = e.path;
+        n["name"] = e.name;
+        n["directory"] = e.directory;
+        n["size"] = e.size;
+        n["start"] = static_cast<uint64_t>(e.start);
+        if (!e.attributes.empty())
+            n["attributes"] = e.attributes;
+        if (e.mtime)
+            n["mtime"] = e.mtime;
+        if (!e.error.empty())
+            n["error"] = e.error;
+        for (const auto& [key, value] : e.fields)
+            n[key] = value;
+        return n;
+    }
+}  // namespace
+
+MediaReply MediaControl::Files(const MediaRequest& request, const std::string& verb)
+{
+    /// A file larger than this comes back only through `out` (a host file)
+    constexpr size_t kInlineLimit = 16 * 1024 * 1024;
+
+    MediaReply reply;
+    reply.result = ResolveSelector(*_manager, request.selector, reply.slot);
+    if (!reply.result.Ok())
+        return reply;
+    const Options& o = request.options;
+    bool recursive = false;
+    if (auto it = o.find("recursive"); it != o.end() && !ParseBool(it->second, recursive))
+        return Fail(MediaError::BadRequest, "option 'recursive': expected true or false, got '" + it->second + "'");
+    const std::string volume = o.count("volume") ? Trim(o.at("volume")) : std::string();
+
+    Medium* medium = _manager->GetMedium(reply.slot);
+    if (!medium)
+        return Fail(MediaError::NotSupported, "slot '" + reply.slot + "' is empty");
+
+    // The guest cannot write while the files are read
+    ParkedEmulator parked(_context);
+    std::unique_ptr<DiskFs> fs = OpenDiskFs(*medium);
+    if (!fs)
+        return Fail(MediaError::NotSupported, "slot '" + reply.slot + "' holds no disk (a tape or a CD has no file system here)");
+
+    if (verb == "volumes")
+    {
+        StateNode volumes = StateNode::Array();
+        for (const DiskFsVolume& v : fs->Volumes())
+            volumes.push(VolumeValue(v));
+        reply.body["volumes"] = std::move(volumes);
+        reply.body["notes"] = Strings(fs->Notes());
+        return reply;
+    }
+
+    std::string error;
+    if (fs->Volumes().empty())
+        return Fail(MediaError::UnreadableSource, "slot '" + reply.slot + "': no file system found on the disk");
+    if (verb == "files")
+    {
+        std::vector<DiskFsEntry> entries;
+        if (!fs->List(volume, request.path, recursive, entries, error))
+            return Fail(MediaError::UnreadableSource, "slot '" + reply.slot + "': " + error);
+        StateNode list = StateNode::Array();
+        for (const DiskFsEntry& e : entries)
+            list.push(EntryValue(e));
+        reply.body["volume"] = volume.empty() ? fs->Volumes().front().id : volume;
+        reply.body["path"] = request.path;
+        reply.body["entries"] = std::move(list);
+        reply.body["notes"] = Strings(fs->Notes());
+        return reply;
+    }
+
+    // read
+    if (Trim(request.path).empty())
+        return Fail(MediaError::BadRequest, "name the file to read");
+    std::vector<uint8_t> data;
+    if (!fs->Read(volume, request.path, data, error))
+        return Fail(MediaError::UnreadableSource, "slot '" + reply.slot + "': " + error +
+                                                      (data.empty() ? "" : " (" + std::to_string(data.size()) + " bytes readable)"));
+    reply.body["volume"] = volume.empty() ? fs->Volumes().front().id : volume;
+    reply.body["path"] = request.path;
+    reply.body["size"] = static_cast<uint64_t>(data.size());
+    if (auto it = o.find("out"); it != o.end() && !Trim(it->second).empty())
+    {
+        std::ofstream out(FileHelper::ToFsPath(Trim(it->second)), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        if (!out)
+            return Fail(MediaError::IoError, "cannot write '" + it->second + "'");
+        reply.body["savedPath"] = Trim(it->second);
+        return reply;
+    }
+    if (data.size() > kInlineLimit)
+        return Fail(MediaError::DoesNotFit, request.path + ": " + std::to_string(data.size()) +
+                                                " bytes, more than an answer carries: give 'out' (a host file)");
+    reply.body["data"] = base64::Encode(data);
+    return reply;
+}
+
+namespace
+{
+    /// The host's local date and time as seconds since 1970-01-01 of that wall clock (no zone): what a DOS stamps
+    int64_t LocalWallClock()
+    {
+        const std::time_t now = std::time(nullptr);
+        std::tm t {};
+#ifdef _WIN32
+        localtime_s(&t, &now);
+#else
+        localtime_r(&now, &t);
+#endif
+        // Howard Hinnant's days_from_civil
+        const int64_t year = t.tm_year + 1900;
+        const int64_t month = t.tm_mon + 1;
+        const int64_t y = month <= 2 ? year - 1 : year;
+        const int64_t era = y / 400;
+        const int64_t yoe = y - era * 400;
+        const int64_t doy = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + t.tm_mday - 1;
+        const int64_t days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+        return days * 86400 + t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec;
+    }
+
+    /// "2026-10-26 14:30[:05]" (or with a T), "now", or seconds: UTC seconds of the DOS wall clock (no time zone)
+    bool ParseWallClock(const std::string& text, int64_t& out)
+    {
+        if (text == "now")
+        {
+            out = LocalWallClock();
+            return true;
+        }
+        if (!text.empty() && text.find_first_not_of("0123456789") == std::string::npos && text.size() <= 12)
+        {
+            out = std::stoll(text);
+            return true;
+        }
+        int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+        char separator = 0;
+        int read = 0;
+        const int fields = std::sscanf(text.c_str(), "%4d-%2d-%2d%c%2d:%2d%n:%2d%n", &year, &month, &day, &separator, &hour, &minute, &read,
+                                       &second, &read);
+        if (fields < 6 || (separator != ' ' && separator != 'T') || static_cast<size_t>(read) != text.size() || year < 1980 ||
+            year > 2107 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59)
+            return false;
+        const int64_t y = month <= 2 ? year - 1 : year;
+        const int64_t era = y / 400;
+        const int64_t yoe = y - era * 400;
+        const int64_t doy = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1;
+        const int64_t days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+        out = days * 86400 + hour * 3600 + minute * 60 + second;
+        return true;
+    }
+}  // namespace
+
+MediaReply MediaControl::EditFiles(const MediaRequest& request, const std::string& verb)
+{
+    MediaReply reply;
+    reply.result = ResolveSelector(*_manager, request.selector, reply.slot);
+    if (!reply.result.Ok())
+        return reply;
+    const Options& o = request.options;
+    const std::string volume = o.count("volume") ? Trim(o.at("volume")) : std::string();
+    if (Trim(request.path).empty() && verb != "label")
+        return Fail(MediaError::BadRequest, verb == "write"    ? "name the file to write (TR-DOS NAME.T, +3DOS NAME.TYP, FAT / iS-DOS dir/name.ext)"
+                                            : verb == "mkdir"  ? "name the directory to make"
+                                            : verb == "attrib" ? "name the file to change"
+                                                               : "name the file to " + verb);
+    // attrib: the letters and / or the time; label: the new name ("" removes a FAT label)
+    const std::string attributes = o.count("attributes") ? Trim(o.at("attributes")) : std::string();
+    int64_t mtime = 0;
+    const bool hasTime = o.count("time") != 0;
+    if (hasTime && !ParseWallClock(Trim(o.at("time")), mtime))
+        return Fail(MediaError::BadRequest, "option 'time': expected 2026-10-26 14:30[:05], now or seconds, got '" + o.at("time") + "'");
+    if (verb == "attrib" && attributes.empty() && !hasTime)
+        return Fail(MediaError::BadRequest, "give 'attributes' (+R-H changes, RA sets exactly) or 'time', or both");
+    if (verb == "label" && !o.count("label"))
+        return Fail(MediaError::BadRequest, "give the new name as 'label' (an empty one removes a FAT label)");
+    const std::string label = o.count("label") ? Trim(o.at("label")) : std::string();
+    const std::string to = o.count("to") ? Trim(o.at("to")) : std::string();
+    if (verb == "rename" && to.empty())
+        return Fail(MediaError::BadRequest, "give the new name as 'to'");
+    bool recursive = false, parents = false;
+    if (auto it = o.find("recursive"); it != o.end() && !ParseBool(it->second, recursive))
+        return Fail(MediaError::BadRequest, "option 'recursive': expected true or false, got '" + it->second + "'");
+    if (auto it = o.find("parents"); it != o.end() && !ParseBool(it->second, parents))
+        return Fail(MediaError::BadRequest, "option 'parents': expected true or false, got '" + it->second + "'");
+    // mkdir: an iS-DOS catalogue continuous and / or of 1-16 blocks (TASiS mkdir.com /c /s)
+    DiskFsDirectoryOptions directory;
+    if (auto it = o.find("continuous"); it != o.end() && !ParseBool(it->second, directory.continuous))
+        return Fail(MediaError::BadRequest, "option 'continuous': expected true or false, got '" + it->second + "'");
+    if (auto it = o.find("blocks"); it != o.end())
+    {
+        const std::string text = Trim(it->second);
+        char* end = nullptr;
+        const unsigned long value = text.empty() ? 0 : std::strtoul(text.c_str(), &end, 10);
+        if (text.empty() || *end != 0 || value < 1 || value > 16)
+            return Fail(MediaError::BadRequest, "option 'blocks': expected 1-16, got '" + it->second + "'");
+        directory.blocks = static_cast<uint32_t>(value);
+    }
+
+    // write: the bytes as base64 `data` or the host file `in`, one of them
+    std::vector<uint8_t> data;
+    DiskFsWriteOptions options;
+    if (verb == "write")
+    {
+        const bool hasData = o.count("data") != 0;
+        const bool hasIn = o.count("in") != 0 && !Trim(o.at("in")).empty();
+        if (hasData == hasIn)
+            return Fail(MediaError::BadRequest, "give the bytes as 'data' (base64) or 'in' (a host file), one of them");
+        if (hasData && !base64::Decode(Trim(o.at("data")), data))
+            return Fail(MediaError::BadRequest, "option 'data': not base64");
+        if (hasIn)
+        {
+            std::ifstream in(FileHelper::ToFsPath(Trim(o.at("in"))), std::ios::binary);
+            if (!in)
+                return Fail(MediaError::UnreadableSource, "cannot read '" + Trim(o.at("in")) + "'");
+            data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        // Decimal, or hex as #8000 / $8000 / 0x8000
+        auto word = [](const std::string& raw, unsigned long& value) {
+            std::string text = Trim(raw);
+            int base = 10;
+            const size_t prefix = !text.empty() && (text[0] == '#' || text[0] == '$')                             ? 1
+                                  : text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2
+                                                                                                             : 0;
+            if (prefix)
+            {
+                text.erase(0, prefix);
+                base = 16;
+            }
+            char* end = nullptr;
+            value = text.empty() ? 0x10000 : std::strtoul(text.c_str(), &end, base);
+            return !text.empty() && *end == 0 && value <= 0xFFFF;
+        };
+        unsigned long value = 0;
+        if (auto it = o.find("start"); it != o.end())
+        {
+            if (!word(it->second, value))
+                return Fail(MediaError::BadRequest, "option 'start': expected 0-65535 (#8000, 0x8000 or 32768), got '" + it->second + "'");
+            options.start = static_cast<uint16_t>(value);
+        }
+        if (auto it = o.find("param2"); it != o.end())
+        {
+            if (!word(it->second, value))
+                return Fail(MediaError::BadRequest, "option 'param2': expected 0-65535 (#8000, 0x8000 or 32768), got '" + it->second + "'");
+            options.param2 = static_cast<int32_t>(value);
+        }
+        if (auto it = o.find("type"); it != o.end())
+        {
+            static const std::vector<std::string> kTypes = {"program", "numbers", "chars", "code"};
+            const std::string text = Lower(Trim(it->second));
+            for (size_t t = 0; t < kTypes.size(); t++)
+                if (text == kTypes[t] || text == std::to_string(t))
+                    options.basicType = static_cast<int>(t);
+            if (options.basicType < 0)
+                return Fail(MediaError::BadRequest, "option 'type': expected program, numbers, chars or code (0-3), got '" + it->second + "'");
+        }
+        if (auto it = o.find("attributes"); it != o.end())
+            options.attributes = Trim(it->second);
+        if (auto it = o.find("header"); it != o.end() && !ParseBool(it->second, options.header))
+            return Fail(MediaError::BadRequest, "option 'header': expected true or false, got '" + it->second + "'");
+    }
+    // FAT and iS-DOS stamp the host's wall clock, as a DOS on the machine would stamp its own
+    options.mtime = LocalWallClock();
+
+    const std::optional<SlotInfo> info = _manager->Info(reply.slot);
+    if (info && info->writeProtect)
+        return Fail(MediaError::NotSupported, "slot '" + reply.slot + "': the disk is write-protected");
+
+    // At a coherent moment (paused, stopped or between frames), as a tool's edit: a TTD session keeps it
+    Emulator* emulator = _context ? _context->pEmulator : nullptr;
+    MediaResult result;
+    auto work = [&]() {
+        Medium* medium = _manager->GetMedium(reply.slot);
+        if (!medium)
+        {
+            result = MediaResult::Fail(MediaError::NotSupported, "slot '" + reply.slot + "' is empty");
+            return;
+        }
+        if (medium->Access() == AccessMode::ReadOnly)
+        {
+            result = MediaResult::Fail(MediaError::NotSupported, "slot '" + reply.slot + "': the disk is read only");
+            return;
+        }
+        DiskImage* floppy = medium->Floppy();
+        std::unique_ptr<IBlockDevice> device = floppy ? nullptr : ToolEditDevice(*medium);
+        if (!floppy && !device)
+        {
+            result = MediaResult::Fail(MediaError::NotSupported, "slot '" + reply.slot + "' holds no disk (a tape or a CD has no file system here)");
+            return;
+        }
+        std::unique_ptr<DiskFs> fs = floppy ? std::make_unique<DiskFs>(*floppy)
+                                            : std::make_unique<DiskFs>(*device, medium->Options().codePage.value_or(CodePage::Cp866));
+        if (fs->Volumes().empty())
+        {
+            result = MediaResult::Fail(MediaError::UnreadableSource, "slot '" + reply.slot + "': no file system found on the disk");
+            return;
+        }
+        std::string error;
+        bool done = false;
+        auto edit = [&]() {
+            // A floppy: every track as it was, for the medium's undo log (a TTD seek back sets the disk to it; without
+            // a TTD history the manager keeps nothing). A block medium tells the log of each sector as it is written
+            if (floppy)
+                for (int t = 0; t < floppy->getCylinders() * floppy->getSides(); t++)
+                    if (const DiskImage::Track* track = floppy->getTrack(static_cast<uint8_t>(t)))
+                        _manager->BeforeTrackWrite(reply.slot, *track);
+            if (verb == "write")
+                done = fs->Write(volume, request.path, data, options, error);
+            else if (verb == "delete")
+                done = fs->Delete(volume, request.path, error, recursive);
+            else if (verb == "mkdir")
+            {
+                directory.mtime = options.mtime;
+                done = fs->MakeDirectory(volume, request.path, parents, directory, error);
+            }
+            else if (verb == "attrib")
+                done = (attributes.empty() || fs->SetAttributes(volume, request.path, attributes, error)) &&
+                       (!hasTime || fs->SetTime(volume, request.path, mtime, error));
+            else if (verb == "label")
+                done = fs->SetLabel(volume, label, options.mtime, error);
+            else
+                done = fs->Rename(volume, request.path, to, error);
+        };
+        std::string refused;
+        if (emulator)
+            refused = emulator->EditMemoryFromTool(verb == "write"    ? "media write"
+                                                   : verb == "delete" ? "media delete"
+                                                   : verb == "mkdir"  ? "media mkdir"
+                                                   : verb == "attrib" ? "media attrib"
+                                                   : verb == "label"  ? "media label"
+                                                                      : "media rename",
+                                                   edit);
+        else
+            edit();
+        if (!refused.empty())
+            result = MediaResult::Fail(MediaError::Recording, refused);
+        else if (!done)
+        {
+            // "not found", "no such entry" (FAT), "no file x", "no x on the <device>" (the others)
+            const bool missing = error.find("not found") != std::string::npos || error.find("no file") != std::string::npos ||
+                                 error.find("no such entry") != std::string::npos ||
+                                 (error.compare(0, 3, "no ") == 0 && error.find(" on the ") != std::string::npos);
+            const bool unable = error.find("read only") != std::string::npos || error.find("has no directories") != std::string::npos ||
+                                error.find("has no file attributes") != std::string::npos ||
+                                error.find("keeps no file times") != std::string::npos || error.find("has no label") != std::string::npos;
+            result = MediaResult::Fail(unable    ? MediaError::NotSupported
+                                       : missing ? MediaError::UnreadableSource
+                                                 : MediaError::BadRequest,
+                                       "slot '" + reply.slot + "': " + error);
+        }
+        else
+        {
+            reply.body["volume"] = volume.empty() ? fs->Volumes().front().id : volume;
+            if (verb == "attrib")
+            {
+                // The entry as it is now
+                DiskFsEntry entry;
+                std::string ignored;
+                if (fs->Stat(volume, request.path, entry, ignored))
+                {
+                    reply.body["attributes"] = entry.attributes;
+                    if (entry.mtime)
+                        reply.body["mtime"] = entry.mtime;
+                }
+            }
+            if (verb == "label")
+                for (const DiskFsVolume& v : fs->Volumes())
+                    if (volume.empty() ? &v == &fs->Volumes().front() : v.id == volume)
+                        reply.body["label"] = v.label;
+            reply.body["changes"] = medium->DescribeChanges();
+            reply.body["access"] = AccessModeName(medium->Access());
+        }
+    };
+    if (emulator && emulator->RunAtCoherentMoment(work, 2000) == Emulator::CoherentMoment::Busy)
+        return Fail(MediaError::InUse, "no coherent moment to reach the disk within 2 s (another client is stepping the machine)");
+    if (!emulator)
+        work();
+    if (!result.Ok())
+    {
+        reply.result = result;
+        return reply;
+    }
+    if (verb != "label")
+        reply.body["path"] = request.path;
+    if (verb == "write")
+        reply.body["size"] = static_cast<uint64_t>(data.size());
+    if (verb == "rename")
+        reply.body["to"] = to;
+    return reply;
+}
+
+/// endregion <Files on a medium>
 
 /// region <Selectors>
 
@@ -422,6 +1072,11 @@ StateNode MediaControl::SlotValue(const SlotInfo& info)
         medium["dirty"] = info.dirty;
         medium["dirtyUnits"] = info.changedUnits;
         medium["changes"] = info.changes;
+        if (info.dirty)
+            medium["onRelease"] = info.onRelease;  // what closing the emulator does with the changes (D-8)
+        char volume[17];
+        std::snprintf(volume, sizeof(volume), "%016llx", static_cast<unsigned long long>(info.volumeId));
+        medium["volumeId"] = std::string(volume);  // hex: a 64-bit id does not survive a JSON double
         slot["medium"] = medium;
     }
     else
@@ -494,6 +1149,19 @@ MediaReply MediaControl::Info(const MediaRequest& request)
             reply.result.report = medium->Report();  // skipped folder entries, format notes
             if (const CdImage* disc = medium->Cd(); disc && reply.body["info"]["medium"].isObject())
                 reply.body["info"]["medium"]["disc"] = DiscValue(*disc);
+            if (const SessionWriteMap* session = medium->Session(); session && reply.body["info"]["medium"].isObject())
+            {
+                // Where the guest's writes are kept (C10e): memory up to the limit, the rest in the journal
+                StateNode writes = StateNode::Object();
+                writes["sectors"] = static_cast<uint64_t>(session->ChangedSectors());
+                writes["memoryBytes"] = session->HotBytes();
+                writes["memoryLimit"] = session->MemoryLimit();
+                writes["journalBytes"] = static_cast<uint64_t>(session->SpilledSectors()) * IBlockDevice::kSectorSize;
+                writes["journalFile"] = session->SpillPath();
+                writes["journalRecoverable"] = session->JournalRecoverable();
+                writes["journalFailed"] = session->SpillFailed();
+                reply.body["info"]["medium"]["sessionWrites"] = std::move(writes);
+            }
         }
         return reply;
     }
@@ -637,6 +1305,11 @@ MediaResult MediaControl::ApplyDisposition(const std::string& slotId, const Opti
         return MediaResult::Fail(MediaError::BadRequest, "say one of save, export or discard");
     if (exportTo && Trim(exportIt->second).empty())
         return MediaResult::Fail(MediaError::BadRequest, "export needs a path");
+    SavePolicy policy;
+    if (MediaResult r = ParseSavePolicy(options, policy); !r.Ok())
+        return r;
+    if (!save && (options.count("strategy") || options.count("onConflict") || options.count("strict")))
+        return MediaResult::Fail(MediaError::BadRequest, "strategy, onConflict and strict go with save");
 
     const auto info = _manager->Info(slotId);
     if (!info || !info->present || !info->dirty)
@@ -650,12 +1323,19 @@ MediaResult MediaControl::ApplyDisposition(const std::string& slotId, const Opti
     if (save || exportTo)
     {
         // Written with the guest parked; the slot then holds a clean medium (save)
-        // or a copy exists (export), so the swap itself may drop the writes
+        // or a copy exists (export), so the swap itself may drop the writes.
+        // A save follows the policy as the medium leaves (D-8)
+        SaveOptions saveOptions;
+        saveOptions.disposition = true;
+        saveOptions.strategy = policy.strategy;
+        saveOptions.keepBoth = policy.keepBoth;
+        saveOptions.strict = policy.strict;
         ParkedEmulator parked(_context);
-        const MediaResult written = save ? _manager->Save(slotId) : _manager->Export(slotId, Trim(exportIt->second));
+        MediaResult written = save ? _manager->Save(slotId, saveOptions) : _manager->Export(slotId, Trim(exportIt->second));
         if (!written.Ok())
             return written;
         remaining = Disposition::Discard;
+        return written;  // its report goes into the reply
     }
     return MediaResult::Success();
 }
@@ -754,23 +1434,48 @@ MediaReply MediaControl::Insert(const MediaRequest& request, bool swap)
     if (MediaResult r = Flag(o, "immediate", flag); !r.Ok())
         return Fail(r.error, r.message);
     options.immediate = flag;
+    if (auto it = o.find("journal"); it != o.end())
+    {
+        const std::string journal = Lower(Trim(it->second));
+        if (journal == "replay")
+            options.journal = JournalChoice::Replay;
+        else if (journal == "discard")
+            options.journal = JournalChoice::Discard;
+        else if (journal == "off")
+            options.journal = JournalChoice::Off;
+        else
+            return Fail(MediaError::BadRequest, "journal '" + it->second + "': expected replay, discard or off");
+    }
 
     MediaSource source;
     source.path = path;
     source.type = request.upload ? MediaSourceType::Upload
                                  : FileHelper::IsFolder(path) ? MediaSourceType::Folder : MediaSourceType::File;
+    if (IsInlineDescriptor(path))
+    {
+        // A composition descriptor given as text (WebAPI / MCP / scripts) instead of a file
+        source.inlineBody = path;
+        source.path.clear();
+        source.type = MediaSourceType::Composite;
+    }
     if (auto it = o.find("format"); it != o.end())
         source.formatHint = Lower(Trim(it->second));
 
-    if (MediaResult r = ApplyDisposition(reply.slot, o, options.disposition); !r.Ok())
+    MediaResult decided = ApplyDisposition(reply.slot, o, options.disposition);
+    if (!decided.Ok())
     {
-        reply.result = r;
+        reply.result = decided;
         return reply;
     }
     options.cancelRequested = request.cancelRequested;
     options.onProgress = request.onProgress;
     reply.result = _manager->Insert(reply.slot, source, options);
+    reply.result.report.insert(reply.result.report.begin(), decided.report.begin(), decided.report.end());
     Finish(reply, o);
+    // Every plane's recent list (a file or a folder the user named; not an upload, not an inline descriptor)
+    if (reply.result.Ok() && (source.type == MediaSourceType::File || source.type == MediaSourceType::Folder))
+        if (const std::optional<SlotInfo> slot = _manager->Info(reply.slot))
+            RecentFiles::Instance().Note(RecentFiles::KindOfSlot(MediaKindName(slot->descriptor.kind)), path);
     return reply;
 }
 
@@ -786,13 +1491,59 @@ MediaReply MediaControl::Eject(const MediaRequest& request)
     if (MediaResult r = Flag(request.options, "end_recording", end); !r.Ok())
         return Fail(r.error, r.message);
     options.endRecording = end;
-    if (MediaResult r = ApplyDisposition(reply.slot, request.options, options.disposition); !r.Ok())
+    MediaResult decided = ApplyDisposition(reply.slot, request.options, options.disposition);
+    if (!decided.Ok())
     {
-        reply.result = r;
+        reply.result = decided;
         return reply;
     }
     reply.result = _manager->Eject(reply.slot, options);
+    reply.result.report.insert(reply.result.report.begin(), decided.report.begin(), decided.report.end());
     Finish(reply, request.options);
+    return reply;
+}
+
+/// `compact`, `fs`, `size` of save / export (S1 compact); a reply with an error when one is malformed
+static MediaReply CompactOptions(const std::map<std::string, std::string>& o, bool& compact, std::optional<FatType>& fs,
+                                 std::optional<uint64_t>& size)
+{
+    MediaReply reply;
+    if (auto it = o.find("compact"); it != o.end())
+    {
+        const std::string v = Lower(Trim(it->second));
+        if (v.empty() || v == "true" || v == "1" || v == "yes" || v == "on")
+            compact = true;
+        else if (v != "false" && v != "0" && v != "no" && v != "off")
+        {
+            reply.result = MediaResult::Fail(MediaError::BadRequest, "compact '" + it->second + "': expected true or false");
+            return reply;
+        }
+    }
+    if (auto it = o.find("fs"); it != o.end())
+    {
+        const std::string v = Lower(Trim(it->second));
+        if (v == "fat16")
+            fs = FatType::Fat16;
+        else if (v == "fat32")
+            fs = FatType::Fat32;
+        else
+        {
+            reply.result = MediaResult::Fail(MediaError::BadRequest, "fs '" + it->second + "': expected fat16 or fat32");
+            return reply;
+        }
+    }
+    if (auto it = o.find("size"); it != o.end())
+    {
+        uint64_t bytes = 0;
+        if (!ComposeDescriptor::ParseSize(it->second, bytes) || bytes == 0)
+        {
+            reply.result = MediaResult::Fail(MediaError::BadRequest, "size '" + it->second + "': expected a size (64MiB, 67108864)");
+            return reply;
+        }
+        size = bytes;
+    }
+    if ((fs || size) && !compact)
+        reply.result = MediaResult::Fail(MediaError::BadRequest, "fs and size go with compact (a re-synthesized volume)");
     return reply;
 }
 
@@ -810,6 +1561,37 @@ MediaReply MediaControl::Save(const MediaRequest& request)
         return Fail(MediaError::BadRequest, "retarget '" + it->second + "': expected true or false");
     if (auto compression = request.options.find("compression"); compression != request.options.end())
         options.compression = Trim(compression->second);
+    if (auto vhd = request.options.find("vhd"); vhd != request.options.end())
+        options.vhd = Lower(Trim(vhd->second));
+    if (MediaReply bad = CompactOptions(request.options, options.compact, options.fs, options.size); !bad.result.Ok())
+        return bad;
+    if (auto strategy = request.options.find("strategy"); strategy != request.options.end())
+        options.strategy = Lower(Trim(strategy->second));
+    if (auto force = request.options.find("force"); force != request.options.end() && !ParseBool(force->second, options.force))
+        return Fail(MediaError::BadRequest, "force '" + force->second + "': expected true or false");
+    if (auto plan = request.options.find("plan"); plan != request.options.end() && !ParseBool(plan->second, options.plan))
+        return Fail(MediaError::BadRequest, "plan '" + plan->second + "': expected true or false");
+    if (auto conflict = request.options.find("onConflict"); conflict != request.options.end())
+    {
+        const std::string v = Lower(Trim(conflict->second));
+        if (v != "refuse" && v != "keep-both")
+            return Fail(MediaError::BadRequest, "onConflict '" + conflict->second + "': expected refuse or keep-both");
+        options.keepBoth = v == "keep-both";
+    }
+    if (auto commit = request.options.find("commit"); commit != request.options.end())
+    {
+        options.commit = Lower(Trim(commit->second));
+        if (options.commit != "all" && options.commit != "partial")
+            return Fail(MediaError::BadRequest, "commit '" + commit->second + "': expected all or partial");
+    }
+    if (request.verb == "flatten")
+    {
+        // flatten names its strategy and never goes through DT-9 (that is save)
+        if (options.strategy.empty())
+            return Fail(MediaError::BadRequest, "flatten names its strategy: flat <path>, delta, commit or write-back");
+        if (options.strategy == "flat" && options.path.empty())
+            return Fail(MediaError::BadRequest, "flatten flat writes a new image: name the path");
+    }
 
     SaveOutcome outcome;
     {
@@ -822,6 +1604,11 @@ MediaReply MediaControl::Save(const MediaRequest& request)
         reply.body["retargeted"] = outcome.retargeted;
     }
     return reply;
+}
+
+MediaReply MediaControl::Flatten(const MediaRequest& request)
+{
+    return Save(request);
 }
 
 MediaReply MediaControl::Export(const MediaRequest& request)
@@ -839,6 +1626,10 @@ MediaReply MediaControl::Export(const MediaRequest& request)
         options.compression = Trim(it->second);
     if (auto it = request.options.find("parent"); it != request.options.end())
         options.parent = Trim(it->second);
+    if (auto it = request.options.find("vhd"); it != request.options.end())
+        options.vhd = Lower(Trim(it->second));
+    if (MediaReply bad = CompactOptions(request.options, options.compact, options.fs, options.size); !bad.result.Ok())
+        return bad;
 
     ParkedEmulator parked(_context);
     reply.result = _manager->Export(reply.slot, path, options);
@@ -864,8 +1655,44 @@ MediaReply MediaControl::Rescan(const MediaRequest& request)
     reply.result = ResolveSelector(*_manager, request.selector, reply.slot);
     if (!reply.result.Ok())
         return reply;
-    reply.result = _manager->Rescan(reply.slot);
-    Finish(reply, request.options);
+    const Options& o = request.options;
+    RescanOptions options;
+    bool save = false;
+    bool discard = false;
+    if (MediaResult r = Flag(o, "save", save); !r.Ok())
+        return Fail(r.error, r.message);
+    if (MediaResult r = Flag(o, "discard", discard); !r.Ok())
+        return Fail(r.error, r.message);
+    auto exportIt = o.find("export");
+    if (static_cast<int>(save) + static_cast<int>(discard) + static_cast<int>(exportIt != o.end()) > 1)
+        return Fail(MediaError::BadRequest, "say one of save, export or discard");
+    SavePolicy policy;
+    if (MediaResult r = ParseSavePolicy(o, policy); !r.Ok())
+        return Fail(r.error, r.message);
+    if (!save && (o.count("strategy") || o.count("onConflict") || o.count("strict")))
+        return Fail(MediaError::BadRequest, "strategy, onConflict and strict go with save");
+    if (exportIt != o.end())
+    {
+        options.disposition = Disposition::Export;
+        options.exportPath = Trim(exportIt->second);
+        if (options.exportPath.empty())
+            return Fail(MediaError::BadRequest, "export needs a path");
+    }
+    else if (save)
+        options.disposition = Disposition::Save;
+    else if (discard)
+        options.disposition = Disposition::Discard;
+    options.strategy = policy.strategy;
+    options.keepBoth = policy.keepBoth;
+    options.strict = policy.strict;
+    {
+        // A save or an export reads the medium while the guest cannot write to it
+        std::optional<ParkedEmulator> parked;
+        if (save || exportIt != o.end())
+            parked.emplace(_context);
+        reply.result = _manager->Rescan(reply.slot, options);
+    }
+    Finish(reply, o);
     return reply;
 }
 
@@ -910,13 +1737,14 @@ MediaReply MediaControl::Create(const MediaRequest& request)
     }
     else if (info->descriptor.kind == MediaKind::Block)
     {
-        // A blank card / disk lives in memory: keep it to what memory holds
-        constexpr uint64_t kMaxBlankBytes = 2ull * 1024 * 1024 * 1024;
+        // A blank card / disk: a session over an empty sparse disk; the guest's writes past the session's memory
+        // limit go to its spill file (C10d), so the size is an SDXC card's, not what memory holds
+        constexpr uint64_t kMaxBlankBytes = 128ull * 1024 * 1024 * 1024;
         uint64_t bytes = 0;
         auto it = o.find("size");
         if (it == o.end() || !ParseUnsigned(it->second, bytes) || bytes == 0 || bytes % 512 != 0 || bytes > kMaxBlankBytes)
-            return Fail(MediaError::BadRequest, "create on a block slot needs size: bytes, a multiple of 512, up to 2 GiB");
-        medium = MediaFormatRegistry::WrapBlock(blank, AccessMode::Session, "blank", std::make_unique<MemoryDisk>(bytes / 512));
+            return Fail(MediaError::BadRequest, "create on a block slot needs size: bytes, a multiple of 512, up to 128 GiB");
+        medium = MediaFormatRegistry::WrapBlock(blank, AccessMode::Session, "blank", std::make_unique<SparseMemoryDisk>(bytes / 512));
         reply.body["size"] = bytes;
     }
     else
@@ -929,12 +1757,14 @@ MediaReply MediaControl::Create(const MediaRequest& request)
     if (MediaResult r = Flag(o, "end_recording", end); !r.Ok())
         return Fail(r.error, r.message);
     options.endRecording = end;
-    if (MediaResult r = ApplyDisposition(reply.slot, o, options.disposition); !r.Ok())
+    MediaResult decided = ApplyDisposition(reply.slot, o, options.disposition);
+    if (!decided.Ok())
     {
-        reply.result = r;
+        reply.result = decided;
         return reply;
     }
     reply.result = _manager->Insert(reply.slot, std::move(medium), options);
+    reply.result.report.insert(reply.result.report.begin(), decided.report.begin(), decided.report.end());
     Finish(reply, o);
     return reply;
 }

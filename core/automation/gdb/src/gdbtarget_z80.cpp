@@ -5,6 +5,7 @@
 #include <emulator/emulator.h>
 #include <emulator/emulatorcontext.h>
 #include <emulator/cpu/z80.h>
+#include <emulator/memory/memory.h>
 #include <emulator/platform.h>
 #include <emulator/ports/portdecoder.h>
 
@@ -156,6 +157,7 @@ bool GDBTargetZ80::deserializeRegisters(EmulatorContext* ctx, const std::string&
     }
 
     size_t offset = 0;
+    std::vector<uint16_t> values;
     for (const auto& reg : g_cpuRegisters)
     {
         int bytes = reg.bitsize / 8;
@@ -178,11 +180,15 @@ bool GDBTargetZ80::deserializeRegisters(EmulatorContext* ctx, const std::string&
             value |= static_cast<uint16_t>(*byte) << (i * 8);
         }
 
-        writeCPURegister(ctx, reg.regnum, value);
+        values.push_back(value);
         offset += hexLen;
     }
 
-    return true;
+    // One tool edit (Emulator::EditMemoryFromTool): while a session records, the new registers are part of the history
+    return editCPU(ctx, "GDB register write", [&] {
+        for (size_t i = 0; i < values.size(); ++i)
+            writeCPURegister(ctx, g_cpuRegisters[i].regnum, values[i]);
+    });
 }
 
 std::string GDBTargetZ80::readRegister(EmulatorContext* ctx, int regnum)
@@ -255,8 +261,50 @@ std::string GDBTargetZ80::writeRegister(EmulatorContext* ctx, int regnum, const 
         value |= static_cast<uint16_t>(*byte) << (i * 8);
     }
 
-    writeCPURegister(ctx, regnum, value);
+    // A CPU register is a tool edit; a paging pseudo-register is a port write, already one (PortWrite)
+    if (regnum < static_cast<int>(g_cpuRegisters.size()))
+    {
+        if (!editCPU(ctx, "GDB register write", [&] { writeCPURegister(ctx, regnum, value); }))
+            return "E0D";   // the recorded past
+    }
+    else
+        writeCPURegister(ctx, regnum, value);
     return "OK";
+}
+
+bool GDBTargetZ80::editCPU(EmulatorContext* ctx, const char* source, const std::function<void()>& edit)
+{
+    if (ctx->pEmulator)
+        return ctx->pEmulator->EditMemoryFromTool(source, edit).empty();
+    edit();
+    return true;
+}
+
+bool GDBTargetZ80::writeMemory(EmulatorContext* ctx, uint64_t addr, const std::vector<uint8_t>& bytes)
+{
+    Memory* memory = ctx ? ctx->pMemory : nullptr;
+    if (!memory)
+        return false;
+
+    // Physical memory access (0x01PPAAAA): a page edit behind the CPU's back, TTD must see it like any other tool write
+    if ((addr & 0xFF000000) == 0x01000000)
+    {
+        const uint8_t page = static_cast<uint8_t>((addr >> 16) & 0xFF);
+        const uint16_t offset = static_cast<uint16_t>(addr & 0x3FFF);
+        uint8_t* pageAddr = memory->RAMPageAddress(page);
+        if (!pageAddr)
+            return false;
+        return editCPU(ctx, "GDB page write", [&] {
+            for (size_t i = 0; i < bytes.size(); i++)
+                pageAddr[static_cast<uint16_t>((offset + i) & 0x3FFF)] = bytes[i];
+            memory->MarkRamPageEdited(page);
+        });
+    }
+
+    return editCPU(ctx, "GDB memory write", [&] {
+        for (size_t i = 0; i < bytes.size(); i++)
+            memory->DirectWriteToZ80Memory(static_cast<uint16_t>((addr + i) & 0xFFFF), bytes[i]);
+    });
 }
 
 int GDBTargetZ80::getRegisterCount(EmulatorContext* /*ctx*/)
@@ -300,7 +348,8 @@ uint16_t GDBTargetZ80::readCPURegister(EmulatorContext* ctx, int regnum)
             case 9:  return state->alt.bc;
             case 10: return state->alt.de;
             case 11: return state->alt.hl;
-            case 12: return state->ir_;
+            // R's bit 7 is kept apart (r_hi, LD R,A); bits 6:0 count
+            case 12: return static_cast<uint16_t>((state->i << 8) | (state->r_low & 0x7F) | (state->r_hi & 0x80));
             case 13: return (state->iff1 ? 1 : 0) | (state->iff2 ? 2 : 0);
             case 14: return state->im;
             default: return 0;
@@ -344,7 +393,7 @@ void GDBTargetZ80::writeCPURegister(EmulatorContext* ctx, int regnum, uint16_t v
             case 9:  state->alt.bc = value; break;
             case 10: state->alt.de = value; break;
             case 11: state->alt.hl = value; break;
-            case 12: state->ir_ = value; break;
+            case 12: state->ir_ = value; state->r_hi = static_cast<uint8_t>(value & 0x80); break;
             case 13:
                 state->iff1 = (value & 1) ? 1 : 0;
                 state->iff2 = (value & 2) ? 1 : 0;

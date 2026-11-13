@@ -49,10 +49,13 @@ std::string TimeTravelController::VisitComposedFrames(uint64_t fromFrame, uint64
 {
     if (_state == TTDSessionState::Recording)
         return "session is recording - stop it first";
-    if (_timeline.empty() || !_context || !_context->pScreen)
+    if (_line->timeline.empty() || !_context || !_context->pScreen)
         return "no recorded history";
-    const uint64_t first = _timeline.front().time.frame;
-    const uint64_t last = _timeline.back().time.frame;
+    // The active lineage: the trunk's start to the active branch's end (SeekToInternal follows it)
+    const uint64_t first = _lines.front()->timeline.empty() ? _line->timeline.front().time.frame
+                                                            : _lines.front()->timeline.front().time.frame;
+    const uint64_t last = _lines[_tip]->timeline.empty() ? _line->timeline.back().time.frame
+                                                         : _lines[_tip]->timeline.back().time.frame;
     if (fromFrame > toFrame || fromFrame < first || toFrame > last)
         return "frame range outside the session [" + std::to_string(first) + ", " + std::to_string(last) + "]";
 
@@ -73,7 +76,7 @@ std::string TimeTravelController::VisitComposedFrames(uint64_t fromFrame, uint64
         f.p7FFD = _context->emulatorState.p7FFD;
         f.border = _context->emulatorState.pFE & 0b0000'0111;
         f.activeScreen = screen->GetActiveScreen();
-        ComposeDisplay(/*frameTarget=*/true);
+        ComposeDisplay(/*frameTarget=*/true, kCurrentFrame);   // positioned at its start: this frame to its end
 
         uint32_t* fb = nullptr;
         size_t fbSize = 0;
@@ -93,6 +96,13 @@ std::string TimeTravelController::VisitComposedFrames(uint64_t fromFrame, uint64
     return error;
 }
 
+std::string TimeTravelController::VisitComposedFramesAsOperation(uint64_t fromFrame, uint64_t toFrame,
+                                                                 const TTDFrameVisitor& visit)
+{
+    const SessionOperation op{*this, SessionOperation::Kind::Change};
+    return VisitComposedFrames(fromFrame, toFrame, visit);
+}
+
 TimeTravelController::TTDClipExportResult TimeTravelController::ExportClip(const TTDClipExportOptions& options)
 {
     const SessionOperation op{*this, SessionOperation::Kind::Change};
@@ -104,13 +114,16 @@ TimeTravelController::TTDClipExportResult TimeTravelController::ExportClip(const
         result.error = "session is recording - stop it first";
         return result;
     }
-    if (_timeline.empty() || !_context || !_context->pScreen)
+    if (_line->timeline.empty() || !_context || !_context->pScreen)
     {
         result.error = "no recorded history";
         return result;
     }
-    const uint64_t first = _timeline.front().time.frame;
-    const uint64_t last = _timeline.back().time.frame;
+    // The active lineage: the trunk's start to the active branch's end (SeekToInternal follows it)
+    const uint64_t first = _lines.front()->timeline.empty() ? _line->timeline.front().time.frame
+                                                            : _lines.front()->timeline.front().time.frame;
+    const uint64_t last = _lines[_tip]->timeline.empty() ? _line->timeline.back().time.frame
+                                                         : _lines[_tip]->timeline.back().time.frame;
     if (options.fromFrame > options.toFrame || options.fromFrame < first || options.toFrame > last)
     {
         result.error = "frame range outside the session [" + std::to_string(first) + ", " + std::to_string(last) + "]";

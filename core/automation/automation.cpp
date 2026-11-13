@@ -2,6 +2,9 @@
 
 #include <emulator/emulator.h>
 #include <emulator/emulatormanager.h>
+#include <common/logger.h>
+#include <emulator/execution/companionregistry.h>
+#include <mutex>
 
 #include <thread>
 
@@ -20,6 +23,7 @@
 
 #if ENABLE_MCP_AUTOMATION
 #include "mcp/src/automation-mcp.h"
+#include <emulator/monitoring/clientstats.h>
 #endif
 
 #if ENABLE_CLI_AUTOMATION
@@ -58,6 +62,14 @@ Automation& Automation::GetInstance()
 bool Automation::start()
 {
     bool result = true;
+
+    // Companion clients of a headless instance (docs/inprogress/2026-10-16-companion-client): provisioned by whoever
+    // starts the process. Once per process, however often automation starts
+    static std::once_flag companionsFromEnvironment;
+    std::call_once(companionsFromEnvironment, [] {
+        if (const size_t added = companion::CompanionRegistry::Instance().LoadFromEnvironment())
+            LOGINFO("%zu companion client(s) from UNREAL_COMPANION_TOKENS", added);
+    });
 
 #if ENABLE_LUA_AUTOMATION
     result &= startLua();
@@ -137,37 +149,26 @@ void Automation::stop()
 #endif
 }
 
-std::string Automation::getEmulatorIdOrFirst(const std::string& providedId)
+bool Automation::IsLuaReady()
 {
-    if (!providedId.empty()) {
-        return providedId;
-    }
-    
-    EmulatorManager* mgr = EmulatorManager::GetInstance();
-    if (!mgr) return "";
-    
-    std::vector<std::string> uuids = mgr->GetEmulatorIds();
-    if (!uuids.empty()) {
-        return uuids.front();
-    }
-    
-    return "";
+#if ENABLE_LUA_AUTOMATION
+    return _lua && _lua->ready();
+#else
+    return false;
+#endif
 }
 
-bool Automation::SetVideowallSingleSyncMode(bool enable, const std::string& emulatorId)
+int Automation::RunLuaFile(const std::string& path, std::string& error)
 {
-    std::string targetId = enable ? getEmulatorIdOrFirst(emulatorId) : "";
-    if (enable && targetId.empty())
-    {
-        std::cerr << "Cannot enable single sync mode: no emulator found." << std::endl;
-        return false;
-    }
-    
-    // Post to message center - VideoWallWindow listens for this
-    auto* payload = new VideowallSyncModePayload(targetId, enable);
-    MessageCenter::DefaultMessageCenter().Post(NC_VIDEOWALL_SINGLE_SYNC_MODE, payload);
-    
-    return true;
+#if ENABLE_LUA_AUTOMATION
+    if (_lua)
+        return _lua->runFile(path, error);
+    error = "Lua automation is not started";
+#else
+    (void)path;
+    error = "this build has no Lua automation";
+#endif
+    return 1;
 }
 
 /// endregion </Methods>
@@ -211,6 +212,15 @@ bool Automation::startPython()
 }
 #endif
 
+int Automation::GetWebAPIPort() const
+{
+#if ENABLE_WEBAPI_AUTOMATION
+    return _webAPI ? _webAPI->port() : 0;
+#else
+    return 0;
+#endif
+}
+
 #if ENABLE_WEBAPI_AUTOMATION
 bool Automation::startWebAPI()
 {
@@ -238,6 +248,10 @@ bool Automation::startMCP()
     _mcp = new AutomationMCP();
     if (_mcp)
     {
+        // host.clients.mcp.tools: the calls per tool and action
+        _mcp->SetToolCallObserver([](const std::string& tool, const std::string& action) {
+            monitoring::ClientStats::Instance().ToolCall(tool, action);
+        });
         _mcp->start();
     }
     else

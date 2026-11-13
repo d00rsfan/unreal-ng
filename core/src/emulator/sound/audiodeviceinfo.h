@@ -31,6 +31,14 @@ enum class AudioSourceType
     MultiSoundSaa,   // MS SAA: the SAA1099
     MultiSoundPcm,   // MS PCM: the four shared DACs (General Sound + SounDrive)
     MultiSoundMidi,  // MS MIDI: the SAM2695 General MIDI synthesizer
+    // The ZX Spectrum Next's sound (NextAudio, a model audio source with parts): its three AY / YM chips and the
+    // four-channel DAC, each a row; the device mixes them in its one buffer at the part's gain
+    NextAy1, NextAy2, NextAy3,
+    NextDac,
+    // Wild Sound card rows (a Sprinter ISA card, emulator/sound/wildsound): the XM player and the two AY chips
+    WildSoundXm,     // WS XM: the uploaded module
+    WildSoundAy1,    // WS AY 1: chip 0
+    WildSoundAy2,    // WS AY 2: chip 1
     Custom
 };
 

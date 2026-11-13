@@ -7,7 +7,6 @@
 #include "stdafx.h"
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -115,11 +114,17 @@ public:
         uint8_t skipBytes;         ///< parser: bytes of a Pause sequence still to skip
         uint8_t modifiers;         ///< kb_ctrl_status (register D bits 6..0)
         uint8_t held[16];          ///< host side: PcKey bitmap of the keys held down
+        uint8_t f12Down;           ///< atx.c: F12 is held - its release decides between a reset and power-off
+        uint8_t reserved[7];
+        uint64_t f12PressMicros;   ///< when F12 went down, emulated time (PortDecoder::EmulatedMicroseconds)
     };
-    static_assert(sizeof(Ps2State) == 40, "EvoAvr::Ps2State layout changed");
+    static_assert(sizeof(Ps2State) == 56, "EvoAvr::Ps2State layout changed");
 
 public:
     EvoAvr();
+    /// Defined in the .cpp: with the destructor implicit, every file that destroys one emits it and its thunks (two bases),
+    /// and MinGW's linker rejects those copies under -flto ("multiple definition of non-virtual thunk")
+    ~EvoAvr() override;
 
     /// region <Host side>
     void SetSdStatus(bool present, bool writeProtected);
@@ -199,8 +204,7 @@ public:
     const Ps2State& GetPs2State() const { return _ps2; }
     void SetPs2State(const Ps2State& state) { _ps2 = state; }
     /// The 4 KiB EEPROM, battery-backed: the time-travel engine's region
-    /// EvoAvrEeprom (compared at each capture: one write path, 4 KiB). v1 does
-    /// not record it
+    /// EvoAvrEeprom (compared at each capture: one write path, 4 KiB)
     const uint8_t* EepromData() const { return _eeprom.data(); }
     /// "cmos" and the 4 KiB EEPROM as the device memory region "eeprom" (plain storage: a write is a byte in it,
     /// as the AVR firmware's EEPROM write leaves it)
@@ -227,7 +231,9 @@ protected:
     {
     public:
         explicit EepromRegion(std::array<uint8_t, kEepromSize>& eeprom) : _eeprom(eeprom) {}
-        const char* Name() const override { return "eeprom"; }
+        const char* Name() const override { return "evo-avr.eeprom"; }
+        const char* Aliases() const override { return "eeprom"; }
+        const char* TtdRegion() const override { return "evo-avr.eeprom"; }
         const char* Description() const override
         {
             return "ZX-Evo AVR EEPROM, 4 KiB, battery-backed (the guest sees 16 bytes of it at a time through the "
@@ -255,8 +261,6 @@ protected:
     EvoAvrWait _wait;
     WaitHandler _waitHandler = WaitHandler::BaseConf;
     ResetHandler _resetHandler;
-    std::chrono::steady_clock::time_point _f12Press{};
-    bool _f12Down = false;
     // Its resolution lives in the AVR's battery-backed RTC cell #FD, which the Z80 cannot reach
     EvoAvrMouse _mouse{[this] { return GetCell(EvoAvrMouse::kResolutionCell); },
                        [this](uint8_t value) { SetCell(EvoAvrMouse::kResolutionCell, value); }};

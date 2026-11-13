@@ -19,7 +19,10 @@ port decoder PROM (`[PROFI] ExtPorts=v003`: the extended ports also from the SYS
 0.41h1 (`rom/profi/bios-plus-041h1.rom`). It boots PQ-DOS from a floppy or an IDE disk (`ide0.master`) and runs DOS
 Navigator. Its start-up board test passes the FDC, drives, parallel port (8255), serial port (8253 + 8251, see
 [Serial port](#serial-port-com)), RTC and AY. PQ-DOS disks and a 2 GB HDD image: see
-`docs/inprogress/2026-10-04-profi-plus/design.md`; create it with `{"model":"PROFI-PLUS"}`.
+`docs/inprogress/2026-10-04-profi-plus/design.md`; create it with `{"model":"PROFI-PLUS"}`. The IDE disk slots read
+FAT16 only (PQ-DOS ignores FAT32 partitions): FAT32 folders, composites and images are refused. A composed disk of
+two partitions (PQ-DOS on partition 1, a host folder as partition 2, drive D:) is a `*.ucompose.yaml` with
+`partitions:` (see `.recipe/media/use-media-slots.md`).
 
 `[PROFI] SyncProm=` picks another sync PROM: `0a1d`, `samx6`, `fb0579b6`
 (71680 T, INT 48 T before paper) or `v503`.
@@ -86,7 +89,7 @@ invoke_api {"method":"GET","path":"/emulator/{id}/ports"}
 | Hi-res (`#DFFD` bit 7) timing: the CPU on its hi-res clock (v3 3 MHz, v5 ZQ3 / 4 = 5 MHz; turbo doubles), frame and INT from the sync PROM's upper half (v3: 320 lines, 48.83 Hz), hi-res waits (v5 model), v3 hi-res floating bus | implemented — see [Hi-res](#hi-res-512x240) |
 | The native v5 matrix keyboard's EXT / MODE / GRAF keys, the v3 on-board XT pads | not implemented |
 | BIOS menu entries TR-DOS, Sinclair 48 / 128 | verified on both boards |
-| CP/M | v5: boots from the BIOS menu "Загрузка системы CP/M" (`testdata/machines/profi/cpm/v5/kondor-system-copyk.fdi`, `ProfiBoot_Test.CpmBootsFromTheKondorSystemDisk`); v3: the Kramis "Profi-DOS" entry. Klug CP/M 2.3 needs the default V0.3 ROM (TR-DOS 5.04T); V0.2 (`kramis-v02.rom`, TR-DOS 5.03) cannot load it. SP-DOS (`cpm/sp-dos/unicopy-sp-dos.td0`, MicroDOS with the BIOS by V. Tereschenko) boots on both boards from the same entries to its hi-res shell |
+| CP/M | v5: boots from the BIOS menu "Загрузка системы CP/M" ("Boot the CP/M system") (`testdata/machines/profi/cpm/v5/kondor-system-copyk.fdi`, `ProfiBoot_Test.CpmBootsFromTheKondorSystemDisk`); v3: the Kramis "Profi-DOS" entry. Klug CP/M 2.3 needs the default V0.3 ROM (TR-DOS 5.04T); V0.2 (`kramis-v02.rom`, TR-DOS 5.03) cannot load it. SP-DOS (`cpm/sp-dos/unicopy-sp-dos.td0`, MicroDOS with the BIOS by V. Tereschenko) boots on both boards from the same entries to its hi-res shell. CP/M floppies come as FDI / TD0 / UDI or as the raw `.pro` dump (`testdata/loaders/pro/ReadFile.pro`, `ProfiBoot_Test.CpmBootsFromAProDump`; the loader gives cylinder 0 side 0 the sector IDs 1, 2, 3, 4, 9 the BIOS boots from, [pro.md](../../docs/file-formats/disk-images/pro.md)); `media volumes` / `files` / `read` / `write` work on them (`cpm`: Profi CP/M or Klug CP/M) |
 
 ### Hi-res (512x240)
 

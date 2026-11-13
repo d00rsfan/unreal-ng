@@ -1,0 +1,224 @@
+{
+  "schema": 1,
+  "family": "md6-pad",
+  "view": "front",
+  "size": [
+    2048,
+    1536
+  ],
+  "controls": [
+    {
+      "control": "mode",
+      "label": "Mode",
+      "shape": {
+        "circle": [
+          1457,
+          586,
+          38
+        ]
+      },
+      "anchor": [
+        1457,
+        586
+      ],
+      "callout": "right",
+      "order": 0
+    },
+    {
+      "control": "up",
+      "label": "Up",
+      "shape": {
+        "rect": [
+          687,
+          628,
+          65,
+          69
+        ]
+      },
+      "anchor": [
+        720,
+        662
+      ],
+      "callout": "left",
+      "group": "directions",
+      "order": 1
+    },
+    {
+      "control": "down",
+      "label": "Down",
+      "shape": {
+        "rect": [
+          687,
+          762,
+          65,
+          69
+        ]
+      },
+      "anchor": [
+        720,
+        796
+      ],
+      "callout": "left",
+      "group": "directions",
+      "order": 2
+    },
+    {
+      "control": "left",
+      "label": "Left",
+      "shape": {
+        "rect": [
+          618,
+          697,
+          69,
+          65
+        ]
+      },
+      "anchor": [
+        652,
+        729
+      ],
+      "callout": "left",
+      "group": "directions",
+      "order": 3
+    },
+    {
+      "control": "right",
+      "label": "Right",
+      "shape": {
+        "rect": [
+          752,
+          697,
+          69,
+          65
+        ]
+      },
+      "anchor": [
+        787,
+        729
+      ],
+      "callout": "left",
+      "group": "directions",
+      "order": 4
+    },
+    {
+      "control": "start",
+      "label": "Start",
+      "shape": {
+        "rect": [
+          971,
+          683,
+          107,
+          41
+        ]
+      },
+      "anchor": [
+        1024,
+        704
+      ],
+      "callout": "right",
+      "order": 5
+    },
+    {
+      "control": "a",
+      "label": "A",
+      "shape": {
+        "circle": [
+          1227,
+          830,
+          54
+        ]
+      },
+      "anchor": [
+        1227,
+        830
+      ],
+      "callout": "right",
+      "order": 6
+    },
+    {
+      "control": "b",
+      "label": "B",
+      "shape": {
+        "circle": [
+          1334,
+          771,
+          54
+        ]
+      },
+      "anchor": [
+        1334,
+        771
+      ],
+      "callout": "right",
+      "order": 7
+    },
+    {
+      "control": "c",
+      "label": "C",
+      "shape": {
+        "circle": [
+          1451,
+          740,
+          54
+        ]
+      },
+      "anchor": [
+        1451,
+        740
+      ],
+      "callout": "right",
+      "order": 8
+    },
+    {
+      "control": "x",
+      "label": "X",
+      "shape": {
+        "circle": [
+          1186,
+          704,
+          40
+        ]
+      },
+      "anchor": [
+        1186,
+        704
+      ],
+      "callout": "right",
+      "order": 9
+    },
+    {
+      "control": "y",
+      "label": "Y",
+      "shape": {
+        "circle": [
+          1285,
+          658,
+          40
+        ]
+      },
+      "anchor": [
+        1285,
+        658
+      ],
+      "callout": "right",
+      "order": 10
+    },
+    {
+      "control": "z",
+      "label": "Z",
+      "shape": {
+        "circle": [
+          1387,
+          632,
+          40
+        ]
+      },
+      "anchor": [
+        1387,
+        632
+      ],
+      "callout": "right",
+      "order": 11
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 #include "floppydriveslot.h"
 
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/io/fdc/fdd.h"
 #include "emulator/media/mediamanager.h"
@@ -51,6 +51,12 @@ void FloppyDriveSlot::NoteSlotWrite(EmulatorContext* context, uint8_t drive, con
     // A controller without a machine around it (unit tests): the marker alone
     if (context->pTimeTravelHooks)
         context->pTimeTravelHooks->RecordExternalEvent(ttd::TTDExternalEventKind::DiskWrite, detail);
+}
+
+void FloppyDriveSlot::BeforeTrackWrite(EmulatorContext* context, uint8_t drive, const unrealdisk::DiskImage::Track* track)
+{
+    if (context && context->pMediaManager && track)
+        context->pMediaManager->BeforeTrackWrite(IdFor(drive), *track);
 }
 
 void FloppyDriveSlot::Attach(Medium& medium)

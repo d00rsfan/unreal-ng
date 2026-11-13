@@ -1,11 +1,18 @@
 # TTD v1: architecture, data streams and the .ttd file format (as built)
 
+> **History.** This is the description of TTD v1 (`TimeTravelManager`), deleted on 2026-10-30 (TTD v2
+> migration, Phase 6, `d4d7bc34a`). Nothing reads its file format any more: no reader, analyzer or test is left
+> for it. Its peripheral id table survives as `legacy_id` in [`ttd.ksy`](../../../../../core/src/debugger/ttd/ttd.ksy).
+> The time-travel implementation now is the engine `ttd::TimeTravelEngine`, driven by `ttd::TimeTravelController`:
+> see [time-travel-debugging-tdd.md §0](./time-travel-debugging-tdd.md#0-as-built-2026-10-31) and the
+> [TTD v2 migration](../../../../inprogress/2026-09-25-ttd-v2-migration/README.md). The body below is kept as written.
+
 | | |
 |---|---|
-| **Status** | Reference. Describes the code on master, 2026-09-29, including the saved replay inputs, the port journals and NeoGS layout 4 (commits `0a8236fa`, `280e4ae2`). |
+| **Status** | **Historical.** TTD v1 (`TimeTravelManager`) and its file reader were deleted on 2026-10-30 (TTD v2 migration, Phase 6); the engine (`TimeTravelController`) is the only recorder, its file is schema 2 ([`ttd.ksy`](../../../../../core/src/debugger/ttd/ttd.ksy)). Kept as the record of v1 as built. Described the code on master, 2026-09-29, including the saved replay inputs, the port journals and NeoGS layout 4 (commits `0a8236fa`, `280e4ae2`). |
 | **Scope** | Time-travel debugging (TTD) v1 in `core/src/debugger/ttd/`: recording, in-memory storage, compression, restore/seek/replay, and the `.ttd` file (serialization and deserialization). |
 | **Source of truth** | The code. Where an older document disagrees, this document follows the code and lists the difference in [Appendix A](#appendix-a-discrepancies-with-older-documents). |
-| **Schema** | [`ttd.ksy`](../../../../../core/src/debugger/ttd/ttd.ksy) (Kaitai), [`ttddumpformat.h`](../../../../../core/src/debugger/ttd/ttddumpformat.h) (C++ constants) |
+| **Schema** | v1's Kaitai schema (schema 1) was deleted with v1; `core/src/debugger/ttd/ttd.ksy` is now the engine's schema 2. Its peripheral id table (0-65, frozen, D23) lives on there as `legacy_id` |
 | **Related** | [time-travel-debugging-tdd.md](./time-travel-debugging-tdd.md) (design intent), [ttd-container-format.md](./ttd-container-format.md) (proposed chunked container), [overhead-and-gating.md](./overhead-and-gating.md) (measured costs), [TTD v2 migration](../../../../inprogress/2026-09-25-ttd-v2-migration/README.md) |
 
 Citations have the form `file:line`. They were taken on master before the
@@ -591,7 +598,9 @@ variant configuration, decode scratch (`ttdcheckpoint.h:21-28`,
 | 112 | 1 | `current_z80_frequency_multiplier` | 0 in old files is read as 1 (`ttdcheckpoint.cpp:215`) |
 | 113 | 1 | `next_z80_frequency_multiplier` | |
 | 114 | 3 | `cpu_t_in_frame` | `z80.t` at capture, 24-bit little-endian (the overshoot) |
-| 117 | 3 | `reserved` | always 0 |
+| 117 | 1 | `hw_clock_den` | clock ratio denominator; 0 = the usual 1 (only the Profi in hi-res writes 7) |
+| 118 | 1 | `hw_clock_den_applied` | the denominator the frame runs with, same encoding |
+| 119 | 1 | `cpu_t_fraction` | `z80.t_l` at capture: the T-state fraction of a CPU above the base clock (0 at the base clock) |
 
 Everything model-specific (ATM, Profi, Scorpion, +3 latches, video modes) lives
 in device blobs, not here (`ttdcheckpoint.h:151`).
@@ -887,6 +896,7 @@ recording is refused (`tm.cpp:1349-1366`).
 | Model (`mem_model`) | Model serializers (ids) | Source |
 |---|---|---|
 | Scorpion, ProfROM Scorpion | ScorpionProfROM (6), Ds12887 (18, the SMUC clock) | `core/src/emulator/ports/portdecoder_scorpion256.cpp` `CreateTTDSerializers` |
+| Scorpion + GMX | ScorpionProfROM (6), Ds12887 (18), GmxPaging (70, the card's register file) | `core/src/emulator/ports/models/portdecoder_scorpiongmx.cpp` `CreateTTDSerializers` |
 | Profi | ProfiPaging (9), Ds12887 (18) | `portdecoder_profi.cpp` `CreateTTDSerializers` |
 | ATM 7.10 | AtmPaging (8), Atm2Kbc (26, the keyboard controller, when fitted), AtmIoBus (36, the INTERNAL I/O latch); MachineSerialPeer (27) and Atm2IoEsp (37) through the network peripherals when a peer / the card is fitted | `portdecoder_atm710.cpp` `CreateTTDSerializers`, `ttdmachineperipherals.cpp` |
 | ATM 4.50 | AtmPaging (8) | inherits the ATM 7.10 decoder without the v7.10 board logic |
@@ -1263,7 +1273,7 @@ Written at `tm.cpp:2987-3057`. `L` is the emulator id length.
 | Offset | Size | Type | Field | Writer value | Reader check |
 |---|---|---|---|---|---|
 | 0 | 4 | char[4] | `magic` | `"TTDD"` (`ttddumpformat.h:32`) | must match (`tm.cpp:3291`) |
-| 4 | 2 | u16 | `schema_version` | 1 (`ttddumpformat.h:48`) | must equal 1 (`tm.cpp:3299`) |
+| 4 | 2 | u16 | `schema_version` | 3 (`kSchemaVersion`; 1 until 2026-10-12) | 1 or 3 (`IsReadableSchema`); 2 is the engine's container, another reader |
 | 6 | 2 | u16 | `flags` | see 7.3 | bit 0 required; bit 5 required on turbo models |
 | 8 | 1 | u8 | `model_id` | `config.mem_model` (eModel) | must equal the live model (`tm.cpp:3356-3365`) |
 | 9 | 2 | u16 | `model_ram_pages` | page bound (1..256) | not checked against the live model |
@@ -1278,8 +1288,8 @@ Written at `tm.cpp:2987-3057`. `L` is the emulator id length.
 | 41+L | 8 | u64 | `session_end_frame` | last checkpoint's frame, or 0 | logged only |
 | 49+L | 4 | u32 | `page_store_count` | number of live slots | drives the slot loop |
 | 53+L | 4 | u32 | `checkpoint_count` | timeline length | drives the checkpoint loop (no pre-allocation) |
-| 57+L | 8 | u64 | `peripheral_mask` (formerly `reserved`) | with flag bit 9: bit N = TTD peripheral id N has a blob in the first checkpoint; zeros in older files | not checked by the loader; `ttd::ReadTTDFileInfo` reports it as the recorded machine's devices (walks to the first checkpoint without bit 9) |
-| 65+L | | | end of header | | |
+| 57+L | 8 (schema 1) or 1 + 8 x n (schema 3) | u64, or u8 word count (1..4) + u64 words | `peripheral_mask` (formerly `reserved`) | with flag bit 9: bit N = TTD peripheral id N has a blob in the first checkpoint; zeros in older files. Schema 3: word w holds ids 64 w .. 64 w + 63, only the words up to the highest non-zero one are written (so a machine with ids below 64 stores one word, 9 bytes) | not checked by the loader; `ttd::ReadTTDFileInfo` reports it as the recorded machine's devices (walks to the first checkpoint without bit 9) |
+| 65+L (schema 1; 66+L for one word of schema 3) | | | end of header (the not-recorded mask follows with flag bit 11, in the same encoding) | | |
 
 The five corpus files have `L = 0`, so a 65-byte header.
 
@@ -1296,7 +1306,7 @@ The five corpus files have `L = 0`, so a 65-byte header.
 | 6 | `0x0040` | `kFlagsHasInputJournal` | input-journal section follows the bookmarks (section 7.9) | always, empty or not | parses; failure is fatal. Absent: the session loads and reports its input history incomplete |
 | 7 | `0x0080` | `kFlagsHasExternalEvents` | external-event section follows (section 7.10) | always | parses; failure is fatal |
 | 8 | `0x0100` | `kFlagsHasPortJournals` | the port journals follow (section 7.11) | the session holds all of its history's I/O (a configuration they isolate, recorded without a gap) | parses and checks every block; failure is fatal. Absent: replay reads the live devices |
-| 9 | `0x0200` | `kFlagsHasPeripheralMask` | the header's last 8 bytes are the peripheral mask | always | read by `ReadTTDFileInfo`; the loader checks the blobs themselves |
+| 9 | `0x0200` | `kFlagsHasPeripheralMask` | the header's last bytes are the peripheral mask (one u64 in schema 1, a word list in schema 3) | always | read by `ReadTTDFileInfo`; the loader checks the blobs themselves |
 | 10 | `0x0400` | `kFlagsHasNetInputs` | network inputs follow | the session has NetEvent input | parses |
 | 11 | `0x0800` | `kFlagsHasNotRecordedMask` | the header carries the not-recorded mask | always | read by `ReadTTDFileInfo` |
 | 12 | `0x1000` | `kFlagsHasJournalSegments` | the write journal is followed by its segment table: u32 count, then per segment u64 from, u64 to (machine time; after `from` up to and including `to`) | always with bit 1 (D40: the journal is recorded on demand, in segments) | write searches inside a segment answer from the journal, elsewhere from the coverage index and a replay |
@@ -1517,7 +1527,7 @@ in this order:
 flowchart TD
     A["read magic"] --> B{"TTDD?"}
     B -->|"no"| X["fail: bad magic"]
-    B -->|"yes"| C{"schema_version is 1?"}
+    B -->|"yes"| C{"schema_version is 1 or 3?"}
     C -->|"no"| X2["fail: unsupported schema"]
     C -->|"yes"| D{"flags bit 0 set?"}
     D -->|"no"| X3["fail: big-endian"]
@@ -1554,7 +1564,7 @@ flowchart TD
 | Step | Check | Fatal? | Code |
 |---|---|---|---|
 | 1 | magic `TTDD` | yes | `tm.cpp:3288-3295` |
-| 2 | `schema_version == 1` | yes | `tm.cpp:3297-3305` |
+| 2 | `schema_version` is 1 or 3 | yes | `tm.cpp:3297-3305` |
 | 3 | flag bit 0 | yes | `tm.cpp:3307-3313` |
 | 4 | ROM signature equal, unless the file or the live machine reports 0 | yes | `tm.cpp:3335-3347` |
 | 5 | `model_id` equals `config.mem_model` | yes | `tm.cpp:3356-3365` |
@@ -1669,7 +1679,7 @@ by tests and fixed in `0a8236fa`.
    later delta slot could get a lower index than the slot it XORs against; the
    file was refused on load ("invalid prev_slot"). The writer now numbers the
    slots in dependency order (each XorPrev slot after its chain). Test:
-   `TimeTravelManager_ResumeSave_Test.SessionSavedAfterAResumeFromThePastLoads`.
+   `TimeTravelController_ResumeSave_Test.SessionSavedAfterAResumeFromThePastLoads`.
 2. **Fixed: the coverage index was not cut on resume and not cleared by
    `StartRecording`.** `ResumeRecordingFrom` now drops the index from the
    resume frame on (`TTDCoverageIndex::DropFramesFrom`; a mid-frame resume
@@ -1693,15 +1703,22 @@ by tests and fixed in `0a8236fa`.
 
 ### 10.1 Schema version
 
-`kSchemaVersion = 1` (`ttddumpformat.h:48`) and `meta.schema-version: 1`
-(`ttd.ksy:57`) must be equal. The C++ reader accepts only exactly 1
-(`tm.cpp:3299`); the Python reader too (`ttd_format.py:711`).
+`kSchemaVersion = 3` (`ttddumpformat.h`) and `meta.schema-version: 3`
+(`ttd.ksy`) must be equal. The C++ reader accepts 1 and 3 (`IsReadableSchema`);
+the Python reader too (`ttd_format.py`). Schema 3 (2026-10-12) widened the
+header's peripheral and not-recorded masks from one u64 each to a word list, so
+a device with an id above 63 can be named (id 63 was the last one a u64 held:
+the second serial port's peer is 64, the joystick connector's 65). Schema 1
+files, the corpus included, load unchanged: nothing else in the layout moved.
+Number 2 is taken by the engine's container (`ttdfileinfo.cpp: kEngineFileSchema`);
+its controller facts (holder stream 17) went from version 1 to 2 for the same
+reason (the masks are word lists), and read both.
 
 The format has not shipped. It is amended **in place** without a version bump
 (`ttddumpformat.h:37-47`, `ttd.ksy:38-42`). Examples of past in-place changes:
 `model_ram_pages` widened from u8 to u16; the chipset struct shrank to 120 bytes;
 checkpoints moved to after the new frame's start; `boundary`,
-`int_acked_in_pulse` and `cpu_t_in_frame` took former padding bytes. Older files
+`int_acked_in_pulse`, `cpu_t_in_frame`, `hw_clock_den` and `cpu_t_fraction` took former padding bytes. Older files
 either fail the size checks or load with a different meaning; they must be
 re-recorded.
 
@@ -1743,7 +1760,7 @@ missing configuration fingerprint, section 9.2).
   the page store and the checkpoints. It does **not** model the trailing
   sections; it documents their layouts in the `flags` field's text, and the C++
   writer is authoritative for them.
-- [`ttd_format.py`](../../../../../tools/verification/ttd-analyzer/src/ttd_format.py)
+- `ttd_format.py` (`tools/verification/ttd-analyzer/src/`, deleted with v1)
   is a hand-written reader. It parses all sections, including the journal
   directory, the coverage blocks and the bookmarks, decodes device blob
   headers, and verifies slot CRCs. It caps a slot payload at 16 MiB
@@ -1839,7 +1856,7 @@ the coverage index and the frame cache (`tm.cpp:683-727`).
 - `docs/inprogress/2026-09-28-debugger-family/ttd-offline-analysis.md` — O-1 and the offline-analysis program.
 - [ttd-port-read-journal.md](./ttd-port-read-journal.md) — the port journals and the port-events search.
 - [testdata/ttd/README.md](../../../../../testdata/ttd/README.md) — fixture corpus and re-recording.
-- Code: [`core/src/debugger/ttd/`](../../../../../core/src/debugger/ttd/), [`ttd.ksy`](../../../../../core/src/debugger/ttd/ttd.ksy), [`ttd_format.py`](../../../../../tools/verification/ttd-analyzer/src/ttd_format.py).
+- Code: [`core/src/debugger/ttd/`](../../../../../core/src/debugger/ttd/), [`ttd.ksy`](../../../../../core/src/debugger/ttd/ttd.ksy), `ttd_format.py` (deleted with v1).
 - CRC32C (Castagnoli): RFC 3720 appendix B.4. FNV-1a: draft-eastlake-fnv. zstd: RFC 8878.
 
 ---

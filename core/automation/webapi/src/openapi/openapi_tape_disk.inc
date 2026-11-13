@@ -29,7 +29,8 @@
     paths["/api/v1/emulator/{id}/tape/load"]["post"]["responses"]["404"]["description"] = "Emulator not found";
     paths["/api/v1/emulator/{id}/tape/load"]["post"]["responses"]["413"]["description"] = "File too large (max 1 MB)";
     paths["/api/v1/emulator/{id}/tape/load"]["post"]["responses"]["409"]["description"] =
-        "A TTD recording is running; the message says why the action would destroy it. Stop the recording first.";
+        "The change is refused (the message says why). A load while TTD records is not refused: it is an event of "
+        "the recording and lands at the next frame boundary.";
 
     paths["/api/v1/emulator/{id}/tape/eject"]["post"]["summary"] = "Eject tape";
     paths["/api/v1/emulator/{id}/tape/eject"]["post"]["description"] =
@@ -41,7 +42,8 @@
     paths["/api/v1/emulator/{id}/tape/eject"]["post"]["parameters"][0]["schema"]["type"] = "string";
     paths["/api/v1/emulator/{id}/tape/eject"]["post"]["responses"]["200"]["description"] = "Tape ejected";
     paths["/api/v1/emulator/{id}/tape/eject"]["post"]["responses"]["409"]["description"] =
-        "A TTD recording is running: the media set is fixed. Stop the recording first.";
+        "The change is refused (the message says why). An eject while TTD records is not refused: it is an event "
+        "of the recording and lands at the next frame boundary.";
 
     paths["/api/v1/emulator/{id}/tape/play"]["post"]["summary"] = "Start tape playback";
     paths["/api/v1/emulator/{id}/tape/play"]["post"]["tags"].append("Tape Control");
@@ -49,7 +51,14 @@
     paths["/api/v1/emulator/{id}/tape/play"]["post"]["parameters"][0]["in"] = "path";
     paths["/api/v1/emulator/{id}/tape/play"]["post"]["parameters"][0]["required"] = true;
     paths["/api/v1/emulator/{id}/tape/play"]["post"]["parameters"][0]["schema"]["type"] = "string";
-    paths["/api/v1/emulator/{id}/tape/play"]["post"]["responses"]["200"]["description"] = "Tape playback started";
+    paths["/api/v1/emulator/{id}/tape/play"]["post"]["description"] =
+        "A paused tape resumes in place, else it plays from the consumption cursor. A tape loaded while TTD records "
+        "lands at the next frame boundary: a play before that is queued (\"Tape playback starts when the tape is "
+        "in\") and the tape starts from its first block when it lands; a stop drops it.";
+    paths["/api/v1/emulator/{id}/tape/play"]["post"]["responses"]["200"]["description"] =
+        "Tape playback started, resumed, or queued for a tape on its way";
+    paths["/api/v1/emulator/{id}/tape/play"]["post"]["responses"]["400"]["description"] =
+        "Tape image has no loadable blocks (no tape in and none on its way)";
 
     paths["/api/v1/emulator/{id}/tape/stop"]["post"]["summary"] = "Stop tape playback";
     paths["/api/v1/emulator/{id}/tape/stop"]["post"]["tags"].append("Tape Control");
@@ -220,7 +229,8 @@
     paths["/api/v1/emulator/{id}/disk/{drive}/insert"]["post"]["responses"]["200"]["description"] =
         "Disk inserted successfully";
     paths["/api/v1/emulator/{id}/disk/{drive}/insert"]["post"]["responses"]["409"]["description"] =
-        "A TTD recording is running; the message says why the action would destroy it. Stop the recording first.";
+        "The change is refused (the message says why). A load while TTD records is not refused: it is an event of "
+        "the recording and lands at the next frame boundary.";
     paths["/api/v1/emulator/{id}/disk/{drive}/insert"]["post"]["responses"]["400"]["description"] =
         "Invalid path, file format, or drive parameter";
     paths["/api/v1/emulator/{id}/disk/{drive}/insert"]["post"]["responses"]["413"]["description"] =
@@ -232,7 +242,8 @@
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["description"] =
         "Create a blank disk and insert it into the specified drive. format 'unformatted' has no sectors "
         "(for the machine's own FORMAT: TR-DOS, +3DOS); 'plus3' is a formatted +3DOS disk (9 x 512-byte "
-        "sectors per track). 'auto' (the default) picks plus3 on a +3 and unformatted elsewhere.";
+        "sectors per track); 'trdos' a formatted TR-DOS disk (16 x 256-byte sectors, an empty catalogue). 'auto' "
+        "(the default) picks plus3 on a +3 and unformatted elsewhere.";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["parameters"][0]["name"] = "id";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["parameters"][0]["in"] = "path";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["parameters"][0]["required"] = true;
@@ -250,18 +261,19 @@
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["requestBody"]["content"]["application/json"]["schema"]
          ["properties"]["format"]["type"] = "string";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["requestBody"]["content"]["application/json"]["schema"]
-         ["properties"]["format"]["description"] = "auto (default), unformatted or plus3";
+         ["properties"]["format"]["description"] = "auto (default), unformatted (raw), plus3 or trdos";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["requestBody"]["content"]["application/json"]["schema"]
          ["properties"]["cylinders"]["description"] =
-        "Number of cylinders/tracks (40 or 80; default: 80 unformatted, 40 plus3)";
+        "Number of cylinders/tracks (40 or 80; default: 80 unformatted / trdos, 40 plus3)";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["requestBody"]["content"]["application/json"]["schema"]
          ["properties"]["sides"]["type"] = "integer";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["requestBody"]["content"]["application/json"]["schema"]
-         ["properties"]["sides"]["description"] = "Number of sides (1 or 2; default: 2 unformatted, 1 plus3)";
+         ["properties"]["sides"]["description"] = "Number of sides (1 or 2; default: 2 unformatted / trdos, 1 plus3)";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["responses"]["200"]["description"] =
         "Blank disk created and inserted";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["responses"]["409"]["description"] =
-        "A TTD recording is running; the message says why the action would destroy it. Stop the recording first.";
+        "The change is refused (the message says why). A load while TTD records is not refused: it is an event of "
+        "the recording and lands at the next frame boundary.";
     paths["/api/v1/emulator/{id}/disk/{drive}/create"]["post"]["responses"]["400"]["description"] =
         "Invalid drive, format or geometry parameters";
 
@@ -445,7 +457,9 @@
     paths["/api/v1/emulator/{id}/disk/{drive}/catalog"]["get"]["summary"] = "Get disk catalog";
     paths["/api/v1/emulator/{id}/disk/{drive}/catalog"]["get"]["tags"].append("Disk Inspection");
     paths["/api/v1/emulator/{id}/disk/{drive}/catalog"]["get"]["description"] =
-        "Parses TR-DOS directory (sectors 1-8) returning file names, types, sizes";
+        "The files of the disk's first file system (TR-DOS, +3DOS, iS-DOS, FAT; dos_type names it): path, name, type "
+        "(the TR-DOS type letter or the extension), start, length; TR-DOS also sectors, first_track, first_sector. Every "
+        "volume and directory: GET /media/{slot}/files";
     paths["/api/v1/emulator/{id}/disk/{drive}/catalog"]["get"]["parameters"][0]["name"] = "id";
     paths["/api/v1/emulator/{id}/disk/{drive}/catalog"]["get"]["parameters"][0]["in"] = "path";
     paths["/api/v1/emulator/{id}/disk/{drive}/catalog"]["get"]["parameters"][0]["required"] = true;

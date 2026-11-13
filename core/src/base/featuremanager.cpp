@@ -6,13 +6,15 @@
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 
 #include "3rdparty/message-center/messagecenter.h"
 #include "common/inifile.h"
 #include "common/modulelogger.h"
 #include "common/filehelper.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/cpu/core.h"
+#include "emulator/emulator.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/ports/portdecoder.h"
 #include "emulator/sound/soundmanager.h"
@@ -20,6 +22,7 @@
 #include "recordingmanager.h"
 #endif
 #include "emulator/video/screen.h"
+#include "emulator/video/viewportcontrol.h"
 
 /// region <Logging>
 const PlatformModulesEnum _MODULE = PlatformModulesEnum::MODULE_CORE;
@@ -66,7 +69,7 @@ void FeatureManager::clear()
     _dirty = true;
 }
 
-/// @brief True while the TTD recording lock is held (TimeTravelManager engages it
+/// @brief True while the TTD recording lock is held (TimeTravelController engages it
 /// on entering Recording and holds it until the session returns to Idle)
 bool FeatureManager::isTtdRecordingActive() const
 {
@@ -85,6 +88,94 @@ bool FeatureManager::isTtdRecordingActive() const
     return false;
 }
 
+bool FeatureManager::debugModeInEffect() const
+{
+    std::lock_guard<std::recursive_mutex> lock(_mutex);
+    if (_replayDebugHold || _tapDebugHold)
+        return true;
+    if (_breakpointDebugHold)
+    {
+        auto breakpointsIt = _features.find(Features::kBreakpoints);
+        if (breakpointsIt != _features.end() && breakpointsIt->second.enabled)
+            return true;
+    }
+    auto debugIt = _features.find(Features::kDebugMode);
+    return debugIt != _features.end() && debugIt->second.enabled;
+}
+
+void FeatureManager::OnModeChanged(const coordinator::ModeState& /*from*/, const coordinator::ModeState& to)
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
+        if (_replayDebugHold == to.replaying)
+            return;
+        _replayDebugHold = to.replaying;
+    }
+    applyDebugMode();
+}
+
+void FeatureManager::setTapDebugHold(bool on)
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
+        if (_tapDebugHold == on)
+            return;
+        _tapDebugHold = on;
+    }
+    applyDebugMode();
+}
+
+bool FeatureManager::tapDebugHold() const
+{
+    std::lock_guard<std::recursive_mutex> lock(_mutex);
+    return _tapDebugHold;
+}
+
+bool FeatureManager::debugCaptureOn() const
+{
+    std::lock_guard<std::recursive_mutex> lock(_mutex);
+    for (const char* id : {Features::kCallTrace, Features::kMemoryTracking, Features::kOpcodeProfiler})
+    {
+        auto it = _features.find(id);
+        if (it != _features.end() && it->second.enabled)
+            return true;
+    }
+    return false;
+}
+
+void FeatureManager::setBreakpointDebugHold(bool on)
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(_mutex);
+        if (_breakpointDebugHold == on)
+            return;
+        _breakpointDebugHold = on;
+    }
+    applyDebugMode();
+}
+
+bool FeatureManager::breakpointDebugHold() const
+{
+    std::lock_guard<std::recursive_mutex> lock(_mutex);
+    return _breakpointDebugHold;
+}
+
+void FeatureManager::applyDebugMode()
+{
+    if (!_context || !_context->pCore)
+        return;
+    // As onFeatureChanged: the emulation thread reads the debug flag, the memory interface and the tracker's buffers
+    // without locks, so switch them with the CPU held (the tracker frees its counters when the debug mode goes off).
+    // Free on the loop thread (the haptic probes arm at a frame end) and under a hold (a TTD replay's operation)
+    std::optional<Emulator::CpuHold> hold;
+    if (_context->pEmulator)
+        hold.emplace(*_context->pEmulator, "debug mode");
+    _context->pCore->GetZ80()->isDebugMode = debugModeInEffect();
+    _context->pCore->SelectMemoryInterface();  // the debug path, contended where the machine is
+    if (Memory* memory = _context->pCore->GetMemory())
+        memory->UpdateFeatureCache();
+}
+
 bool FeatureManager::isRzxPlaying() const
 {
     return _context && _context->rzxPlayer != nullptr;
@@ -100,6 +191,30 @@ bool FeatureManager::isTtdTimelineBound() const
         return true;
     return _context->pTimeTravelHooks &&
            _context->pTimeTravelHooks->GetState() == ttd::TTDSessionState::Detached;
+}
+
+bool FeatureManager::ttdRecordsShortcuts() const
+{
+    return _context && _context->pTimeTravelHooks && _context->pTimeTravelHooks->RecordsShortcuts();
+}
+
+bool FeatureManager::ttdLocksTurboMode() const
+{
+    return isTtdRecordingActive() && !ttdRecordsShortcuts();
+}
+
+bool FeatureManager::ttdLocksFastLoader(const std::string& id) const
+{
+    // Fast disk also compresses the WD1793's timing outside its trap (WD1793::isFastDiskArmed): no edit records
+    // that, a replay with it off would run another FDC. Held for every recording, a black box too
+    if (id == Features::kFastDisk)
+        return isTtdTimelineBound() || (_context && _context->pTimeTravelHooks && _context->pTimeTravelHooks->IsRecording());
+    if (!isTtdTimelineBound())
+        return false;
+    // The engine records the tape trap as an edit, and turbo tape only takes the pacing away: the live head of a
+    // recording keeps them, a replay applies the edits instead (and the machine sitting in history keeps them off
+    // until it records again)
+    return !(ttdRecordsShortcuts() && _context->pTimeTravelHooks->IsRecording() && !_context->ttdReplayActive);
 }
 
 void FeatureManager::onTtdRecordingStarted()
@@ -301,20 +416,33 @@ bool FeatureManager::isEnabled(const std::string& idOrAlias) const
 std::string FeatureManager::refusalReason(const std::string& idOrAlias, bool enabled) const
 {
     std::string id;
+    bool current = false;
     {
         std::lock_guard<std::recursive_mutex> lock(_mutex);
         const auto* feature = findFeature(idOrAlias);
         if (!feature)
             return {};
         id = feature->id;
+        current = feature->enabled;
     }
 
     // Either direction swaps the fitted General Sound card (FR-4)
     if (id == Features::kGSLightweight)
     {
-        ttd::ITimeTravelHooks* ttd = _context ? _context->pTimeTravelHooks : nullptr;
+        coordinator::IMachineOps* ops = _context ? _context->pMachineOps : nullptr;
         const bool gsFitted = _context && _context->pSoundManager && _context->pSoundManager->getGeneralSound();
-        return (ttd && gsFitted) ? ttd->RecordingGuard(ttd::TTDGuardedAction::SwitchGsCard) : std::string();
+        if (!ops || !gsFitted)
+            return {};
+        coordinator::MachineOp op;
+        op.kind = coordinator::OpKind::GsCardSwitch;
+        return ops->WouldRefuse(op).reason;
+    }
+
+    // The esxDOS mode changes what RST $08 does in both directions: a recorded run replays only with the same one
+    if (id == Features::kEsxDos && enabled != current && (isTtdTimelineBound() || isRzxPlaying()))
+    {
+        return "Cannot change " + id + " while TTD is recording or replaying history, or an RZX recording plays: it "
+               "changes what the guest code does. Stop the recording, or leave the history, first.";
     }
 
     // Switching timetravel or debugmode off is never refused: setFeature stops a
@@ -327,13 +455,13 @@ std::string FeatureManager::refusalReason(const std::string& idOrAlias, bool ena
         return "Cannot enable " + id + " while an RZX recording plays: it changes what the guest code does, so the "
                "playback would leave the recorded path. Stop the playback first.";
     }
-    if ((id == Features::kFastDisk || id == Features::kFastTape || id == Features::kTurboTape) && isTtdTimelineBound())
+    if ((id == Features::kFastDisk || id == Features::kFastTape || id == Features::kTurboTape) && ttdLocksFastLoader(id))
     {
         return "Cannot enable " + id + " while TTD is recording or replaying history: it changes what the guest "
                "code does, so the replay would no longer match the recording. Stop the recording, or leave the "
                "history, first.";
     }
-    if (id == Features::kTurboMode && isTtdRecordingActive())
+    if (id == Features::kTurboMode && ttdLocksTurboMode())
     {
         return "Cannot enable turbo mode while TTD is recording: a recording must show the code running at real "
                "speed. Stop the recording first.";
@@ -352,9 +480,9 @@ bool FeatureManager::isMaskedByTtd(const std::string& id) const
     // Shortcuts read as OFF for the whole timeline binding (recording, replay, Detached);
     // turbo mode only while recording
     if (id == Features::kFastDisk || id == Features::kFastTape || id == Features::kTurboTape)
-        return isTtdTimelineBound() || isRzxPlaying();
+        return ttdLocksFastLoader(id) || isRzxPlaying();
     if (id == Features::kTurboMode)
-        return isTtdRecordingActive();
+        return ttdLocksTurboMode();
     return false;
 }
 
@@ -376,7 +504,7 @@ void FeatureManager::syncTurboModeWithTtdState()
     // Recording forces turbo off regardless of the stored desired state; the
     // desired state itself is left untouched so it can be restored verbatim
     // once recording stops (same masking approach as isEnabled() above).
-    if (isTtdRecordingActive())
+    if (ttdLocksTurboMode())
         wantsTurbo = false;
 
     if (_context->pCore->IsTurboMode() != wantsTurbo)
@@ -505,6 +633,13 @@ void FeatureManager::setDefaults()
                      "",
                      {Features::kStateOff, Features::kStateOn},
                      Features::kCategoryDebug});
+    registerFeature({Features::kDeviceAccess,
+                     Features::kDeviceAccessAlias,
+                     Features::kDeviceAccessDesc,
+                     false,  // OFF by default (owner 2026-11-02): always-on only after the hot-path A/B
+                     "",
+                     {Features::kStateOff, Features::kStateOn},
+                     Features::kCategoryAnalysis});
     registerFeature({Features::kZXDLSS,
                      Features::kZXDLSSAlias,
                      Features::kZXDLSSDesc,
@@ -585,6 +720,22 @@ void FeatureManager::setDefaults()
                      {Features::kStateOff, Features::kStateOn},
                      Features::kCategoryPerformance});
 
+    registerFeature({Features::kTTDRestart,
+                     Features::kTTDRestartAlias,
+                     Features::kTTDRestartDesc,
+                     false,  // OFF by default - an operation that ends a TTD session leaves the machine unrecorded
+                     "",
+                     {Features::kStateOff, Features::kStateOn},
+                     Features::kCategoryDebug});
+
+    registerFeature({Features::kEsxDos,
+                     Features::kEsxDosAlias,
+                     Features::kEsxDosDesc,
+                     false,  // OFF by default - the board runs RST $08 through its ROM
+                     "",
+                     {Features::kStateOff, Features::kStateOn},
+                     Features::kCategoryPerformance});
+
     registerFeature({Features::kGSLightweight,
                      Features::kGSLightweightAlias,
                      Features::kGSLightweightDesc,
@@ -622,6 +773,8 @@ void FeatureManager::loadFromFile(const std::string& path)
             auto it = _features.find(section);
             if (it == _features.end())
                 continue;  // Only override registered features
+            if (section == Features::kOverscan)
+                continue;  // the machine's frame, not a preference: it starts with the machine's mode
             FeatureInfo& f = it->second;
 
             const char* state = ini.GetValue(section.c_str(), "state", nullptr);
@@ -675,19 +828,20 @@ void FeatureManager::saveToFile(const std::string& path) const
 /// @param changedFeatureId The canonical ID of the feature that changed, or empty for bulk reload.
 void FeatureManager::onFeatureChanged(const std::string& changedFeatureId)
 {
+    // The machine caches below (memory interface, contention, Z80 / screen / port decoder caches) are read by the
+    // emulation thread without locks: refresh them with the CPU held. Free when the machine is not running or the
+    // caller already holds the CPU (the loop thread, a nested hold); TSan, the GUI toggling a feature mid-frame
+    std::optional<Emulator::CpuHold> hold;
+    if (_context && _context->pEmulator)
+        hold.emplace(*_context->pEmulator, "feature change");
+
     // Update the feature cache in Memory class if it exists
     if (_context && _context->pCore && _context->pCore->GetMemory())
     {
         _context->pCore->GetMemory()->UpdateFeatureCache();
 
-        // Synchronize master switch with feature changes
-        bool debugEnabled;
-        {
-            std::lock_guard<std::recursive_mutex> lock(_mutex);
-            auto debugIt = _features.find(Features::kDebugMode);
-            debugEnabled = debugIt != _features.end() && debugIt->second.enabled;
-        }
-        _context->pCore->GetZ80()->isDebugMode = debugEnabled;
+        // Synchronize master switch with feature changes (a replay's hold stays: debugModeInEffect)
+        _context->pCore->GetZ80()->isDebugMode = debugModeInEffect();
 
         // Switch memory interface based on debug mode and the machine's contention (with its switch)
         _context->pCore->SetContentionSwitch(isEnabled(Features::kContention));  // re-selects the interface
@@ -746,6 +900,7 @@ void FeatureManager::onFeatureChanged(const std::string& changedFeatureId)
     {
         _context->pPortDecoder->UpdateFeatureCache();
     }
+    hold.reset();
 
     // General turbo (max speed) mode: push the desired state into Core when the
     // 'turbomode' feature itself changes, or when TTD recording starts/stops
@@ -756,6 +911,19 @@ void FeatureManager::onFeatureChanged(const std::string& changedFeatureId)
     if (changedFeatureId == Features::kTurboMode || changedFeatureId == Features::kTimeTravel)
     {
         syncTurboModeWithTtdState();
+    }
+
+    // The feature `overscan` is the switch of the Pentagon's overscan frame (the WebAPI route, View > Overscan, the
+    // catalogue's video.overscan_toggle): the frame follows it, with the viewport the GUI picks. A machine without the
+    // frame keeps it off (Emulator::SetOverscanMode sets it back to the frame's mode)
+    if (changedFeatureId == Features::kOverscan && _context && _context->pEmulator)
+    {
+        Emulator* emulator = _context->pEmulator;
+        const bool on = isEnabled(Features::kOverscan);
+        if (emulator->IsOverscanMode() != on)
+            VideoViewport::SetOverscan(*emulator, on);
+        if (emulator->IsOverscanMode() != on)
+            setFeature(Features::kOverscan, emulator->IsOverscanMode());  // no frame here: the switch says so
     }
 
     if (_dirty)

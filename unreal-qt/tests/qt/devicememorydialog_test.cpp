@@ -3,6 +3,8 @@
 
 #include <QApplication>
 #include <QComboBox>
+#include <QLabel>
+#include <QStackedWidget>
 #include <gtest/gtest.h>
 
 #include <memory>
@@ -39,13 +41,17 @@ TEST_F(DeviceMemoryDialog_Test, TypedBytesReachTheTsConfPalette)
     auto* decoder = dynamic_cast<PortDecoder_TSConf*>(_emulator->GetContext()->pPortDecoder);
     ASSERT_NE(decoder, nullptr);
 
-    DeviceMemoryDialog dialog(_emulator.get());
+    EXPECT_TRUE(DeviceMemoryDialog::HasRegions(_emulator.get()));
+    DeviceMemoryDialog dialog(_emulator);
     auto* regions = dialog.findChild<QComboBox*>();
     auto* view = dialog.findChild<QHexView*>();
     ASSERT_NE(regions, nullptr);
     ASSERT_NE(view, nullptr);
-    ASSERT_EQ(regions->count(), 4);  // cram, sfile, cmos, eeprom
-    EXPECT_EQ(regions->currentData().toString(), "cram");
+    // cram, sfile, cmos, eeprom, then the memories time travel records (the sound cards fitted, the ROM chip)
+    ASSERT_GE(regions->count(), 4);
+    EXPECT_EQ(regions->currentData().toString(), "tsconf.cram");
+    EXPECT_EQ(regions->itemData(3).toString(), "evo-avr.eeprom");
+    EXPECT_GE(regions->findData(QStringLiteral("evo.flash")), 4) << "the ZX-Evo ROM chip is listed too";
     ASSERT_NE(view->getDocument(), nullptr);
     EXPECT_EQ(view->getDocument()->length(), 512);
 
@@ -67,7 +73,10 @@ TEST_F(DeviceMemoryDialog_Test, TypedBytesReachTheTsConfPalette)
 TEST_F(DeviceMemoryDialog_Test, MachineWithoutRegions)
 {
     ASSERT_NO_FATAL_FAILURE(Create("48K"));
-    DeviceMemoryDialog dialog(_emulator.get());
+    EXPECT_FALSE(DeviceMemoryDialog::HasRegions(_emulator.get()));
+    DeviceMemoryDialog dialog(_emulator);
     EXPECT_EQ(dialog.findChild<QComboBox*>()->count(), 0);
-    EXPECT_FALSE(dialog.findChild<QHexView*>()->isEnabled());
+    auto* note = qobject_cast<QLabel*>(dialog.findChild<QStackedWidget*>()->currentWidget());
+    ASSERT_NE(note, nullptr) << "a note, not an empty hex view";
+    EXPECT_TRUE(note->text().contains("no device memory"));
 }

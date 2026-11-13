@@ -340,7 +340,7 @@
         p[3]["name"] = "memory";
         p[3]["in"] = "query";
         p[3]["description"] =
-            "Memory windows <space>:<address>:<length> (space cpu | ram | ram5 | rom2 | cache0, length at most 65536); "
+            "Memory windows <space>:<address>:<length> (space cpu | ram | ram5 | rom2 | cache0 | a device memory region by name, length at most 65536); "
             "repeat the parameter or separate with commas; at most 8";
         p[3]["schema"]["type"] = "string";
         p[4]["name"] = "pchist";
@@ -370,9 +370,29 @@
     paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][2]["in"] = "query";
     paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][2]["required"] = false;
     paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][2]["description"] =
-        "Number of instructions (default: 10, max: 100)";
+        "Number of instructions (default: 10, max: 256)";
     paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][2]["schema"]["type"] = "integer";
-    paths["/api/v1/emulator/{id}/disasm"]["get"]["responses"]["200"]["description"] = "Disassembled instructions";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][3]["name"] = "before";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][3]["in"] = "query";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][3]["required"] = false;
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][3]["description"] =
+        "Rows above the address first (default: 0, max: 256), synced back from the known instruction starts";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][3]["schema"]["type"] = "integer";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][4]["name"] = "snap";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][4]["in"] = "query";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][4]["required"] = false;
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][4]["description"] =
+        "1: move the address to the start of the row that holds it (a scrollbar drag)";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][4]["schema"]["type"] = "boolean";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][5]["name"] = "cpu";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][5]["in"] = "query";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][5]["required"] = false;
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][5]["description"] =
+        "main (default), gs or ms: a sound card CPU's code from its PC";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["parameters"][5]["schema"]["type"] = "string";
+    paths["/api/v1/emulator/{id}/disasm"]["get"]["responses"]["200"]["description"] =
+        "Disassembled rows: instructions, and (kind data / cut) db rows of the memory markup's data ranges or of an "
+        "instruction's bytes cut by a known instruction start";
 
     // Physical page disassembly endpoint
     paths["/api/v1/emulator/{id}/disasm/page"]["get"]["summary"] = "Disassemble from physical RAM/ROM page";
@@ -413,7 +433,7 @@
         "Scans memory for a byte pattern (MemorySearch, the same as CLI find, Lua / Python mem_find, MCP find_bytes). "
         "Body: {pattern_hex: \"CD ?? 00\" (?? = any byte, A? = any low nibble) or pattern: [205, 22, 0], mask_hex: "
         "\"FF 00 FF\" (optional, 1 bits must match; replaces the wildcards), space: \"cpu\" (default: what the CPU "
-        "sees now) | \"ram\" (every RAM page) | a page \"ram5\" / \"rom2\" / \"cache0\", start, end (in the space; "
+        "sees now) | \"ram\" (every RAM page) | a page \"ram5\" / \"rom2\" / \"cache0\" | a device memory region by name or alias, start, end (in the space; "
         "default the whole space), max: 64, alignment: 1 | 2}. Each match: address (cpu) or page {kind, page} + offset, "
         "context_start and context (4 bytes before, the match, 4 after).";
     paths["/api/v1/emulator/{id}/memory/find"]["post"]["parameters"][0]["name"] = "id";
@@ -436,3 +456,70 @@
         ["properties"]["alignment"]["type"] = "integer";
     paths["/api/v1/emulator/{id}/memory/find"]["post"]["responses"]["200"]["description"] =
         "space, count, matches[] (address or page + offset, context_start, context), truncated, range";
+
+    // The sound card CPU (cpuview.h): ?cpu= on the register, memory, disassembly and memory map routes
+    {
+        const char* text = "main (default), gs (the General Sound slot card's CPU) or ms (the MultiSound's General "
+                           "Sound): the CPU whose registers / memory view / code it is. 400 for another name, 404 "
+                           "for a card CPU that is not there now (a card without a CPU, an empty slot)";
+        const std::pair<const char*, const char*> routes[] = {
+            {"/api/v1/emulator/{id}/registers", "get"},        {"/api/v1/emulator/{id}/registers/{name}", "put"},
+            {"/api/v1/emulator/{id}/memory/{addr}", "get"},    {"/api/v1/emulator/{id}/memory/{addr}", "put"},
+            {"/api/v1/emulator/{id}/disasm", "get"},           {"/api/v1/emulator/{id}/memory/map", "get"},
+            {"/api/v1/emulator/{id}/memory/info", "get"},      {"/api/v1/emulator/{id}/memory/read/{address}", "get"}};
+        for (const auto& [path, verb] : routes)
+        {
+            Json::Value& operation = paths[path][verb];
+            Json::Value cpu;
+            cpu["name"] = "cpu";
+            cpu["in"] = "query";
+            cpu["required"] = false;
+            cpu["description"] = text;
+            cpu["schema"]["type"] = "string";
+            cpu["schema"]["enum"].append("main");
+            cpu["schema"]["enum"].append("gs");
+            cpu["schema"]["enum"].append("ms");
+            operation["parameters"].append(cpu);
+            operation["responses"]["404"]["description"] = "Emulator instance not found, or the card CPU is not there";
+        }
+        // POST /memory/write takes it in the body
+        Json::Value& write = paths["/api/v1/emulator/{id}/memory/write"]["post"];
+        write["requestBody"]["content"]["application/json"]["schema"]["properties"]["cpu"]["type"] = "string";
+        write["requestBody"]["content"]["application/json"]["schema"]["properties"]["cpu"]["description"] = text;
+        write["responses"]["404"]["description"] = "Emulator instance not found, or the card CPU is not there";
+        paths["/api/v1/emulator/{id}/registers"]["get"]["description"] =
+            paths["/api/v1/emulator/{id}/registers"]["get"]["description"].asString() +
+            " With cpu=gs / ms the card CPU's registers in the same shape plus cpu; special has card_time (the "
+            "card's own clock) instead of t.";
+        paths["/api/v1/emulator/{id}/memory/map"]["get"]["description"] =
+            paths["/api/v1/emulator/{id}/memory/map"]["get"]["description"].asString() +
+            " With cpu=gs / ms: {cpu, windows: [{start, size, kind (rom, ram, none), page, offset}]}, the card CPU's "
+            "four 16K windows.";
+        // The steps: ?cpu= (or the body's cpu) gs / ms steps that card CPU (RunControl::CardStep)
+        const char* step = "main (default), gs or ms: the CPU that steps. A card CPU's step resumes the machine until "
+                           "the card ends it, then pauses it; the card runs as the main CPU's run takes it along (at "
+                           "a host port access or the frame end), so the main CPU moves on to that point. A breakpoint "
+                           "of any CPU on the way ends it; no end within 2 s (over / out 5 s) pauses with the reason "
+                           "timeout. The reply: stop {cpu, reason step / breakpoint / pause / timeout, cpu_pc, "
+                           "breakpoint_id, address, access}, the card CPU's pc and sp, the main CPU's main_pc and "
+                           "main_sp, state. 409 when not paused or a step of that CPU is under way";
+        for (const char* path : {"/api/v1/emulator/{id}/step", "/api/v1/emulator/{id}/steps",
+                                 "/api/v1/emulator/{id}/stepover", "/api/v1/emulator/{id}/stepout"})
+        {
+            Json::Value& operation = paths[path]["post"];
+            Json::Value cpu;
+            cpu["name"] = "cpu";
+            cpu["in"] = "query";
+            cpu["required"] = false;
+            cpu["description"] = step;
+            cpu["schema"]["type"] = "string";
+            cpu["schema"]["enum"].append("main");
+            cpu["schema"]["enum"].append("gs");
+            cpu["schema"]["enum"].append("ms");
+            operation["parameters"].append(cpu);
+            operation["responses"]["404"]["description"] = "Emulator instance not found, or the card CPU is not there";
+        }
+        paths["/api/v1/emulator/{id}/steps"]["post"]["description"] =
+            paths["/api/v1/emulator/{id}/steps"]["post"]["description"].asString() +
+            " With cpu=gs / ms: count (1-10000) instructions of that card CPU.";
+    }

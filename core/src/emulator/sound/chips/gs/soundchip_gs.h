@@ -14,6 +14,7 @@
 #include "emulator/sound/chips/gs/gsmodulereplay.h"
 #include "emulator/sound/chips/gs/gsmailbox.h"
 #include "emulator/sound/chips/gs/gsprofile.h"
+#include "emulator/sound/chips/gs/gsbusobserver.h"
 #include "emulator/sound/chips/gs/gsporttrace.h"
 #include "emulator/ports/portdecoder.h"
 #include "common/modulelogger.h"
@@ -156,6 +157,17 @@ public:
     bool hadAudioActivityLastFrame() const override { return _wasActive; }
     bool isCPUHalted() const override { return _cpu && Z80CpuHalted(_cpu) != 0; }
     uint16_t getCPUReg(GSCpuRegister reg) const override;
+    // Card CPU debugging (gs-debugger design §4)
+    bool setDebugHooks(IGSDebugHooks* hooks) override;
+    CardPage mapCardAddress(uint16_t addr) const override;
+    uint32_t cardPageCount(CardPage::Kind kind) const override;
+    bool cardRegisters(Z80CpuRegisters& out) const override;
+    int64_t cardTime() const override { return totalGsCycles(); }
+    double cardUnitsPerSecond() const override { return _unitsPerSecond; }
+    int64_t cardFrameTime() const override { return totalGsCycles() - _frameStartGsCycles; }
+    bool inFrameEndCatchUp() const override { return _frameEndCatchUp; }
+    bool pokeCardMemory(uint16_t addr, uint8_t value) override;
+    bool setCardRegisters(const Z80CpuRegisters& regs) override;
 
     // Coprocessor capability: this is the LLE personality
     bool hasCoprocessor() const override { return true; }
@@ -172,6 +184,7 @@ public:
     /// Structured event trace (host ports, GS-side ports, DAC fetches,
     /// interrupts) - opt-in, mirrors the main-Z80 port tracer's session model
     /// but scoped to this chip. See gsporttrace.h.
+    void attachPortTrace(GSHistory* history) override { _portTrace.attach(history, _context); }
     void startPortTrace() override { _portTrace.start(); }
     void stopPortTrace() override { _portTrace.stop(); }
     void pausePortTrace() override { _portTrace.pause(); }
@@ -199,6 +212,22 @@ public:
     /// The card runs to the host's now first, so its earlier accesses see the
     /// old value; the sink is not told (the board already has the write)
     void sharedVolumeWrite(int channel, uint8_t volume);
+
+    /// What the runner may do with this card (GSCardRunner reads these, not the private hooks themselves: a
+    /// requires-expression on a befriended private member is false under MSVC 2019, which compiled the sleep out)
+    static constexpr bool kRunnerIdleSleep = true;          ///< sleepAllowed() and the rest: the idle loop is slept through
+    static constexpr bool kRunnerBatchQuietEvents = true;   ///< sleepQuietEventsBefore()
+
+    /// The firmware's idle poll loop is slept through (default on; off steps every instruction: comparison tests)
+    void setIdleSleep(bool on) { _runner.setSleepOn(on); }
+    /// Card CPU steps the sleeps stood for (tests, diagnosis)
+    uint64_t stepsSlept() const { return _runner.stepsSlept(); }
+    /// Card time in profile units, and a run of the card by itself (tests)
+    int64_t cardUnits() const { return totalGsCycles(); }
+    void runFor(int64_t units) { runTo(totalGsCycles() + units); }
+
+    /// The board's bus trace (MultiSound profile only): every GS port cycle and DAC fetch, nullptr = off
+    void setBusObserver(IGSBusObserver* observer) { _busObserver = observer; }
 
     /// Bus /RESET of a board with its own host clock (GSProfile::hostClock):
     /// the power-on reset (reset()) at the host's now. The card's time 0 is
@@ -282,7 +311,7 @@ public:
     /// the engine's blob is the fixed state only
     void TTDRegions(std::vector<ttd::TTDDeviceRegion>& out) override;
     void TTDArmRegions(bool on) override { _ramTrackerArmed = on ? &_ramTracker : nullptr; }
-    bool TTDStateWithoutRegions(uint8_t& peripheralId, std::vector<uint8_t>& state) const override;
+    bool TTDStateWithoutRegions(std::vector<uint8_t>& state) const override;
     bool TTDLoadStateWithoutRegions(const uint8_t* state, size_t size) override;
 
 private:
@@ -311,6 +340,25 @@ private:
     int64_t unitsPerCycle() const { return _unitsPerCycle; }
     static constexpr bool kCanStall = false; // no DMA on the classic card
     void onStep() { _activityCounters.cpuSteps++; }
+    // Sleeping through the firmware's idle poll loop (GSCardRunner): after boot the firmware polls FLAGS with
+    // interrupts off (COMINT_ at #026E: IN A,(4) / RRCA / JR C / LD A,(PROCESS) / OR A / JR Z). Every bus access
+    // except a plain memory read outside the DAC window and the FLAGS / COMRG reads counts as a side effect; the
+    // period boundary is the only event and is quiet while the CPU cannot take the INT
+    uint32_t busEffects() const { return _busEffects; }
+    bool sleepAllowed() const
+    {
+        return !_nmiPending && !_busObserver && !Z80CpuIntPossible(_cpu);
+    }
+    static int64_t sleepHardStop() { return std::numeric_limits<int64_t>::max(); }
+    void onStepsSkipped(uint64_t steps) { _activityCounters.cpuSteps += steps; }
+    /// One sleep, one record in each history that is on (the event trace's Idle, the execution history's idle)
+    void onSlept(uint16_t head, int64_t start, uint64_t iterations)
+    {
+        if (_portTrace.isCapturing()) [[unlikely]]
+            traceIdle(head, start, iterations);
+        recordExecIdle(head, iterations);
+    }
+    bool sleepQuietEventsBefore(int64_t end);
 
     // GSModuleReplay hooks
     void replayRunFor(int64_t cycles) { runTo(totalGsCycles() + cycles); }
@@ -329,12 +377,21 @@ private:
     static uint8_t gsPortReadMultiSound(Z80CPU* cpu, uint16_t port, void* userData);
     static void gsPortWriteMultiSound(Z80CPU* cpu, uint16_t port, uint8_t value, void* userData);
     static uint8_t gsIntRead(Z80CPU* cpu, void* userData);
+    // The same with the debug hooks told (setDebugHooks): the access done, then reported
+    static uint8_t gsMemReadDebug(Z80CPU* cpu, uint16_t addr, int m1State, void* userData);
+    static void gsMemWriteDebug(Z80CPU* cpu, uint16_t addr, uint8_t value, void* userData);
+    static uint8_t gsPortReadDebug(Z80CPU* cpu, uint16_t port, void* userData);
+    static void gsPortWriteDebug(Z80CPU* cpu, uint16_t port, uint8_t value, void* userData);
+    /// The CPU's bus: the plain callbacks of the port rules, or the debug ones
+    void bindBus();
 
     // GS-side port handlers (ports 0x00-0x0B): classic, and the MultiSound
     // CPLD's rules (GSPortRules), bound per profile at construction
     uint8_t gsIn(uint16_t port);
+    uint8_t gsInDecode(uint16_t port);  // the byte and its side effects, untraced
     void gsOut(uint16_t port, uint8_t value);
     uint8_t gsInMultiSound(uint16_t port);
+    uint8_t gsInMultiSoundDecode(uint16_t port);
     void gsOutMultiSound(uint16_t port, uint8_t value);
     void volumeWrite(uint16_t port, uint8_t value);  // ports 6-9 (own mix or DAC sink)
 
@@ -362,8 +419,23 @@ private:
 
     // Lazy sync core
     void flush();                      // run GS to the current ZX tact
+    void runToDebug(int64_t targetGsCycles);  // out of line: the debug loop's code stays away from the fast loop's
+    void runToRecord(int64_t targetGsCycles);  // out of line too: the execution history's loop
     void runTo(int64_t targetGsCycles)
     {
+        syncExecHistory();
+        // A debugger's hooks: the debug loop; the execution history: the record loop (tests a run, never per
+        // instruction)
+        if (_debugHooks) [[unlikely]]
+        {
+            runToDebug(targetGsCycles);
+            return;
+        }
+        if (execRecording()) [[unlikely]]
+        {
+            runToRecord(targetGsCycles);
+            return;
+        }
         // The classic timing (1 unit per cycle, INT held until accepted) runs
         // its own policy: its per-instruction path is the pre-profile one
         if (_classicTiming)
@@ -445,9 +517,11 @@ private:
     GSCardRunner<SoundChip_GeneralSound> _runner;
     int64_t _gsCyclesAbs = 0;
     int64_t _frameStartGsCycles = 0;
+    bool _frameEndCatchUp = false;  // inside handleFrameEnd's run (a card hook's edit names the frame)
     uint64_t _frameStartZxTacts = 0;
     int64_t _frameGsCycles = 0;
     bool _nmiPending = false;
+    uint32_t _busEffects = 0;  // GSCardRunner::busEffects
 
     // Level-held 37.5 kHz INT request (design §2.4): asserted at each quantum
     // boundary, cleared only by acceptance - the request survives firmware
@@ -460,6 +534,9 @@ private:
     // Diagnostics: always-on counters + opt-in structured trace (gsporttrace.h)
     GSActivityCounters _activityCounters;
     GSPortTraceRecorder _portTrace;
+    IGSBusObserver* _busObserver = nullptr;
+    IGSDebugHooks* _debugHooks = nullptr;  // a card CPU debugger (setDebugHooks): the debug loop and bus
     uint32_t currentFrameNumber() const;
     void traceEvent(GSTraceSide side, uint16_t port, uint8_t value, bool isOut, uint8_t channel = 0, uint8_t extraFlags = 0);
+    void traceIdle(uint16_t head, int64_t start, uint64_t iterations);
 };

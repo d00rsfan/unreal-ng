@@ -15,7 +15,10 @@ use a feature branch for verification before publishing.
 |----------|---------|
 | Linux x86_64, portable | `UnrealNG-Suite-Linux-x86_64.AppImage` |
 | Linux x86_64, bundled Qt DEB | `UnrealNG-Suite-Linux-x86_64.deb` |
+| Linux x86_64, bundled Qt RPM | `UnrealNG-Suite-Linux-x86_64.rpm` |
+| Linux x86_64, portable archive with bundled Qt | `UnrealNG-Suite-Linux.tar.gz` |
 | Ubuntu 26.04 x86_64, system libraries | `UnrealNG-Suite-Ubuntu-26.04-x86_64.deb` |
+| Steam Deck, AppImage with Steam library installer | `UnrealNG-SteamDeck-x86_64.tar.gz` |
 | macOS Intel | `UnrealNG-Suite-macOS-x86_64.dmg` |
 | macOS Apple Silicon | `UnrealNG-Suite-macOS-arm64.dmg` |
 | Windows x86_64, MSVC | `UnrealNG-Suite-Windows-x86_64.zip` |
@@ -37,6 +40,9 @@ not currently produce a separate symbol archive.
   resources, Qt plugins and offscreen startup.
 - The AppImage starts with the Qt SDK environment removed, using extraction mode
   so verification does not require FUSE.
+- The portable tarball includes the bundled DEB's private Qt runtime and is
+  checked with the Qt SDK environment removed. The RPM uses the same install
+  tree and includes its private Qt libraries and plugins.
 
 Follow [native DEB packaging](native-deb.md) to reproduce the native build and
 clean-install check locally. The regular Linux build image and local commands

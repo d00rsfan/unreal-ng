@@ -1,8 +1,12 @@
 #pragma once
 
+#include <array>
+#include <atomic>
+
 #include <cstdint>
 #include <cstddef>
 #include "emulator/sound/audio.h"
+#include "emulator/sound/chips/chipwritehistory.h"
 #include "emulator/ports/portdecoder.h"
 #include "common/modulelogger.h"
 #include "debugger/ttd/ttdserializable.h"  // TTDSerializable (P1.5 peripheral serializer)
@@ -45,6 +49,19 @@ struct blip_t;
 /// `PortDecoder_Scorpion256` turned out to have none of
 /// `PortDecoder_Pentagon128`'s per-model SoundDrive fix (see
 /// docs/inprogress/2026-09-23-sounddrive-quad-wiring/DONE.md, session 3).
+///
+/// One instance, one set of controls (the mixer's COVOX row), whatever ports
+/// it answers: a fitment adds ports, never a second DAC or volume. The mono
+/// Covox's port depends on the board: #FB on the Pentagon-style card
+/// (CovoxFB), #DD on the Scorpion family - its printer data latch, the
+/// Scorpion's one and only Covox port ([SOUND] CovoxDD=1, slot built-in
+/// `covox-dd`; no #FB on the board). Both drive the mono latch (RightB in
+/// the code), centred on both sides when it is the only one driven - as
+/// Xpeccy's hardware/scorpion.c `scrpOutDD` (`sdrvWrite(..., 0xfb, val)`).
+/// A SounDrive / #FB card in a Scorpion slot adds its ports to this
+/// instance. The #DD decode is the board's partial one (PrinterDecodeOf):
+/// yellow board #0027/#00DD, Turbo+ #0023/#00DD (Xpeccy; MAME scorpion.cpp
+/// Centronics mirror #FFDC). Write-only.
 class Covox : public PortDevice, public ttd::TTDSerializable
 {
 public:
@@ -88,7 +105,12 @@ public:
     /// (CovoxFB=1, SD=0), Mode1 / Mode2 one SounDrive port set (mode=1 / 2:
     /// the real card's S1 switch), Mode1Mono the mode-1 set plus a Covox card's
     /// #FB (two cards, one DAC module)
-    enum class Fitment { Mono, Quad, Mode1, Mode2, Mode1Mono };
+    /// None: no SounDrive / #FB card - the Scorpion's own Covox on #DD alone (CovoxDD=1, CovoxFB=0, SD=0)
+    enum class Fitment { Mono, Quad, Mode1, Mode2, Mode1Mono, None };
+
+    /// The Scorpion printer port's decode on this model (yellow board and GMX: A0 = 1, A1 = 0, A2 = 1, A5 = 0;
+    /// Turbo+: A0 = 1, A1 = 0, A5 = 0), or mask 0 when the model has no such port
+    static PortMaskMatch PrinterDecodeOf(int memModel);
 
     enum class Channel { LeftA = 0, LeftB = 1, RightA = 2, RightB = 3, Count = 4 };
 
@@ -108,9 +130,12 @@ public:
 
 protected:
     EmulatorContext* _context;
+    ChipWriteHistory _history;  ///< the DAC writes, by channel (chipwritehistory.h)
 
     // Fitment baked in at construction (see Fitment doc, public section)
     Fitment _fitment;
+    // The Scorpion's Covox port #DD (the printer data latch, on the mono latch): its decode, mask 0 = not answered (CovoxDD)
+    PortMaskMatch _printerDecode{};
 
     // Audio buffer (one frame of stereo int16)
     AudioFrameDescriptor _audioDescriptor;
@@ -131,6 +156,12 @@ protected:
 
     // Per-channel mute (for UI)
     bool _channelMute[4] = {false, false, false, false};
+    // Per-channel host gain, Q15 (the mixer's channel volume; 32768 = unity: bit-exact). Not machine state
+    int32_t _channelGain[4] = {32768, 32768, 32768, 32768};
+    // A mute or a gain changed: the output level is rebuilt at the next frame start (T-state 0)
+    bool _levelsDirty = false;
+    /// Emit the step to the current amplitudes at T-state 0 of the frame (frame start only)
+    void emitLevelsAtFrameStart();
 
     // Stale-channel decay state (see STALE_CHANNEL_FRAMES doc, public section)
     bool _writtenThisFrame[4] = {false, false, false, false};
@@ -148,7 +179,7 @@ protected:
     bool _hadSoundLastFrame = false;
 
     // DC offset removal (optional, applied post-blip)
-    bool _dcRemovalEnabled = false;
+    std::atomic<bool> _dcRemovalEnabled{false};  // any thread sets it (the audio settings, automation)
     float _dcAccumL = 0.0f;
     float _dcAccumR = 0.0f;
     static constexpr float DC_COEF = 0.995f;  // ~7 Hz cutoff @ 44.1 kHz
@@ -156,6 +187,15 @@ protected:
 
     // Core output rate (multirate plan phase 6)
     size_t _sampleRate;
+
+    // The haptic feed's channel taps (SetChannelTap): each channel's level per output sample, before its gain, filled
+    // up to the sample of each write and to the frame's end in handleFrameEnd. Off: no work
+    bool _channelTap = false;
+    std::array<std::array<int16_t, MAX_SAMPLES_PER_FRAME>, 4> _channelTapBuffer{};
+    std::array<size_t, 4> _channelTapFilled{};
+    void FillChannelTap(int channel, size_t upTo);
+    /// One latch write at the current T-state: the level step into blip_buf, the chip-register watch and history
+    void WriteLatch(Channel ch, uint8_t value);
 
     // Input clock (T-states fed to blip): base CPU clock x frequency
     // multiplier - the T-state position is descaled by EmulatorState::AudioTstate
@@ -167,6 +207,14 @@ public:
     virtual ~Covox();
 
     // Buffer access for registry
+    /// The haptic feed's `soundrive:<n>` (SoundManager::setHapticTaps): each channel alone, mono int16 at the core
+    /// rate, the frame's samples after handleFrameEnd, (value - #80) x 128 before the channel's gain
+    void SetChannelTap(bool on);
+    const int16_t* ChannelTap(int channel) const
+    {
+        return _channelTap && channel >= 0 && channel < 4 ? _channelTapBuffer[static_cast<size_t>(channel)].data()
+                                                          : nullptr;
+    }
     int16_t* getBuffer() { return _buffer; }
     const int16_t* getBuffer() const { return _buffer; }
 
@@ -180,6 +228,8 @@ public:
 
     // Frame lifecycle
     void reset();
+    /// Drop the deltas no frame end has read and restart the buffers at the level the DACs hold (see Beeper)
+    void discardPending();
     void handleFrameStart();
     /// The mixer's frame-start sample phase (SoundManager::handleFrameStart, before handleFrameStart): the Covox reads
     /// the mixer's count from its blip stream, so a frame that rendered more (a host speed multiplier) left a backlog
@@ -194,6 +244,9 @@ public:
 
     /// Mono Covox on #FB, or the quad SoundDrive
     Fitment fitment() const { return _fitment; }
+    /// It answers the Scorpion's Covox port #DD (CovoxDD on the Scorpion family), and that port's decode
+    bool answersPrinterPort() const { return _printerDecode.mask != 0; }
+    PortMaskMatch printerDecode() const { return _printerDecode; }
     /// @param expectedSamples Exact per-frame sample count from SoundManager's
     ///        accumulator (0 = compute locally via rounding, legacy behavior).
     ///        Passing it keeps the covox stream in lockstep with the mixer.
@@ -203,12 +256,26 @@ public:
     bool hadSoundLastFrame() const { return _hadSoundLastFrame; }
 
     // DC removal control (for UI section)
-    void setDCRemovalEnabled(bool enabled) { _dcRemovalEnabled = enabled; }
-    bool isDCRemovalEnabled() const { return _dcRemovalEnabled; }
+    void setDCRemovalEnabled(bool enabled) { _dcRemovalEnabled.store(enabled, std::memory_order_relaxed); }
+    bool isDCRemovalEnabled() const { return _dcRemovalEnabled.load(std::memory_order_relaxed); }
 
     // Per-channel mute control
-    void setChannelMute(Channel ch, bool mute) { _channelMute[static_cast<int>(ch)] = mute; }
+    /// Takes effect at the next DAC write or frame start
+    void setChannelMute(Channel ch, bool mute)
+    {
+        if (_channelMute[static_cast<int>(ch)] != mute)
+            _levelsDirty = true;
+        _channelMute[static_cast<int>(ch)] = mute;
+    }
     bool isChannelMuted(Channel ch) const { return _channelMute[static_cast<int>(ch)]; }
+    /// The mixer's channel volume as a Q15 gain (MixerChannelGainQ15); takes effect at the next DAC write or frame start
+    void setChannelGain(Channel ch, int32_t gainQ15)
+    {
+        if (_channelGain[static_cast<int>(ch)] != gainQ15)
+            _levelsDirty = true;
+        _channelGain[static_cast<int>(ch)] = gainQ15;
+    }
+    int32_t channelGain(Channel ch) const { return _channelGain[static_cast<int>(ch)]; }
 
     /// The four DAC latches (LeftA, LeftB, RightA, RightB order of Channel)
     void getDacLatches(uint8_t (&out)[4]) const
@@ -254,7 +321,7 @@ public:
     /// audio pipeline (rebuilt by handleFrameStart) or user config (mute,
     /// DC-removal toggle).
     ///
-    /// Layout: 4 bytes - _dacValue[0..3] (LeftA, LeftB, RightA, RightB).
+    /// Layout: see covox.cpp (9 bytes).
     size_t TTDStateSize() const override;
     void   TTDSaveState(uint8_t* dst) const override;
     void   TTDLoadState(const uint8_t* src) override;

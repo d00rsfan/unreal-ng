@@ -58,16 +58,28 @@ public:
 
     /// region <Screen>
     void CreateTables() override {}
-    void InitRaster() override;
+    void DetectRaster() override;
     /// The frame start: also closes the beam-ordered picture's previous frame (SprinterBeamVideo::CloseFrame)
     void InitFrame() override;
     void SetVideoMode(VideoModeEnum mode) override;
     void UpdateScreen() override;
+    /// Every picture input has its catch-up (the video RAM's before-change listener, CatchUpToBorderLatch, the
+    /// decoder's CatchUpScreen at HOLD / RGMOD / #7FFD bit 3); not while a configuration's beam-ordered picture
+    /// runs (its state advances with every catch-up)
+    bool CatchesUpOnEvents() const override;
+    /// Off: drawn after every step as the classic screens (comparison tests, diagnosis); on by default
+    void SetCatchUpOnEvents(bool on) { _catchUpOnEvents = on; }
     void DrawRange(uint32_t fromTstate, uint32_t toTstate) override;
     void RenderFrameBatch() override;
     void RenderOnlyMainScreen() override;
     void FillBorderWithColor(uint8_t color) override;
     ScreenState DescribeScreenState() const override;
+    /// The picture reads the video RAM only (the Spectrum mode too, through its ZX-40 squares), and every 4 KB of it
+    /// holds picture, mode-table and palette bytes: the whole "sprinter.vram" region
+    void DescribeDisplayedMemory(std::vector<ScreenMemorySpan>& out) const override
+    {
+        out.assign({{"sprinter.vram", 0, 0x40000}});
+    }
     BeamPosition DescribeBeam(uint32_t tInFrame) const override;
     const void* VideoFamilyView() const override;
     void CaptureFamilyLatches(videomap::VideoLatches& latches) const override;
@@ -119,6 +131,7 @@ public:
     static constexpr uint32_t kBorderLatchAfterIorqT = 4;
 
 private:
+    bool _catchUpOnEvents = true;
     /// Draw [_prevTstate, end) - every beam position before `end` - with the state of now
     void DrawTo(uint32_t end);
     /// Before a write lands at base T `t`: if the beam is inside a text / Spectrum square there, keep the

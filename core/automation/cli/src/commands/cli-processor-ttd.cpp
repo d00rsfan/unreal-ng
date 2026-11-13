@@ -10,11 +10,19 @@
 ///   ttd seek <frame> [tinframe] — seek to a point in the timeline
 ///   ttd step-back              — step back one frame (preserve intra-frame pos)
 ///   ttd step-forward           — step forward one frame (preserve intra-frame pos)
-///   ttd resume [frame] [tin]   — resume recording from current or specified point
+///   ttd resume [frame] [tin] [media=ask|empty|keep] — resume recording from current or specified point
 ///   ttd position               — show current TTDTimePoint (frame + tInFrame)
 ///   ttd markers                — list external-event markers (replay barriers)
-///   ttd bookmark [add|del|list] — agent bookmarks (advisory, never barriers)
+///   ttd bookmark [add|note|export|del|list] — agent bookmarks with notes (advisory, never barriers)
 ///   ttd seek --bookmark <label> — seek to a bookmarked position
+///   ttd branches [...]         — the branches of the history (a resume keeps the old future as a branch)
+///   ttd branch switch|update|delete <branch> — continue on a branch, rename / tag / pin it, delete it
+///   ttd cause <addr>|<reg>     — the cause chain: where a byte or a register got its value
+///   ttd event <kind> ...       — find event: when a value, the screen, a run, a port, the border or a key changed
+///   ttd explain [F]            — explain frame: what one frame did (time, routines, ports, memory, screen, keys)
+///   ttd diff F[+T] [G[+T]]     — diff of two moments: registers, paging, memory with the last writes, screen, devices
+///   ttd replay-check [F [G]]   — replay each frame and compare it with the next checkpoint
+///   ttd seek-check [on|off]    — every seek also replay-checks the frame it lands in
 ///
 /// All commands operate on the currently selected emulator instance. The TTD
 /// engine requires the emulator to be paused for seek/step/resume operations
@@ -25,7 +33,8 @@
 #include <algorithm>
 #include <cctype>
 
-#include <debugger/ttd/timetravelmanager.h>
+#include <debugger/ttd/timetravelcontroller.h>
+#include <debugger/ttd/ttdcausechain.h>
 #include <debugger/ttd/ttdcontrol.h>
 #include <debugger/ttd/ttdsession.h>
 #include <debugger/ttd/ttdbookmarks.h>
@@ -81,6 +90,24 @@ static std::string FormatSearchWindow(const StateNode& body)
     std::stringstream ss;
     ss << "  Searched: frame " << from->i << " t=" << body.find("covered_from_tinframe")->i << " .. frame "
        << body.find("covered_to")->i << " t=" << body.find("covered_to_tinframe")->i << CLIProcessor::NEWLINE;
+    return ss.str();
+}
+
+/// How exactly the position came back (a TTDControl reply's "check"): nothing when exact, otherwise the status and
+/// one line per issue (other settings, a medium written since)
+static std::string FormatCheck(const StateNode& body)
+{
+    const StateNode* check = body.find("check");
+    if (!check || check->find("status")->s == "exact")
+        return {};
+    std::stringstream ss;
+    ss << "  Not exact (" << check->find("status")->s << "):" << CLIProcessor::NEWLINE;
+    for (const StateNode& issue : check->find("issues")->items)
+    {
+        const std::string& device = issue.find("device")->s;
+        ss << "    " << issue.find("kind")->s << ": " << (device.empty() ? "" : device + ": ") << issue.find("detail")->s
+           << CLIProcessor::NEWLINE;
+    }
     return ss.str();
 }
 
@@ -256,6 +283,10 @@ void CLIProcessor::HandleTTD(const ClientSession& session, const std::vector<std
     {
         HandleTTDBookmark(session, context, args);
     }
+    else if (subcommand == "branches" || subcommand == "branch" || subcommand == "br")
+    {
+        HandleTTDBranch(session, context, args);
+    }
     else if (subcommand == "dump" || subcommand == "save")
     {
         HandleTTDDump(session, context, args);
@@ -282,6 +313,10 @@ void CLIProcessor::HandleTTD(const ClientSession& session, const std::vector<std
     {
         HandleTTDStepInstruction(session, context, args);
     }
+    else if (subcommand == "reverse-step-over" || subcommand == "rso")
+    {
+        HandleTTDReverseStepOver(session, context);
+    }
     else if (subcommand == "reverse-step"   ||
              subcommand == "reverse-continue" ||
              subcommand == "rs"             ||
@@ -292,9 +327,49 @@ void CLIProcessor::HandleTTD(const ClientSession& session, const std::vector<std
         else
             HandleTTDReverseStep(session, context, args);
     }
+    else if (subcommand == "probe-frames" || subcommand == "pf")
+    {
+        HandleTTDProbeFrames(session, context, args);
+    }
+    else if (subcommand == "timeline" || subcommand == "tl")
+    {
+        HandleTTDTimeline(session, context, args);
+    }
+    else if (subcommand == "cause" || subcommand == "cause-chain")
+    {
+        HandleTTDCauseChain(session, context, args);
+    }
+    else if (subcommand == "bt" || subcommand == "backtrace")
+    {
+        HandleTTDBacktrace(session, context, args);
+    }
+    else if (subcommand == "event" || subcommand == "find-event")
+    {
+        HandleTTDFindEvent(session, context, args);
+    }
+    else if (subcommand == "explain" || subcommand == "explain-frame")
+    {
+        HandleTTDExplainFrame(session, context, args);
+    }
+    else if (subcommand == "diff")
+    {
+        HandleTTDDiffMoments(session, context, args);
+    }
+    else if (subcommand == "replay-check")
+    {
+        HandleTTDReplayCheck(session, context, args);
+    }
+    else if (subcommand == "seek-check")
+    {
+        HandleTTDSeekCheck(session, context, args);
+    }
     else if (subcommand == "coverage" || subcommand == "cov")
     {
         HandleTTDCoverage(session, context, args);
+    }
+    else if (subcommand == "memory-at" || subcommand == "mat" || subcommand == "memory-diff" || subcommand == "mdiff")
+    {
+        HandleTTDMemoryAt(session, context, args);
     }
     else if (subcommand == "help" || subcommand == "?")
     {
@@ -317,12 +392,14 @@ void CLIProcessor::ShowTTDHelp(const ClientSession& session)
     ss << "  ttd info <path>                  Describe a .ttd file without loading it: frames, sections and" << NEWLINE;
     ss << "                                     the recorded machine (model, ROM, General Sound card, devices)" << NEWLINE;
     ss << "  ttd start [--journal]            Begin recording (captures baseline checkpoint)" << NEWLINE;
+    ss << "  ttd start --black-box [--minutes N]  Record as the black box: the last N minutes (default 5)" << NEWLINE;
     ss << "                                     --journal: also record the write journal (off by default)" << NEWLINE;
     ss << "  ttd journal [on|off]             The write journal: who wrote an address last, at once." << NEWLINE;
     ss << "                                     Switch it at any moment, also while recording; each on-off" << NEWLINE;
     ss << "                                     span is a segment. No argument: its state and segments" << NEWLINE;
     ss << "  ttd journal build [from] [to]    Build it by replaying frames from..to (default: the whole" << NEWLINE;
     ss << "                                     session); about 2-4 ms per frame. Not while recording" << NEWLINE;
+    ss << "  ttd journal build-cancel         Stop a build that runs (from another connection)" << NEWLINE;
     ss << "  ttd stop                         Stop recording (history retained, browsable)" << NEWLINE;
     ss << "  ttd limit [frames <n>] [bytes <n>[K|M|G]]" << NEWLINE;
     ss << "                                   Bound the history: while recording, the oldest frames are" << NEWLINE;
@@ -332,23 +409,46 @@ void CLIProcessor::ShowTTDHelp(const ClientSession& session)
     ss << "  ttd seek <frame> [tinframe]      Seek to a point in the timeline" << NEWLINE;
     ss << "  ttd step-back                    Step back one frame (preserve intra-frame pos)" << NEWLINE;
     ss << "  ttd step-forward                 Step forward one frame (preserve intra-frame pos)" << NEWLINE;
-    ss << "  ttd resume [frame] [tinframe]    Resume recording from current or specified point" << NEWLINE;
+    ss << "  ttd resume [frame] [tinframe] [media=ask|empty|keep]" << NEWLINE;
+    ss << "                                   Resume recording from current or specified point; a medium that" << NEWLINE;
+    ss << "                                   cannot go back there: empty (default) takes it out, keep leaves it," << NEWLINE;
+    ss << "                                   ask lists them and resumes nothing" << NEWLINE;
     ss << "  ttd position                     Show current TTDTimePoint (frame + tInFrame)" << NEWLINE;
     ss << "  ttd markers                      List external-event markers (replay barriers)" << NEWLINE;
-    ss << "  ttd bookmark [list]              List agent bookmarks (advisory, never barriers)" << NEWLINE;
-    ss << "  ttd bookmark add <l> [f] [t]     Add bookmark <label> at frame/tinframe (default: here)" << NEWLINE;
+    ss << "  ttd bookmark [list] [--tag T]    List agent bookmarks with notes, tags, context (never barriers)" << NEWLINE;
+    ss << "  ttd bookmark add <l> [f] [t]     Add bookmark <label> at frame/tinframe (default: here):" << NEWLINE;
+    ss << "        [--note TEXT] [--tags a,b] [--watch #A130,#A140:4] [--no-context]" << NEWLINE;
+    ss << "  ttd bookmark note <label>        Edit: --note TEXT | --append TEXT, --tags, --add-tags," << NEWLINE;
+    ss << "        --remove-tags, --rename L" << NEWLINE;
+    ss << "  ttd bookmark export              The bookmarks written up: [--format markdown|profile|json]" << NEWLINE;
+    ss << "        [--tag T] [--title T] [--path FILE]" << NEWLINE;
     ss << "  ttd bookmark del <label>         Remove a bookmark by label" << NEWLINE;
     ss << "  ttd seek --bookmark <label>      Seek to a bookmarked position" << NEWLINE;
     ss << NEWLINE;
+    ss << "Branches (a resume in the past keeps the old future as a branch; <branch>: an id, a GUID or a name):" << NEWLINE;
+    ss << "  ttd branches                     List the branches ('*' the active one): [--scope all|lineage]" << NEWLINE;
+    ss << "        [--created-by P] [--tag T] [--name-prefix P] [--pinned true|false] [--limit N] [--offset N]" << NEWLINE;
+    ss << "  ttd branch switch <b> [f] [t]    Continue on branch <b>, at frame/tinframe (default: its end)" << NEWLINE;
+    ss << "  ttd branch update <b>            Edit: --name N, --note TEXT, --tags a,b, --add-tags, --remove-tags," << NEWLINE;
+    ss << "        --pin | --unpin" << NEWLINE;
+    ss << "  ttd branch del <b> [--force]     Delete a branch and its descendants (--force: pinned ones too)" << NEWLINE;
+    ss << NEWLINE;
     ss << "Phase 4 — Reverse Search + Automation:" << NEWLINE;
-    ss << "  ttd dump <path>                  Serialize session to .ttd file" << NEWLINE;
+    ss << "  ttd dump <path> [--lineage]      Serialize session to .ttd file (--lineage: only the active branch's" << NEWLINE;
+    ss << "                                   lineage, as one linear history; default: every branch)" << NEWLINE;
     ss << "  ttd load <path>                  Load a .ttd session for playback (alias: open)" << NEWLINE;
-    ss << "  ttd export-clip <from> <to> <dir> [--chunk N]" << NEWLINE;
+    ss << "  ttd export-clip <from> <to> <dir|file.gif|.mp4|...> [--chunk N]" << NEWLINE;
     ss << "                                   Write frames from..to as a lossless clip into dir (alias: clip)" << NEWLINE;
     ss << "  ttd find-last --addr <A>         Reverse search: find last access at address" << NEWLINE;
     ss << "    [--access write|read|execute|io]  (default: write)" << NEWLINE;
     ss << "    [--value V] [--pc-from X] [--pc-to Y]" << NEWLINE;
-    ss << "    [--before-frame F] [--before-tin T]" << NEWLINE;
+    ss << "    [--before-frame F] [--before-tin T] [--before T] [--from-frame F] [--space ram|vram|cache]" << NEWLINE;
+    ss << "    [--phys-page P|rom] [--all] [--changes-only] [--limit N]" << NEWLINE;
+    ss << "  ttd memory-at --space S --frame F [--tinframe T] [--offset O] [--length N]   (alias: mat)" << NEWLINE;
+    ss << "                                   A memory at a past checkpoint, without seeking (S: ram, ramN, or a" << NEWLINE;
+    ss << "                                   region: vram, cache, neogs.ram, ... - memory regions lists them)" << NEWLINE;
+    ss << "  ttd memory-diff --space S --from F1 --to F2 [--limit N]       (alias: mdiff)" << NEWLINE;
+    ss << "                                   The bytes of a memory that differ between two checkpoints" << NEWLINE;
     ss << "  ttd port-events <event> [arg] [option=value ...]   (alias: pe)" << NEWLINE;
     ss << "                                   When did the program ... - from the port journals, no replay:" << NEWLINE;
     ss << "    key [KEY]       saw a key down (KEY: a, enter, space, caps, symbol...; none: any key)" << NEWLINE;
@@ -359,14 +459,48 @@ void CLIProcessor::ShowTTDHelp(const ClientSession& session)
     ss << "    options: limit=N newest=true from=F[:T] to=F[:T] match=any|equals|any-clear|any-set" << NEWLINE;
     ss << "             trigger=every|rising|change stream_mask=M ay_register=R" << NEWLINE;
     ss << "             file=<path.ttd>  search a saved session without loading it" << NEWLINE;
+    ss << "             context=true|false  each hit's HL DE BC SP and (SP) at its instruction, replayed" << NEWLINE;
+    ss << "                      (default on; off while a recording runs, true pauses it; not with file=)" << NEWLINE;
+    ss << "    a keyboard read shows the half-rows it selects (rows) and the keys it saw down" << NEWLINE;
     ss << "  ttd step-instruction <back|fwd>  Step one instruction (aliases: si-back, si-forward)" << NEWLINE;
     ss << NEWLINE;
     ss << "Phase 4 — Reverse Execution:" << NEWLINE;
     ss << "  ttd reverse-step [--count N]     Step back N instructions (default: 1)" << NEWLINE;
+    ss << "  ttd reverse-step-over            Step back over a routine (its return before): back to its CALL" << NEWLINE;
     ss << "    [--tstates T]                     Step back T t-states (aligns to M1)" << NEWLINE;
+    ss << "    [--scanlines L]                   Step back L scanlines (the machine's line length each)" << NEWLINE;
     ss << "  ttd reverse-continue --pc <A>    Run backward until any PC matches" << NEWLINE;
+    ss << "      [--phys-page P|rom] [--all] [--limit N] [--before-frame F [--before-tin T] | --before T] [--from-frame F]"
+       << NEWLINE;
     ss << "    [--pc <B> ...]                    (repeat --pc for multiple breakpoints)" << NEWLINE;
-    ss << "  Aliases: rs=reverse-step, rc=reverse-continue" << NEWLINE;
+    ss << "  ttd probe-frames <exec|read|write|port-in|port-out> <address>   The frames a profile probe fired in" << NEWLINE;
+    ss << "      [--end A] [--page N] [--port-mask M] [--if \"COND\"] | --probes '[{...}, ...]'" << NEWLINE;
+    ss << "      [--from-frame F] [--to-frame F] [--limit N]   (replays the window; the machine stays)" << NEWLINE;
+    ss << "  ttd timeline [--from-frame F] [--to-frame F] [--bucket-size N] [--limit N] [--buckets] [--no-ports]" << NEWLINE;
+    ss << "      [--min-phase-ms N]              The recording cut into phases of the same activity (no replay)" << NEWLINE;
+    ss << "  ttd cause <addr>[:page] | <reg> [--frame F [--tin T]] [--depth N] [--links N] [--frames N] [--flags]" << NEWLINE;
+    ss << "      Where a byte or a register got its value: the chain back to constants, ports, initial memory" << NEWLINE;
+    ss << "  ttd bt [F[+T]] [--depth N] [--slots N]   The call stack at moment F+T (default: the current position):" << NEWLINE;
+    ss << "      each return address above SP with the CALL / RST / interrupt that pushed it and when" << NEWLINE;
+    ss << "  ttd event <kind> ... [--last] [--from F] [--to F] [--limit N]   When did it happen (frames filtered, hits replayed)"
+       << NEWLINE;
+    ss << "    mem <addr>[:page] [changed|increased|decreased|equals V|becomes V|differs V|bit_set B|bit_clear B]" << NEWLINE;
+    ss << "        [--size 2] [--exact]          a byte / word; --exact follows every CPU write" << NEWLINE;
+    ss << "    screen [PERCENT|cleared]          a scene change: PERCENT of the picture differs (default 50)" << NEWLINE;
+    ss << "    exec <addr>[-<to>][:page]         an address (range) ran: its first / last start" << NEWLINE;
+    ss << "    port <in|out> <port> [value V] [--mask M] [--value-mask M]" << NEWLINE;
+    ss << "    border [COLOUR]                   the border changed (to COLOUR)" << NEWLINE;
+    ss << "    key [KEY] [--released]            a key pressed (released), from the input journal" << NEWLINE;
+    ss << "  ttd explain [F] [--sections a,b,...] [--limit N]   What frame F (default: the current) did: time split," << NEWLINE;
+    ss << "      routines by time, interrupt, paging, ports, memory changed with its writers, screen, keys (one replay)" << NEWLINE;
+    ss << "  ttd diff F[+T] [G[+T]] [--sections a,b,...] [--limit N] [--no-writers]   What differs between moment F+T" << NEWLINE;
+    ss << "      and G+T (default: the current position): registers, latches, mapping, memory with the last write, screen," << NEWLINE;
+    ss << "      devices, the time, keys and markers in between" << NEWLINE;
+    ss << "  ttd replay-check [F [G]] [--stride N] [--limit N]   Replay frames F..G (default: all) from their checkpoints" << NEWLINE;
+    ss << "      and compare each with the next checkpoint: what diverged (cpu, chipset, ram, device, region)" << NEWLINE;
+    ss << "  ttd seek-check [on|off]   Every seek also replay-checks the frame it lands in (off by default); the counts" << NEWLINE;
+    ss << "  Aliases: rs=reverse-step, rso=reverse-step-over, rc=reverse-continue, pf=probe-frames, tl=timeline, cause-chain=cause, "
+          "backtrace=bt, find-event=event, explain-frame=explain" << NEWLINE;
     ss << NEWLINE;
     ss << "Notes:" << NEWLINE;
     ss << "  - Seek/step/resume require the emulator to be paused." << NEWLINE;
@@ -400,6 +534,14 @@ void CLIProcessor::HandleTTDStatus(const ClientSession& session, EmulatorContext
     if (!info.recordedBy.empty())
         ss << "  Recorded by:            " << info.recordedBy << NEWLINE;
     ss << "  State:                  " << ttd::TTDSessionStateToString(info.state) << NEWLINE;
+    if (info.state == ttd::TTDSessionState::Detached)
+    {
+        // How exactly the position the machine stands on came back
+        ss << "  Position check:         " << ttd::TTDRestoreStatusName(info.lastCheck.status);
+        if (!info.lastCheck.message.empty())
+            ss << " - " << info.lastCheck.message;
+        ss << NEWLINE;
+    }
     ss << "  Session start frame:    " << info.sessionStartFrame << NEWLINE;
     ss << "  Current end frame:      " << info.currentEndFrame << NEWLINE;
     ss << "  Checkpoint count:       " << info.checkpointCount << NEWLINE;
@@ -430,6 +572,17 @@ void CLIProcessor::HandleTTDStatus(const ClientSession& session, EmulatorContext
            << NEWLINE;
     }
     ss << "  Bookmarks:              " << info.bookmarkCount << " (advisory, never barriers)" << NEWLINE;
+    if (info.branches)
+    {
+        // Only a session with branches says anything about them
+        const ttd::TTDBranchInfo* active = info.branches->Find(info.activeBranch);
+        const ttd::TTDBranchInfo* viewed = info.branches->Find(info.viewedBranch);
+        ss << "  Branches:               " << info.branches->branches.size() << ", active '"
+           << (active ? active->meta.name : std::string("trunk")) << "'";
+        if (viewed && info.viewedBranch != info.activeBranch)
+            ss << ", viewing '" << viewed->meta.name << "'";
+        ss << " (ttd branches lists them)" << NEWLINE;
+    }
     ss << "  Input events:           " << info.inputEventCount << NEWLINE;
     ss << "  Replay barriers:        " << info.externalEventCount << NEWLINE;
     if (!info.inputHistoryComplete)
@@ -449,6 +602,8 @@ void CLIProcessor::HandleTTDStatus(const ClientSession& session, EmulatorContext
         ss << "  Last session dropped:   " << info.lastDropReason << NEWLINE;
     if (!info.lastStopReason.empty())
         ss << "  Recording stopped by:   " << info.lastStopReason << NEWLINE;
+    if (info.startPending)
+        ss << "  Recording starts:       at the next frame boundary (asked inside the sound card's run)" << NEWLINE;
     if (info.recordingPaused)
         ss << "  Recording paused:       yes (browsing; resume at its end goes on, stop ends it)" << NEWLINE;
     if (!info.unavailableReason.empty())
@@ -474,18 +629,31 @@ void CLIProcessor::HandleTTDStart(const ClientSession& session, EmulatorContext*
     {
         if (args[i] == "--journal" || args[i] == "-j")
             options["journal"] = "true";
+        else if (args[i] == "--black-box")
+            options["black_box"] = "true";
+        else if (args[i] == "--minutes" && i + 1 < args.size())
+            options["minutes"] = args[++i];
         else
         {
-            session.SendResponse("TTD: unknown option '" + args[i] + "' (ttd start [--journal])" + NEWLINE);
+            session.SendResponse("TTD: unknown option '" + args[i] +
+                                 "' (ttd start [--journal] [--black-box [--minutes N]])" + NEWLINE);
             return;
         }
     }
 
     const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"start", options});
     if (reply.Ok() && reply.body.find("started")->b)
-        session.SendResponse(std::string(options["journal"] == "true" ? "TTD: Recording started (with the write journal)"
-                                                                      : "TTD: Recording started") +
-                             NEWLINE);
+    {
+        std::string text = options["journal"] == "true" ? "TTD: Recording started (with the write journal)"
+                                                        : "TTD: Recording started";
+        if (reply.body.find("start_pending")->b)
+            text += " at the next frame boundary (the machine is stopped inside the sound card's run)";
+        if (options.count("black_box"))
+            text += std::string(" as the black box: the last ") +
+                    (options.count("minutes") ? options["minutes"] : std::string("5")) +
+                    " minutes, turbo and host speed stay free";
+        session.SendResponse(text + NEWLINE);
+    }
     else
         session.SendResponse(std::string("TTD: Failed to start recording") +
                              (reply.message.empty() ? "" : ": " + reply.message) + NEWLINE);
@@ -545,9 +713,23 @@ void CLIProcessor::HandleTTDJournal(const ClientSession& session, EmulatorContex
         session.SendResponse(ss.str());
         return;
     }
+    if (action == "build-cancel" || action == "cancel")
+    {
+        const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"journal-build-cancel", {}});
+        if (!reply.Ok())
+        {
+            session.SendResponse("TTD: " + reply.message + NEWLINE);
+            return;
+        }
+        const StateNode* cancelled = reply.body.find("cancelled");
+        session.SendResponse(std::string(cancelled != nullptr && cancelled->b ? "TTD: the write journal build is cancelled"
+                                                                               : "TTD: no write journal build runs") +
+                             NEWLINE);
+        return;
+    }
     if (action != "status")
     {
-        session.SendResponse("TTD: unknown journal action '" + action + "' (on, off, build, status)" + NEWLINE);
+        session.SendResponse("TTD: unknown journal action '" + action + "' (on, off, build, build-cancel, status)" + NEWLINE);
         return;
     }
     const ttd::TTDSessionInfo info = mgr->GetSessionInfo();
@@ -733,6 +915,7 @@ void CLIProcessor::HandleTTDSeek(const ClientSession& session, EmulatorContext* 
     }
     if (!bookmarkLabel.empty())
         ss << "  (bookmark '" << bookmarkLabel << "')" << NEWLINE;
+    ss << FormatCheck(b);
     session.SendResponse(ss.str());
 }
 
@@ -744,89 +927,250 @@ void CLIProcessor::HandleTTDSeek(const ClientSession& session, EmulatorContext* 
 void CLIProcessor::HandleTTDBookmark(const ClientSession& session, EmulatorContext* context,
                                       const std::vector<std::string>& args)
 {
-    const ttd::TTDSessionView view(context);
-    const ttd::TTDSessionView* mgr = &view;
-
     const std::string action = args.size() > 1 ? args[1] : "list";
+
+    // The options after the positional arguments: --note TEXT, --append TEXT, --tags a,b, --add-tags, --remove-tags,
+    // --rename L, --watch #A130,#A140:4, --no-context, --tag T, --format F, --title T, --path P
+    std::map<std::string, std::string> options;
+    std::vector<std::string> positional;
+    for (size_t i = 2; i < args.size(); ++i)
+    {
+        static const std::map<std::string, std::string> valued = {
+            {"--note", "note"},       {"--tags", "tags"},           {"--add-tags", "add_tags"},
+            {"--remove-tags", "remove_tags"}, {"--rename", "rename"}, {"--watch", "watch"},
+            {"--tag", "tag"},         {"--format", "format"},       {"--title", "title"},
+            {"--path", "path"}};
+        if (const auto it = valued.find(args[i]); it != valued.end())
+        {
+            if (i + 1 >= args.size())
+            {
+                session.SendResponse("Error: " + args[i] + " needs a value" + NEWLINE);
+                return;
+            }
+            options[it->second] = args[++i];
+        }
+        else if (args[i] == "--append" && i + 1 < args.size())
+        {
+            options["note"] = args[++i];
+            options["append"] = "true";
+        }
+        else if (args[i] == "--no-context")
+            options["context"] = "false";
+        else if (args[i].rfind("--", 0) == 0)
+        {
+            session.SendResponse("Error: unknown option " + args[i] + NEWLINE);
+            return;
+        }
+        else
+            positional.push_back(args[i]);
+    }
+    auto run = [&](const char* verb) {
+        const ttd::TTDReply reply = ttd::TTDControl(context).Execute({verb, options});
+        if (!reply.Ok())
+        {
+            session.SendResponse("Error: " + reply.message + NEWLINE);
+            return;
+        }
+        const StateNode* text = reply.body.find("text");
+        std::string out = text ? text->s : std::string();
+        if (const StateNode* path = reply.body.find("path"))
+            out += "Written to " + path->s + " (" + std::to_string(reply.body.find("bytes")->i) + " bytes)\n";
+        if (!out.empty() && out.back() != '\n')
+            out += "\n";
+        session.SendResponse(out);
+    };
 
     if (action == "list" || action == "ls")
     {
-        const auto bookmarks = mgr->GetBookmarks();
-
-        std::stringstream ss;
-        ss << "TTD Bookmarks (" << bookmarks.size() << " total, advisory — never replay barriers)" << NEWLINE;
-        ss << "==========================================================" << NEWLINE;
-
-        if (bookmarks.empty())
-        {
-            ss << "  (none)" << NEWLINE;
-        }
-        else
-        {
-            for (size_t i = 0; i < bookmarks.size(); ++i)
-            {
-                ss << "  [" << i << "] frame=" << bookmarks[i].time.frame
-                   << " tInFrame=" << bookmarks[i].time.tInFrame
-                   << " label=\"" << bookmarks[i].label << "\"" << NEWLINE;
-            }
-        }
-
-        session.SendResponse(ss.str());
+        options["text"] = "true";
+        run("bookmarks");
         return;
     }
 
     if (action == "add" || action == "mark")
     {
-        if (args.size() < 3)
+        if (positional.empty())
         {
             session.SendResponse(std::string("Error: Missing label argument") + NEWLINE +
-                                 "Usage: ttd bookmark add <label> [frame] [tinframe]" + NEWLINE +
+                                 "Usage: ttd bookmark add <label> [frame] [tinframe] [--note TEXT] [--tags a,b] "
+                                 "[--watch #A130,#A140:4] [--no-context]" + NEWLINE +
                                  "       (frame omitted → bookmark the current position)" + NEWLINE);
             return;
         }
-        const std::string label = args[2];
         // Optional position; omitted: the current position (mark here)
-        std::map<std::string, std::string> options{{"label", label}};
-        if (args.size() > 3)
+        options["label"] = positional[0];
+        if (positional.size() > 1)
         {
-            options["frame"] = args[3];
-            options["tinframe"] = args.size() > 4 ? args[4] : "0";
+            options["frame"] = positional[1];
+            options["tinframe"] = positional.size() > 2 ? positional[2] : "0";
         }
-        const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"bookmark-add", options});
-        if (!reply.Ok())
+        run("bookmark-add");
+        return;
+    }
+
+    if (action == "note" || action == "edit")
+    {
+        if (positional.empty())
         {
-            session.SendResponse(std::string("Error: ") + reply.message + NEWLINE);
+            session.SendResponse(std::string("Error: Missing label argument") + NEWLINE +
+                                 "Usage: ttd bookmark note <label> [--note TEXT | --append TEXT] [--tags a,b] "
+                                 "[--add-tags a] [--remove-tags a] [--rename L]" + NEWLINE);
             return;
         }
-        std::stringstream ss;
-        ss << "TTD: Bookmark '" << label << "' added at (frame=" << reply.body.find("frame")->i
-           << ", tInFrame=" << reply.body.find("tinframe")->i << ")" << NEWLINE;
-        session.SendResponse(ss.str());
+        options["label"] = positional[0];
+        run("bookmark-note");
+        return;
+    }
+
+    if (action == "export")
+    {
+        run("bookmark-export");
         return;
     }
 
     if (action == "del" || action == "delete" || action == "remove" || action == "rm")
     {
-        if (args.size() < 3)
+        if (positional.empty())
         {
             session.SendResponse(std::string("Error: Missing label argument") + NEWLINE +
                                  "Usage: ttd bookmark del <label>" + NEWLINE);
             return;
         }
 
-        const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"bookmark-delete", {{"label", args[2]}}});
+        const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"bookmark-delete", {{"label", positional[0]}}});
         if (!reply.Ok())
         {
             session.SendResponse("Error: " + reply.message + NEWLINE);
             return;
         }
 
-        session.SendResponse(std::string("TTD: Bookmark '") + args[2] + "' removed" + NEWLINE);
+        session.SendResponse(std::string("TTD: Bookmark '") + positional[0] + "' removed" + NEWLINE);
         return;
     }
 
     session.SendResponse(std::string("Error: Unknown bookmark action '") + action + "'" + NEWLINE +
-                         "Usage: ttd bookmark [list|add|del]" + NEWLINE);
+                         "Usage: ttd bookmark [list|add|note|export|del]" + NEWLINE);
+}
+
+// -------------------------------------------------------------------------
+// TTD branches: a resume in the past keeps the old future as a branch. A branch is named by its id, its GUID or its
+// name; the trunk is id 0.
+// -------------------------------------------------------------------------
+
+void CLIProcessor::HandleTTDBranch(const ClientSession& session, EmulatorContext* context,
+                                    const std::vector<std::string>& args)
+{
+    // `ttd branches [--options]` and `ttd branch [list]` list; `ttd branch switch|update|delete <branch> ...` act
+    std::string action = "list";
+    size_t first = 1;
+    if (args.size() > 1 && args[1].rfind("--", 0) != 0)
+    {
+        action = args[1];
+        first = 2;
+    }
+
+    // The options after the positional arguments: --scope S, --created-by P, --tag T, --name-prefix P, --pinned B,
+    // --limit N, --offset N (list); --name N, --note TEXT, --tags a,b, --add-tags, --remove-tags, --pin, --unpin
+    // (update); --force (delete)
+    std::map<std::string, std::string> options;
+    std::vector<std::string> positional;
+    for (size_t i = first; i < args.size(); ++i)
+    {
+        static const std::map<std::string, std::string> valued = {
+            {"--scope", "scope"},     {"--created-by", "created_by"}, {"--tag", "tag"},
+            {"--name-prefix", "name_prefix"}, {"--pinned", "pinned"}, {"--limit", "limit"},
+            {"--offset", "offset"},   {"--name", "name"},             {"--note", "note"},
+            {"--tags", "tags"},       {"--add-tags", "add_tags"},     {"--remove-tags", "remove_tags"}};
+        if (const auto it = valued.find(args[i]); it != valued.end())
+        {
+            if (i + 1 >= args.size())
+            {
+                session.SendResponse("Error: " + args[i] + " needs a value" + NEWLINE);
+                return;
+            }
+            options[it->second] = args[++i];
+        }
+        else if (args[i] == "--pin" || args[i] == "--unpin")
+            options["pinned"] = args[i] == "--pin" ? "true" : "false";
+        else if (args[i] == "--force")
+            options["force"] = "true";
+        else if (args[i].rfind("--", 0) == 0)
+        {
+            session.SendResponse("Error: unknown option " + args[i] + NEWLINE);
+            return;
+        }
+        else
+            positional.push_back(args[i]);
+    }
+    auto run = [&](const char* verb) {
+        const ttd::TTDReply reply = ttd::TTDControl(context).Execute({verb, options});
+        if (!reply.Ok())
+        {
+            session.SendResponse("Error: " + reply.message + NEWLINE);
+            return;
+        }
+        const StateNode* text = reply.body.find("text");
+        std::string out = text ? text->s : std::string();
+        // A page of a longer list says how much is left
+        const StateNode* total = reply.body.find("total");
+        const StateNode* list = reply.body.find("branches");
+        if (total && list && static_cast<uint64_t>(total->i) > list->size())
+            out += std::to_string(list->size()) + " of " + std::to_string(total->i) +
+                   " branches shown (--offset N --limit N pages on)\n";
+        if (!out.empty() && out.back() != '\n')
+            out += "\n";
+        session.SendResponse(out);
+    };
+    auto needsBranch = [&](const char* usage) {
+        if (!positional.empty())
+        {
+            options["branch"] = positional[0];
+            return true;
+        }
+        session.SendResponse(std::string("Error: Missing branch argument (an id, a GUID or a name)") + NEWLINE +
+                             "Usage: " + usage + NEWLINE);
+        return false;
+    };
+
+    if (action == "list" || action == "ls")
+    {
+        run("branches");
+        return;
+    }
+
+    if (action == "switch" || action == "sw" || action == "checkout")
+    {
+        if (!needsBranch("ttd branch switch <branch> [frame] [tinframe]"))
+            return;
+        // Optional position on the branch; omitted: the branch's end
+        if (positional.size() > 1)
+        {
+            options["frame"] = positional[1];
+            options["tinframe"] = positional.size() > 2 ? positional[2] : "0";
+        }
+        run("branch-switch");
+        return;
+    }
+
+    if (action == "update" || action == "edit" || action == "note")
+    {
+        if (!needsBranch("ttd branch update <branch> [--name N] [--note TEXT] [--tags a,b] [--add-tags a] "
+                         "[--remove-tags a] [--pin|--unpin]"))
+            return;
+        run("branch-update");
+        return;
+    }
+
+    if (action == "del" || action == "delete" || action == "remove" || action == "rm")
+    {
+        if (!needsBranch("ttd branch del <branch> [--force]"))
+            return;
+        run("branch-delete");
+        return;
+    }
+
+    session.SendResponse(std::string("Error: Unknown branch action '") + action + "'" + NEWLINE +
+                         "Usage: ttd branch [list|switch|update|del]" + NEWLINE);
 }
 
 void CLIProcessor::HandleTTDStepBack(const ClientSession& session, EmulatorContext* context)
@@ -841,7 +1185,7 @@ void CLIProcessor::HandleTTDStepBack(const ClientSession& session, EmulatorConte
     {
         std::stringstream ss;
         ss << "TTD: Stepped back to (frame=" << reply.body.find("frame")->i << ", tInFrame=" << reply.body.find("tinframe")->i
-           << ")" << NEWLINE;
+           << ")" << NEWLINE << FormatCheck(reply.body);
         session.SendResponse(ss.str());
     }
     else
@@ -862,7 +1206,7 @@ void CLIProcessor::HandleTTDStepForward(const ClientSession& session, EmulatorCo
     {
         std::stringstream ss;
         ss << "TTD: Stepped forward to (frame=" << reply.body.find("frame")->i << ", tInFrame=" << reply.body.find("tinframe")->i
-           << ")" << NEWLINE;
+           << ")" << NEWLINE << FormatCheck(reply.body);
         session.SendResponse(ss.str());
     }
     else
@@ -874,16 +1218,46 @@ void CLIProcessor::HandleTTDStepForward(const ClientSession& session, EmulatorCo
 void CLIProcessor::HandleTTDResume(const ClientSession& session, EmulatorContext* context,
                                     const std::vector<std::string>& args)
 {
+    // ttd resume [frame [tinframe]] [media=ask|empty|keep]: what happens to a medium that cannot go back there
     std::map<std::string, std::string> options;
-    if (args.size() >= 2)
+    std::vector<std::string> position;
+    for (size_t i = 1; i < args.size(); ++i)
     {
-        options["frame"] = args[1];
-        options["tinframe"] = args.size() > 2 ? args[2] : "0";
+        if (args[i].rfind("media=", 0) == 0)
+            options["media"] = args[i].substr(6);
+        else
+            position.push_back(args[i]);
+    }
+    if (!position.empty())
+    {
+        options["frame"] = position[0];
+        options["tinframe"] = position.size() > 1 ? position[1] : "0";
     }
     const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"resume", options});
     if (!reply.Ok())
     {
         session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    // The media that could not go back to the cut point, with the decision taken (or wanted)
+    auto listMedia = [&]() {
+        const StateNode* media = reply.body.find("media");
+        if (!media)
+            return;
+        for (const StateNode& item : media->items)
+        {
+            const StateNode* decision = item.find("decision");
+            const StateNode* error = item.find("error");
+            session.SendResponse("  " + item.find("slot")->s + ": " + item.find("reason")->s +
+                                 (decision ? " -> " + decision->s : std::string()) +
+                                 (error ? " (" + error->s + ")" : std::string()) + NEWLINE);
+        }
+    };
+    if (const StateNode* needs = reply.body.find("needs_decision"); needs && needs->b)
+    {
+        session.SendResponse(std::string("TTD: These media cannot go back there; resume with media=empty or "
+                                         "media=keep:") + NEWLINE);
+        listMedia();
         return;
     }
     if (reply.body.find("resumed")->b)
@@ -892,6 +1266,7 @@ void CLIProcessor::HandleTTDResume(const ClientSession& session, EmulatorContext
         ss << "TTD: Resumed recording from (frame=" << reply.body.find("frame")->i
            << ", tInFrame=" << reply.body.find("tinframe")->i << ")" << NEWLINE;
         session.SendResponse(ss.str());
+        listMedia();
     }
     else
     {
@@ -901,17 +1276,36 @@ void CLIProcessor::HandleTTDResume(const ClientSession& session, EmulatorContext
 
 void CLIProcessor::HandleTTDPosition(const ClientSession& session, EmulatorContext* context)
 {
-    const ttd::TTDSessionView view(context);
-    const ttd::TTDSessionView* mgr = &view;
-
-    ttd::TTDTimePoint pos = mgr->CurrentPosition();
-    ttd::TTDTimePoint end = mgr->SessionEndPosition();
+    // The position verb every surface answers from (the live position and the published cursor: never parks)
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"position", {}});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    auto number = [&reply](const char* object, const char* key) -> int64_t {
+        const StateNode* node = object ? reply.body.find(object) : &reply.body;
+        const StateNode* value = node ? node->find(key) : nullptr;
+        return value ? value->i : 0;
+    };
+    const StateNode* history = reply.body.find("history");
+    const StateNode* paused = reply.body.find("paused");
+    const StateNode* fps = reply.body.find("fps");
+    const StateNode* state = reply.body.find("state");
 
     std::stringstream ss;
     ss << "TTD Position" << NEWLINE;
     ss << "============" << NEWLINE;
-    ss << "  Current: (frame=" << pos.frame << ", tInFrame=" << pos.tInFrame << ")" << NEWLINE;
-    ss << "  End:     (frame=" << end.frame << ", tInFrame=" << end.tInFrame << ")" << NEWLINE;
+    ss << "  Current: (frame=" << number("current", "frame") << ", tInFrame=" << number("current", "tinframe") << ")"
+       << NEWLINE;
+    ss << "  End:     (frame=" << number("session_end", "frame") << ", tInFrame=" << number("session_end", "tinframe")
+       << ")" << NEWLINE;
+    if (history && history->b)
+        ss << "  First:   frame=" << number(nullptr, "first_frame") << NEWLINE;
+    ss << "  State:   " << (state ? state->s : std::string("?")) << (paused && paused->b ? ", paused" : "")
+       << NEWLINE;
+    if (fps)
+        ss << "  Fps:     " << fps->d << NEWLINE;
 
     session.SendResponse(ss.str());
 }
@@ -953,13 +1347,31 @@ void CLIProcessor::HandleTTDMarkers(const ClientSession& session, EmulatorContex
 void CLIProcessor::HandleTTDDump(const ClientSession& session, EmulatorContext* context,
                                   const std::vector<std::string>& args)
 {
-    if (args.size() < 2)
+    // ttd dump <path> [--lineage]: the flag may stand before or after the path
+    std::string path;
+    bool lineage = false;
+    for (size_t i = 1; i < args.size(); ++i)
     {
-        session.SendResponse(std::string("Error: Missing path argument") + NEWLINE + "Usage: ttd dump <path>" + NEWLINE);
+        if (args[i] == "--lineage")
+            lineage = true;
+        else if (args[i].rfind("--", 0) == 0)
+        {
+            session.SendResponse("Error: unknown option " + args[i] + NEWLINE);
+            return;
+        }
+        else if (path.empty())
+            path = args[i];
+    }
+    if (path.empty())
+    {
+        session.SendResponse(std::string("Error: Missing path argument") + NEWLINE + "Usage: ttd dump <path> [--lineage]" +
+                             NEWLINE);
         return;
     }
-    const std::string& path = args[1];
-    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"dump", {{"path", path}}});
+    std::map<std::string, std::string> options{{"path", path}};
+    if (lineage)
+        options["lineage"] = "true";
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"dump", options});
     if (!reply.Ok())
     {
         session.SendResponse(std::string(reply.message.rfind("Cannot open", 0) == 0 ? "Error: " : "TTD: Dump failed: ") +
@@ -967,7 +1379,8 @@ void CLIProcessor::HandleTTDDump(const ClientSession& session, EmulatorContext* 
         return;
     }
     std::stringstream ss;
-    ss << "TTD: Session dumped to '" << path << "' (" << reply.body.find("bytes")->i << " bytes)" << NEWLINE;
+    ss << "TTD: Session dumped to '" << path << "' (" << reply.body.find("bytes")->i << " bytes"
+       << (lineage ? ", the active lineage only" : "") << ")" << NEWLINE;
     session.SendResponse(ss.str());
 }
 
@@ -1000,7 +1413,7 @@ void CLIProcessor::HandleTTDLoad(const ClientSession& session, EmulatorContext* 
 void CLIProcessor::HandleTTDExportClip(const ClientSession& session, EmulatorContext* context,
                                        const std::vector<std::string>& args)
 {
-    // ttd export-clip <from> <to> <dir> [--chunk N]
+    // ttd export-clip <from> <to> <dir | a .gif / .mp4 / .mkv / .webm / .mov / .avi file> [--chunk N]
     std::vector<std::string> positional;
     std::map<std::string, std::string> options;
     for (size_t i = 1; i < args.size(); ++i)
@@ -1013,7 +1426,7 @@ void CLIProcessor::HandleTTDExportClip(const ClientSession& session, EmulatorCon
     if (positional.size() != 3)
     {
         session.SendResponse(std::string("Error: Missing arguments") + NEWLINE +
-                             "Usage: ttd export-clip <from-frame> <to-frame> <dir> [--chunk N]" + NEWLINE);
+                             "Usage: ttd export-clip <from-frame> <to-frame> <dir | file.gif / .mp4 / ...> [--chunk N]" + NEWLINE);
         return;
     }
     options["from"] = positional[0];
@@ -1077,6 +1490,28 @@ void CLIProcessor::HandleTTDPortEvents(const ClientSession& session, EmulatorCon
            << h.find("port")->i << "  value #" << std::setw(2) << h.find("value")->i << std::dec << std::setfill(' ');
         if (const StateNode* r = h.find("ay_register"))
             ss << "  R" << r->i;
+        if (const StateNode* rows = h.find("rows"))
+        {
+            ss << "  rows #" << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << rows->i << std::dec
+               << std::setfill(' ');
+            std::string keys;
+            for (const StateNode& k : h.find("keys")->items)
+                keys += (keys.empty() ? "" : "+") + k.s;
+            if (!keys.empty())
+                ss << "  keys " << keys;
+        }
+        if (const StateNode* what = h.find("what"))
+            ss << "  - " << what->s;
+        if (const StateNode* regs = h.find("registers"))
+        {
+            ss << std::hex << std::uppercase << std::setfill('0');
+            for (const char* name : {"hl", "de", "bc", "sp"})
+                ss << "  " << static_cast<char>(std::toupper(name[0])) << static_cast<char>(std::toupper(name[1]))
+                   << " #" << std::setw(4) << regs->find(name)->i;
+            ss << "  (SP) #" << std::setw(4) << h.find("stack_top")->i << std::dec << std::setfill(' ');
+        }
+        else if (const StateNode* err = h.find("context_error"))
+            ss << "  (no context: " << err->s << ")";
         ss << NEWLINE;
     }
     session.SendResponse(ss.str());
@@ -1090,12 +1525,17 @@ void CLIProcessor::HandleTTDFindLast(const ClientSession& session, EmulatorConte
         {"--addr", "addr"},       {"--addr-from", "addr_from"},   {"--addr-to", "addr_to"},
         {"--access", "access"},   {"--value", "value"},           {"--pc-from", "pc_from"},
         {"--pc-to", "pc_to"},     {"--phys-page", "phys_page"},   {"--before-frame", "before_frame"},
-        {"--before-tin", "before_tin"}};
+        {"--before-tin", "before_tin"}, {"--space", "space"},   {"--before", "before"},
+        {"--from-frame", "from_frame"}, {"--limit", "limit"}};
     std::map<std::string, std::string> options;
     for (size_t i = 1; i < args.size(); ++i)
     {
         const auto flag = flags.find(args[i]);
-        if (flag != flags.end() && i + 1 < args.size())
+        if (args[i] == "--all")
+            options["all"] = "true";   // the hit list, newest first
+        else if (args[i] == "--changes-only")
+            options["changes_only"] = "true";   // writes that changed the byte
+        else if (flag != flags.end() && i + 1 < args.size())
             options[flag->second] = args[++i];
     }
     // --before-tin alone: T-state of frame 0, as before
@@ -1109,7 +1549,8 @@ void CLIProcessor::HandleTTDFindLast(const ClientSession& session, EmulatorConte
                              (reply.error == ttd::TTDControlError::BadRequest
                                   ? std::string("Usage: ttd find-last [--addr <A> | --addr-from <F> --addr-to <T>] "
                                                 "[--access write|read|execute|io] [--value V] [--pc-from X] [--pc-to Y] "
-                                                "[--phys-page P] [--before-frame F] [--before-tin T]") +
+                                                "[--phys-page P|rom] [--space ram|vram|cache] [--before-frame F] [--before-tin T] "
+                                                "[--before T] [--from-frame F] [--all] [--changes-only] [--limit N]") +
                                         NEWLINE
                                   : std::string()));
         return;
@@ -1117,7 +1558,33 @@ void CLIProcessor::HandleTTDFindLast(const ClientSession& session, EmulatorConte
 
     const StateNode& b = reply.body;
     std::stringstream ss;
-    if (b.find("found")->b)
+    if (const StateNode* hits = b.find("hits"))
+    {
+        // --all: the list, newest first
+        ss << "TTD: " << b.find("count")->i << " match(es), newest first" << NEWLINE;
+        for (const StateNode& h : hits->items)
+        {
+            ss << "  frame " << h.find("frame")->i << " t " << h.find("tinframe")->i << "  " << h.find("access")->s
+               << "  PC #" << std::hex << std::uppercase << std::setfill('0') << std::setw(4) << h.find("pc")->i
+               << "  value #" << std::setw(2) << h.find("value")->i;
+            if (const StateNode* old = h.find("old_value"); old && old->kind != StateNode::Kind::Null)
+                ss << " (was #" << std::setw(2) << old->i << ")";
+            if (const StateNode* addr = h.find("addr"))
+                ss << "  addr #" << std::setw(4) << addr->i;
+            else if (const StateNode* offset = h.find("offset"))
+                ss << "  " << h.find("space")->s << " #" << std::setw(5) << offset->i;
+            ss << std::dec << std::setfill(' ');
+            if (h.find("phys_page")->kind != StateNode::Kind::Null)
+                ss << "  page " << h.find("phys_page")->i;
+            ss << NEWLINE;
+        }
+        if (b.find("truncated")->b)
+            ss << "More: --before " << b.find("next_before")->i << NEWLINE;
+        if (b.find("blocked"))
+            ss << "Stopped at the marker at frame=" << b.find("marker_frame")->i << " tInFrame=" << b.find("marker_tinframe")->i
+               << " (" << b.find("marker_reason")->s << ")" << NEWLINE;
+    }
+    else if (b.find("found")->b)
     {
         ss << "TTD: Match found" << NEWLINE;
         ss << "  Frame:    " << b.find("frame")->i << NEWLINE;
@@ -1125,11 +1592,19 @@ void CLIProcessor::HandleTTDFindLast(const ClientSession& session, EmulatorConte
         ss << "  PC:       0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(4) << b.find("pc")->i
            << NEWLINE;
         ss << "  Value:    0x" << std::setw(2) << b.find("value")->i << NEWLINE;
+        if (const StateNode* old = b.find("old_value"); old && old->kind != StateNode::Kind::Null)
+            ss << "  Was:      0x" << std::setw(2) << old->i << NEWLINE;
         ss << "  PhysPage: " << std::dec;
-        if (b.find("phys_page")->kind == StateNode::Kind::Null)
+        const StateNode* offset = b.find("offset");   // --space vram / cache: the offset in that memory
+        if (offset)
+            ss << "none (" << b.find("space")->s << ")" << NEWLINE;
+        else if (b.find("phys_page")->kind == StateNode::Kind::Null)
             ss << "none (ROM / no RAM page)" << NEWLINE;
         else
             ss << b.find("phys_page")->i << NEWLINE;
+        if (offset)
+            ss << "  Offset:   " << b.find("space")->s << " 0x" << std::hex << std::uppercase << std::setw(5) << offset->i
+               << std::dec << NEWLINE;
         ss << "  Access:   " << b.find("access")->s << NEWLINE;
     }
     else if (b.find("blocked"))
@@ -1175,7 +1650,7 @@ void CLIProcessor::HandleTTDStepInstruction(const ClientSession& session, Emulat
     {
         std::stringstream ss;
         ss << "TTD: Stepped " << (forward ? "forward" : "back") << " to (frame=" << reply.body.find("frame")->i
-           << ", tInFrame=" << reply.body.find("tinframe")->i << ")" << NEWLINE;
+           << ", tInFrame=" << reply.body.find("tinframe")->i << ")" << NEWLINE << FormatCheck(reply.body);
         session.SendResponse(ss.str());
     }
     else
@@ -1188,7 +1663,7 @@ void CLIProcessor::HandleTTDStepInstruction(const ClientSession& session, Emulat
 void CLIProcessor::HandleTTDReverseStep(const ClientSession& session, EmulatorContext* context,
                                           const std::vector<std::string>& args)
 {
-    // --count N or --tstates T; neither: one instruction
+    // --count N, --tstates T or --scanlines L; none: one instruction
     std::map<std::string, std::string> options;
     for (size_t i = 1; i < args.size(); ++i)
     {
@@ -1197,6 +1672,8 @@ void CLIProcessor::HandleTTDReverseStep(const ClientSession& session, EmulatorCo
             options["count"] = args[++i];
         else if (tok == "--tstates" && i + 1 < args.size())
             options["tstates"] = args[++i];
+        else if (tok == "--scanlines" && i + 1 < args.size())
+            options["scanlines"] = args[++i];
     }
     if (options.empty())
         options["count"] = "1";
@@ -1212,11 +1689,14 @@ void CLIProcessor::HandleTTDReverseStep(const ClientSession& session, EmulatorCo
         std::stringstream ss;
         if (options.count("tstates"))
             ss << "TTD: Stepped back " << options["tstates"] << " t-states to ";
+        else if (options.count("scanlines"))
+            ss << "TTD: Stepped back " << options["scanlines"] << " scanline" << (options["scanlines"] == "1" ? "" : "s")
+               << " to ";
         else
             ss << "TTD: Stepped back " << options["count"] << " instruction" << (options["count"] == "1" ? "" : "s")
                << " to ";
         ss << "(frame=" << reply.body.find("frame")->i << ", tInFrame=" << reply.body.find("tinframe")->i << ")"
-           << NEWLINE;
+           << NEWLINE << FormatCheck(reply.body);
         session.SendResponse(ss.str());
     }
     else
@@ -1225,22 +1705,54 @@ void CLIProcessor::HandleTTDReverseStep(const ClientSession& session, EmulatorCo
     }
 }
 
+void CLIProcessor::HandleTTDReverseStepOver(const ClientSession& session, EmulatorContext* context)
+{
+    // Back over a routine when the instruction before is its return, else one instruction back
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"reverse-step-over", {}});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::stringstream ss;
+    ss << "TTD: " << reply.body.find("text")->s;
+    if (reply.body.find("stepped")->b)
+        ss << " (frame=" << reply.body.find("frame")->i << ", tInFrame=" << reply.body.find("tinframe")->i << ")";
+    ss << NEWLINE << FormatCheck(reply.body);
+    session.SendResponse(ss.str());
+}
+
 void CLIProcessor::HandleTTDReverseContinue(const ClientSession& session, EmulatorContext* context,
                                              const std::vector<std::string>& args)
 {
-    // One or more --pc <V> arguments
+    // One or more --pc <V> arguments, then the page, bounds and the --all list
+    static const std::map<std::string, std::string> flags = {
+        {"--phys-page", "phys_page"},   {"--before-frame", "before_frame"}, {"--before-tin", "before_tin"},
+        {"--before", "before"},         {"--from-frame", "from_frame"},     {"--limit", "limit"}};
+    std::map<std::string, std::string> options;
     std::string pcs;
     for (size_t i = 1; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
         if (args[i] == "--pc" && i + 1 < args.size())
             pcs += (pcs.empty() ? "" : ",") + args[++i];
+        else if (args[i] == "--all")
+            options["all"] = "true";
+        else if (args[i] == "--first-per-pc")
+            options["first_per_pc"] = "true";   // the list, each PC's newest hit only
+        else if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+    }
     if (pcs.empty())
     {
         session.SendResponse(std::string("Error: --pc is required (at least one)") + NEWLINE +
-                             "Usage: ttd reverse-continue --pc <A> [--pc <B> ...]" + NEWLINE);
+                             "Usage: ttd reverse-continue --pc <A> [--pc <B> ...] [--phys-page P|rom] [--all | --first-per-pc] [--limit N] "
+                             "[--before-frame F [--before-tin T] | --before T] [--from-frame F]" + NEWLINE);
         return;
     }
+    options["pcs"] = pcs;
 
-    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"reverse-continue", {{"pcs", pcs}}});
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"reverse-continue", options});
     if (!reply.Ok())
     {
         session.SendResponse("Error: " + reply.message + NEWLINE);
@@ -1248,7 +1760,29 @@ void CLIProcessor::HandleTTDReverseContinue(const ClientSession& session, Emulat
     }
     const StateNode& b = reply.body;
     std::stringstream ss;
-    if (b.find("matched")->b)
+    if (const StateNode* hits = b.find("hits"))
+    {
+        // --all: every hit, newest first; the machine did not move
+        ss << "TTD: " << b.find("count")->i << " PC hit(s), newest first" << NEWLINE;
+        for (const StateNode& h : hits->items)
+        {
+            ss << "  frame " << h.find("frame")->i << " t " << h.find("tinframe")->i << "  PC #" << std::hex
+               << std::uppercase << std::setfill('0') << std::setw(4) << h.find("pc")->i << std::dec << std::setfill(' ')
+               << "  page ";
+            const StateNode* page = h.find("phys_page");   // a number, or "rom" (the page-less bucket)
+            if (page->kind == StateNode::Kind::String)
+                ss << page->s;
+            else
+                ss << page->i;
+            ss << NEWLINE;
+        }
+        if (b.find("truncated")->b)
+            ss << "More: --before " << b.find("next_before")->i << NEWLINE;
+        if (const StateNode* m = b.find("blocked_by_marker"))
+            ss << "Stopped at the marker at (frame=" << m->find("frame")->i << ", tInFrame=" << m->find("tinframe")->i
+               << "): " << m->find("reason")->s << NEWLINE;
+    }
+    else if (b.find("matched")->b)
     {
         ss << "TTD: Reverse-continue hit PC=0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(4)
            << b.find("pc")->i << std::dec << " at (frame=" << b.find("frame")->i
@@ -1265,7 +1799,565 @@ void CLIProcessor::HandleTTDReverseContinue(const ClientSession& session, Emulat
     {
         ss << "TTD: Reverse-continue found no match (reached session start)" << NEWLINE;
     }
-    ss << FormatSearchWindow(b);
+    ss << FormatSearchWindow(b) << FormatCheck(b);
+    session.SendResponse(ss.str());
+}
+
+/// `ttd probe-frames <kind> <address> [--end A] [--page N] [--port-mask M] [--if "COND"]` or `--probes JSON`, with
+/// `[--from-frame F] [--to-frame F] [--limit N]`: the frames a game profile's probes fired in (a replay of the window)
+void CLIProcessor::HandleTTDProbeFrames(const ClientSession& session, EmulatorContext* context,
+                                        const std::vector<std::string>& args)
+{
+    static const std::map<std::string, std::string> flags = {
+        {"--end", "end"},           {"--page", "page"},         {"--port-mask", "port_mask"}, {"--if", "if"},
+        {"--probes", "probes"},     {"--from-frame", "from_frame"}, {"--to-frame", "to_frame"}, {"--limit", "limit"}};
+    std::map<std::string, std::string> options;
+    std::vector<std::string> positional;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
+        if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+        else
+            positional.push_back(args[i]);
+    }
+    if (positional.size() >= 1)
+        options["probe"] = positional[0];
+    if (positional.size() >= 2)
+        options["address"] = positional[1];
+    if (!options.count("probes") && positional.size() != 2)
+    {
+        session.SendResponse(std::string("Usage: ttd probe-frames <exec|read|write|port-in|port-out> <address> [--end A] "
+                                         "[--page N] [--port-mask M] [--if \"COND\"] | --probes '[{...}]' "
+                                         "[--from-frame F] [--to-frame F] [--limit N]") + NEWLINE);
+        return;
+    }
+
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"probe-frames", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    const StateNode& b = reply.body;
+    std::stringstream ss;
+    ss << "Frames " << b.find("from_frame")->i << ".." << b.find("to_frame")->i << ": " << b.find("replayed_frames")->i
+       << " replayed, " << b.find("pruned_frames")->i << " pruned by the coverage index";
+    if (const StateNode* barriers = b.find("barrier_frames"); barriers && !barriers->items.empty())
+        ss << ", " << barriers->items.size() << " behind a replay barrier (not searched)";
+    ss << NEWLINE;
+    for (const StateNode& probe : b.find("probes")->items)
+    {
+        ss << "  " << probe.find("probe")->s << " " << probe.find("address")->s;
+        if (const StateNode* end = probe.find("end"))
+            ss << ".." << end->s;
+        if (const StateNode* page = probe.find("page"))
+            ss << " page=" << page->i;
+        if (const StateNode* mask = probe.find("port_mask"))
+            ss << " mask=" << mask->s;
+        if (const StateNode* cond = probe.find("if"))
+            ss << " if " << cond->s;
+        if (const StateNode* error = probe.find("error"))
+        {
+            ss << ": not armed (" << error->s << ")" << NEWLINE;
+            continue;
+        }
+        ss << ": " << probe.find("frame_count")->i << " frames, " << probe.find("hit_count")->i << " hits";
+        const std::vector<StateNode>& frames = probe.find("frames")->items;
+        const std::vector<StateNode>& hits = probe.find("hits")->items;
+        if (!frames.empty())
+            ss << ":";
+        for (size_t i = 0; i < frames.size(); ++i)
+            ss << " " << frames[i].i << (hits[i].i > 1 ? "x" + std::to_string(hits[i].i) : "");
+        if (probe.find("truncated")->b)
+            ss << " ...";
+        ss << NEWLINE;
+    }
+    if (const StateNode* next = b.find("next_from_frame"))
+        ss << "More: --from-frame " << next->i << NEWLINE;
+    session.SendResponse(ss.str());
+}
+
+/// `ttd cause <addr>[:page] | <reg> [--frame F [--tin T]] [--depth N] [--links N] [--frames N] [--flags]`: the cause
+/// chain of a memory byte or a register, one line per link
+void CLIProcessor::HandleTTDCauseChain(const ClientSession& session, EmulatorContext* context,
+                                       const std::vector<std::string>& args)
+{
+    static const std::map<std::string, std::string> flags = {{"--frame", "frame"},     {"--tin", "tinframe"},
+                                                             {"--depth", "depth"},     {"--links", "max_links"},
+                                                             {"--frames", "max_frames"}};
+    const std::string usage = std::string("Usage: ttd cause <addr>[:page] | <reg> [--frame F [--tin T]] [--depth N] "
+                                          "[--links N] [--frames N] [--flags]") + NEWLINE;
+    std::map<std::string, std::string> options = {{"text", "true"}};
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
+        if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+        else if (args[i] == "--flags")
+            options["flags"] = "true";
+        else if (i == 1 && !args[i].empty() && args[i][0] != '-')
+        {
+            std::vector<ttd::TTDCauseReg> regs;
+            if (ttd::TTDCauseRegsByName(args[i], regs))
+                options["reg"] = args[i];
+            else if (const size_t colon = args[i].find(':'); colon != std::string::npos)
+            {
+                options["addr"] = args[i].substr(0, colon);
+                options["phys_page"] = args[i].substr(colon + 1);
+            }
+            else
+                options["addr"] = args[i];
+        }
+        else
+        {
+            session.SendResponse(usage);
+            return;
+        }
+    }
+    if (!options.count("reg") && !options.count("addr"))
+    {
+        session.SendResponse(usage);
+        return;
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"cause-chain", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::string text = reply.body.find("text")->s;
+    std::string out;
+    for (char c : text)
+        out += c == '\n' ? std::string(NEWLINE) : std::string(1, c);
+    session.SendResponse(out);
+}
+
+/// `ttd bt [F[+T]] [--depth N] [--slots N]`: the call stack at a moment, one line per frame
+void CLIProcessor::HandleTTDBacktrace(const ClientSession& session, EmulatorContext* context,
+                                      const std::vector<std::string>& args)
+{
+    static const std::map<std::string, std::string> flags = {{"--depth", "max_depth"}, {"--slots", "max_slots"}};
+    const std::string usage = std::string("Usage: ttd bt [F[+T]] [--depth N] [--slots N]") + NEWLINE;
+    std::map<std::string, std::string> options = {{"text", "true"}};
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
+        if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+        else if (i == 1 && !args[i].empty() && args[i][0] != '-')
+        {
+            const size_t plus = args[i].find('+');
+            options["frame"] = args[i].substr(0, plus);
+            if (plus != std::string::npos)
+                options["tinframe"] = args[i].substr(plus + 1);
+        }
+        else
+        {
+            session.SendResponse(usage);
+            return;
+        }
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"backtrace", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::string text = reply.body.find("text")->s;
+    std::string out;
+    for (char c : text)
+        out += c == '\n' ? std::string(NEWLINE) : std::string(1, c);
+    session.SendResponse(out + NEWLINE);
+}
+
+/// `ttd event <kind> ... [--last] [--from F] [--to F] [--limit N]`: the first (or last) moments an event happened,
+/// one line per hit (find event)
+void CLIProcessor::HandleTTDFindEvent(const ClientSession& session, EmulatorContext* context,
+                                      const std::vector<std::string>& args)
+{
+    const std::string usage =
+        std::string("Usage: ttd event mem <addr>[:page] [cond [V|B]] [--size 2] [--exact] | screen [PERCENT|cleared] | "
+                    "exec <addr>[-<to>][:page] | port <in|out> <port> [value V] [--mask M] [--value-mask M] | "
+                    "border [COLOUR] | key [KEY] [--released];  [--last] [--from F] [--to F] [--limit N]") +
+        NEWLINE;
+    if (args.size() < 2)
+    {
+        session.SendResponse(usage);
+        return;
+    }
+    static const std::map<std::string, std::string> flags = {{"--from", "from_frame"},  {"--to", "to_frame"},
+                                                             {"--limit", "limit"},      {"--size", "size"},
+                                                             {"--mask", "port_mask"},   {"--value-mask", "value_mask"},
+                                                             {"--max-frames", "max_frames"}};
+    const std::string kind = args[1];
+    std::map<std::string, std::string> options = {{"text", "true"}, {"kind", kind}};
+    std::vector<std::string> words;
+    for (size_t i = 2; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
+        if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+        else if (args[i] == "--last")
+            options["order"] = "last";
+        else if (args[i] == "--exact")
+            options["exact"] = "true";
+        else if (args[i] == "--released")
+            options["pressed"] = "false";
+        else if (!args[i].empty() && args[i][0] == '-' && args[i].size() > 1 && !std::isdigit(static_cast<unsigned char>(args[i][1])))
+        {
+            session.SendResponse(usage);
+            return;
+        }
+        else
+            words.push_back(args[i]);
+    }
+    auto addrPage = [&](std::string a) {
+        if (const size_t colon = a.find(':'); colon != std::string::npos)
+        {
+            options["phys_page"] = a.substr(colon + 1);
+            a = a.substr(0, colon);
+        }
+        if (const size_t dash = a.find('-'); kind == "exec" && dash != std::string::npos && dash > 0)
+        {
+            options["addr_to"] = a.substr(dash + 1);
+            a = a.substr(0, dash);
+        }
+        options["addr"] = a;
+    };
+    bool ok = true;
+    if (kind == "mem")
+    {
+        ok = !words.empty() && words.size() <= 3;
+        if (ok)
+        {
+            addrPage(words[0]);
+            if (words.size() >= 2)
+                options["cond"] = words[1];
+            if (words.size() == 3)
+                options[words[1].rfind("bit_", 0) == 0 ? "bit" : "value"] = words[2];
+        }
+    }
+    else if (kind == "screen")
+    {
+        ok = words.size() <= 1;
+        if (ok && words.size() == 1)
+        {
+            if (words[0] == "cleared" || words[0] == "change")
+                options["cond"] = words[0];
+            else
+                options["min_changed"] = words[0];
+        }
+    }
+    else if (kind == "exec")
+    {
+        ok = words.size() == 1;
+        if (ok)
+            addrPage(words[0]);
+    }
+    else if (kind == "port")
+    {
+        ok = words.size() == 2 || (words.size() == 4 && words[2] == "value");
+        if (ok)
+        {
+            options["dir"] = words[0];
+            options["port"] = words[1];
+            if (words.size() == 4)
+                options["value"] = words[3];
+        }
+    }
+    else if (kind == "border")
+    {
+        ok = words.size() <= 1;
+        if (ok && words.size() == 1)
+            options["value"] = words[0];
+    }
+    else if (kind == "key")
+    {
+        ok = words.size() <= 1;
+        if (ok && words.size() == 1)
+            options["key"] = words[0];
+    }
+    else
+        ok = false;
+    if (!ok)
+    {
+        session.SendResponse(usage);
+        return;
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"find-event", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::string text = reply.body.find("text")->s;
+    std::string out;
+    for (char c : text)
+        out += c == '\n' ? std::string(NEWLINE) : std::string(1, c);
+    session.SendResponse(out);
+}
+
+/// `ttd explain [F] [--sections a,b] [--limit N]`: what frame F (default: the current one) did, as text
+void CLIProcessor::HandleTTDExplainFrame(const ClientSession& session, EmulatorContext* context,
+                                         const std::vector<std::string>& args)
+{
+    const std::string usage =
+        std::string("Usage: ttd explain [F] [--sections time,routines,interrupt,paging,ports,memory,screen,input,markers] "
+                    "[--limit N]") +
+        NEWLINE;
+    std::map<std::string, std::string> options = {{"text", "true"}};
+    bool haveFrame = false;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        if ((args[i] == "--sections" || args[i] == "--limit") && i + 1 < args.size())
+        {
+            options[args[i].substr(2)] = args[i + 1];
+            ++i;
+        }
+        else if (!haveFrame && !args[i].empty() && std::isdigit(static_cast<unsigned char>(args[i][0])))
+        {
+            options["frame"] = args[i];
+            haveFrame = true;
+        }
+        else
+        {
+            session.SendResponse(usage);
+            return;
+        }
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"explain-frame", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::string text = reply.body.find("text")->s;
+    std::string out;
+    for (char c : text)
+        out += c == '\n' ? std::string(NEWLINE) : std::string(1, c);
+    session.SendResponse(out);
+}
+
+/// `ttd diff F[+T] [G[+T]] [--sections a,b] [--limit N] [--no-writers]`: what differs between two moments, as text
+void CLIProcessor::HandleTTDDiffMoments(const ClientSession& session, EmulatorContext* context,
+                                        const std::vector<std::string>& args)
+{
+    const std::string usage =
+        std::string("Usage: ttd diff F[+T] [G[+T]] [--sections cpu,paging,memory,screen,devices,between] [--limit N] "
+                    "[--no-writers]") +
+        NEWLINE;
+    std::map<std::string, std::string> options = {{"text", "true"}};
+    int moments = 0;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        if ((args[i] == "--sections" || args[i] == "--limit") && i + 1 < args.size())
+        {
+            options[args[i].substr(2)] = args[i + 1];
+            ++i;
+        }
+        else if (args[i] == "--no-writers")
+            options["writers"] = "false";
+        else if (moments < 2 && !args[i].empty() && std::isdigit(static_cast<unsigned char>(args[i][0])))
+        {
+            // F, F+T or F:T
+            const std::string& m = args[i];
+            const size_t sep = m.find_first_of("+:");
+            const std::string prefix = moments == 0 ? "from_" : "to_";
+            options[prefix + "frame"] = m.substr(0, sep);
+            if (sep != std::string::npos)
+                options[prefix + "tinframe"] = m.substr(sep + 1);
+            ++moments;
+        }
+        else
+        {
+            session.SendResponse(usage);
+            return;
+        }
+    }
+    if (moments == 0)
+    {
+        session.SendResponse(usage);
+        return;
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"diff", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::string text = reply.body.find("text")->s;
+    std::string out;
+    for (char c : text)
+        out += c == '\n' ? std::string(NEWLINE) : std::string(1, c);
+    session.SendResponse(out);
+}
+
+/// `ttd replay-check [F [G]] [--stride N] [--limit N]`: each frame of F..G replayed from its checkpoint and compared with
+/// the next checkpoint, as text
+void CLIProcessor::HandleTTDReplayCheck(const ClientSession& session, EmulatorContext* context,
+                                        const std::vector<std::string>& args)
+{
+    const std::string usage = std::string("Usage: ttd replay-check [F [G]] [--stride N] [--limit N]") + NEWLINE;
+    std::map<std::string, std::string> options = {{"text", "true"}};
+    int frames = 0;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        if ((args[i] == "--stride" || args[i] == "--limit") && i + 1 < args.size())
+        {
+            options[args[i].substr(2)] = args[i + 1];
+            ++i;
+        }
+        else if (frames < 2 && !args[i].empty() && std::isdigit(static_cast<unsigned char>(args[i][0])))
+            options[frames++ == 0 ? "from_frame" : "to_frame"] = args[i];
+        else
+        {
+            session.SendResponse(usage);
+            return;
+        }
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"replay-check", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::string text = reply.body.find("text")->s;
+    std::string out;
+    for (char c : text)
+        out += c == '\n' ? std::string(NEWLINE) : std::string(1, c);
+    session.SendResponse(out);
+}
+
+/// `ttd seek-check [on|off]`: whether every seek replay-checks the frame it lands in, and the counts
+void CLIProcessor::HandleTTDSeekCheck(const ClientSession& session, EmulatorContext* context,
+                                      const std::vector<std::string>& args)
+{
+    std::map<std::string, std::string> options;
+    if (args.size() > 1)
+    {
+        if (args[1] != "on" && args[1] != "off")
+        {
+            session.SendResponse(std::string("Usage: ttd seek-check [on|off]") + NEWLINE);
+            return;
+        }
+        options["enabled"] = args[1] == "on" ? "true" : "false";
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"seek-check", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    std::stringstream ss;
+    ss << "TTD seek check: " << (reply.body.find("enabled")->b ? "on" : "off") << ", "
+       << reply.body.find("seek_checks")->i << " seek(s) checked, " << reply.body.find("seek_check_divergences")->i
+       << " diverged" << NEWLINE;
+    const StateNode* last = reply.body.find("last_seek_divergence");
+    if (last && last->kind == StateNode::Kind::String)
+    {
+        ss << "Last divergence:" << NEWLINE;
+        for (char c : last->s)
+            ss << (c == '\n' ? std::string(NEWLINE) : std::string(1, c));
+    }
+    session.SendResponse(ss.str());
+}
+
+/// `ttd timeline [--from-frame F] [--to-frame F] [--bucket-size N] [--limit N] [--buckets] [--no-ports]
+/// [--min-phase-ms N]`: the phases of the recording, each with its tags and the facts that made them
+void CLIProcessor::HandleTTDTimeline(const ClientSession& session, EmulatorContext* context,
+                                     const std::vector<std::string>& args)
+{
+    static const std::map<std::string, std::string> flags = {{"--from-frame", "from_frame"},
+                                                             {"--to-frame", "to_frame"},
+                                                             {"--bucket-size", "bucket_size"},
+                                                             {"--limit", "limit"},
+                                                             {"--min-phase-ms", "min_phase_ms"}};
+    std::map<std::string, std::string> options;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
+        if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+        else if (args[i] == "--buckets")
+            options["buckets"] = "true";
+        else if (args[i] == "--no-ports")
+            options["ports"] = "false";
+        else
+        {
+            session.SendResponse(std::string("Usage: ttd timeline [--from-frame F] [--to-frame F] [--bucket-size N] "
+                                             "[--limit N] [--buckets] [--no-ports] [--min-phase-ms N]") + NEWLINE);
+            return;
+        }
+    }
+
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({"timeline", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE);
+        return;
+    }
+    const StateNode& b = reply.body;
+    const std::vector<StateNode>& devices = b.find("devices")->items;
+    auto line = [&](std::stringstream& ss, const StateNode& p) {
+        ss << p.find("frame_start")->i << ".." << p.find("frame_end")->i << " ";
+        std::string tags;
+        for (const StateNode& tag : p.find("tags")->items)
+            tags += (tags.empty() ? "" : ",") + tag.s;
+        ss << (tags.empty() ? "-" : tags) << ": exec " << p.find("executed")->i << ", written " << p.find("written")->i
+           << ", in " << p.find("in")->i << ", out " << p.find("out")->i;
+        if (p.find("screen_frames")->i)
+            ss << ", screen " << p.find("screen_frames")->i << " fr";
+        if (p.find("halted_frames")->i)
+            ss << ", halted " << p.find("halted_frames")->i << " fr";
+        if (p.find("ula_reads")->i)
+            ss << ", #FE reads " << p.find("ula_reads")->i;
+        if (p.find("beeper_toggles")->i)
+            ss << ", beeper " << p.find("beeper_toggles")->i;
+        if (p.find("sectors")->i)
+            ss << ", sectors " << p.find("sectors")->i;
+        if (!p.find("keys")->items.empty())
+        {
+            ss << ", keys";
+            for (const StateNode& key : p.find("keys")->items)
+                ss << " " << key.s;
+        }
+        for (const StateNode& dev : p.find("devices")->items)
+        {
+            if (const StateNode* slot = dev.find("slot"))
+                ss << "; " << slot->s << " " << dev.find("sectors")->i << " sectors";
+            else if (const StateNode* region = dev.find("region"))
+                ss << "; " << region->s << " changed " << dev.find("frames")->i << " fr";
+            else if (static_cast<size_t>(dev.find("device")->i) < devices.size())
+                ss << "; " << devices[static_cast<size_t>(dev.find("device")->i)].find("name")->s << " in "
+                   << dev.find("in")->i << " out " << dev.find("out")->i;
+        }
+        ss << NEWLINE;
+    };
+    std::stringstream ss;
+    ss << "Frames " << b.find("from_frame")->i << ".." << b.find("to_frame")->i;
+    if (b.find("bucket_count")->i)
+        ss << ", " << b.find("bucket_count")->i << " buckets of " << b.find("bucket_size")->i;
+    ss << (b.find("truncated")->b ? " (window cut at the limit)" : "") << ", " << b.find("phases")->items.size()
+       << " phases" << NEWLINE;
+    for (const StateNode& p : b.find("phases")->items)
+    {
+        ss << "  ";
+        line(ss, p);
+    }
+    if (const StateNode* buckets = b.find("buckets"))
+    {
+        ss << "Buckets:" << NEWLINE;
+        for (const StateNode& bucket : buckets->items)
+        {
+            ss << "  ";
+            line(ss, bucket);
+        }
+    }
+    for (const StateNode& e : b.find("events")->items)
+        ss << "  event " << e.find("frame")->i << " " << e.find("kind")->s << " " << e.find("text")->s << NEWLINE;
+    for (const StateNode& m : b.find("missing")->items)
+        ss << "  missing " << m.find("fact")->s << ": " << m.find("reason")->s << NEWLINE;
     session.SendResponse(ss.str());
 }
 
@@ -1273,13 +2365,13 @@ void CLIProcessor::HandleTTDCoverage(const ClientSession& session, EmulatorConte
 {
     if (args.size() < 2)
     {
-        session.SendResponse(std::string("Usage: ttd coverage [probe|scan|summary] [options]") + NEWLINE);
+        session.SendResponse(std::string("Usage: ttd coverage [probe|scan|rare|summary] [options]") + NEWLINE);
         return;
     }
     const std::string sub = args[1];
-    if (sub != "probe" && sub != "scan" && sub != "summary")
+    if (sub != "probe" && sub != "scan" && sub != "rare" && sub != "summary")
     {
-        session.SendResponse("Unknown coverage subcommand '" + sub + "'. Expected: probe, scan, summary" + NEWLINE);
+        session.SendResponse("Unknown coverage subcommand '" + sub + "'. Expected: probe, scan, rare, summary" + NEWLINE);
         return;
     }
 
@@ -1290,13 +2382,17 @@ void CLIProcessor::HandleTTDCoverage(const ClientSession& session, EmulatorConte
         {"--from", "addr_from"},      {"--addr-from", "addr_from"}, {"-a", "addr_from"},
         {"--to", "addr_to"},          {"--addr-to", "addr_to"},  {"-b", "addr_to"},
         {"--page", "phys_page"},      {"--phys-page", "phys_page"}, {"-p", "phys_page"},
+        {"--space", "space"},
         {"--limit", "limit"},         {"-l", "limit"},           {"--bucket", "bucket_size"},
-        {"--bucket-size", "bucket_size"}};
+        {"--bucket-size", "bucket_size"}, {"--order", "order"},  {"--max-frames", "max_frames"},
+        {"-n", "max_frames"}};
     std::map<std::string, std::string> options;
     for (size_t i = 2; i < args.size(); ++i)
     {
         const auto flag = flags.find(args[i]);
-        if (flag != flags.end() && i + 1 < args.size())
+        if (args[i] == "--ranges")
+            options["ranges"] = "true";   // runs of consecutive frames instead of the frame list
+        else if (flag != flags.end() && i + 1 < args.size())
             options[flag->second] = args[++i];
     }
     const std::string verb = "coverage-" + sub;
@@ -1322,8 +2418,13 @@ void CLIProcessor::HandleTTDCoverage(const ClientSession& session, EmulatorConte
     }
     else if (sub == "probe")
     {
-        ss << "Frame " << b.find("frame")->i << " kind=" << b.find("kind")->s << " range=[" << b.find("addr_from")->s
-           << ".." << b.find("addr_to")->s << "]: " << (b.find("touched")->b ? "TOUCHED" : "NOT touched") << NEWLINE;
+        // A range in another memory (--space vram / cache) by its offsets
+        const bool space = b.find("space") != nullptr;
+        ss << "Frame " << b.find("frame")->i << " kind=" << b.find("kind")->s
+           << (space ? " space=" + b.find("space")->s : std::string()) << " range=["
+           << (space ? b.find("offset_from")->s : b.find("addr_from")->s) << ".."
+           << (space ? b.find("offset_to")->s : b.find("addr_to")->s) << "]: " << (b.find("touched")->b ? "TOUCHED" : "NOT touched")
+           << NEWLINE;
     }
     else if (sub == "scan")
     {
@@ -1333,12 +2434,60 @@ void CLIProcessor::HandleTTDCoverage(const ClientSession& session, EmulatorConte
         if (b.find("truncated")->b)
             ss << " [TRUNCATED]";
         ss << NEWLINE;
-        const auto& frames = b.find("frames")->items;
-        if (!frames.empty())
+        const std::string order = b.find("order")->s;
+        if (const StateNode* ranges = b.find("ranges"))
         {
-            ss << "Matching frames: ";
-            for (size_t n = 0; n < frames.size(); ++n)
-                ss << (n ? ", " : "") << frames[n].i;
+            if (!ranges->items.empty())
+            {
+                ss << "Matching runs (" << order << " first): ";
+                for (size_t n = 0; n < ranges->items.size(); ++n)
+                {
+                    const auto& run = ranges->items[n].items;
+                    ss << (n ? ", " : "") << run[0].i;
+                    if (run[1].i != run[0].i)
+                        ss << "-" << run[1].i;
+                }
+                ss << NEWLINE;
+            }
+        }
+        else if (const StateNode* frames = b.find("frames"); frames && !frames->items.empty())
+        {
+            ss << "Matching frames (" << order << " first): ";
+            for (size_t n = 0; n < frames->items.size(); ++n)
+                ss << (n ? ", " : "") << frames->items[n].i;
+            ss << NEWLINE;
+        }
+        if (const StateNode* next = b.find("next_from_frame"))
+            ss << "More: --from-frame " << next->i << NEWLINE;
+        else if (const StateNode* nextTo = b.find("next_to_frame"))
+            ss << "More: --to-frame " << nextTo->i << NEWLINE;
+        if (!b.find("exact")->b && b.find("matching_frames")->i > 0)
+            ss << "Not exact: without --page the offset matched on every page; give --page N (or rom)" << NEWLINE;
+    }
+    else if (sub == "rare")
+    {
+        // A block: its CPU address where the page was mapped, else the page and its offsets
+        ss << "Scanned " << b.find("scanned_frames")->i << " frames: " << b.find("distinct_keys")->i << " keys, "
+           << b.find("rare_keys")->i << " in at most " << b.find("max_frames")->i << " frames, "
+           << b.find("rare_blocks")->i << " blocks";
+        if (b.find("unindexed_frames")->i)
+            ss << " (" << b.find("unindexed_frames")->i << " frames not indexed)";
+        if (b.find("truncated")->b)
+            ss << " [TRUNCATED]";
+        ss << NEWLINE;
+        for (const StateNode& block : b.find("blocks")->items)
+        {
+            if (const StateNode* addr = block.find("addr_from"))
+                ss << "  " << addr->s << ".." << block.find("addr_to")->s;
+            else
+                ss << "  page offset " << block.find("page_offset_from")->s << ".." << block.find("page_offset_to")->s;
+            if (const StateNode* page = block.find("phys_page"))
+                ss << " page=" << (page->kind == StateNode::Kind::String ? page->s : std::to_string(page->i));
+            else if (const StateNode* space = block.find("space"))
+                ss << " space=" << space->s << " offset=" << block.find("offset_from")->s;
+            ss << " keys=" << block.find("keys")->i << " frames:";
+            for (const StateNode& f : block.find("frames")->items)
+                ss << " " << f.i;
             ss << NEWLINE;
         }
     }
@@ -1352,6 +2501,73 @@ void CLIProcessor::HandleTTDCoverage(const ClientSession& session, EmulatorConte
                << " exec=" << bucket.find("executed_distinct")->i << " write=" << bucket.find("written_distinct")->i
                << " read=" << bucket.find("read_distinct")->i << (bucket.find("has_keyframe")->b ? " [I-frame]" : "")
                << NEWLINE;
+    }
+    session.SendResponse(ss.str());
+}
+
+/// `ttd memory-at --space S --frame F [--offset O] [--length N]` and `ttd memory-diff --space S --from F1 --to F2
+/// [--limit N]`: a memory at a past checkpoint, and what changed between two (the engine's store, no seek)
+void CLIProcessor::HandleTTDMemoryAt(const ClientSession& session, EmulatorContext* context,
+                                     const std::vector<std::string>& args)
+{
+    const bool diff = args[0] == "memory-diff" || args[0] == "mdiff";
+    static const std::map<std::string, std::string> flags = {
+        {"--space", "space"}, {"--frame", "frame"},       {"--offset", "offset"}, {"--length", "length"},
+        {"--tinframe", "tinframe"}, {"--tstate", "tinframe"},
+        {"--from", "from_frame"}, {"--to", "to_frame"},   {"--limit", "limit"}};
+    std::map<std::string, std::string> options;
+    for (size_t i = 1; i < args.size(); ++i)
+    {
+        const auto flag = flags.find(args[i]);
+        if (flag != flags.end() && i + 1 < args.size())
+            options[flag->second] = args[++i];
+    }
+    const ttd::TTDReply reply = ttd::TTDControl(context).Execute({diff ? "memory-diff" : "memory-at", options});
+    if (!reply.Ok())
+    {
+        session.SendResponse("Error: " + reply.message + NEWLINE +
+                             (reply.error == ttd::TTDControlError::BadRequest
+                                  ? std::string(diff ? "Usage: ttd memory-diff --space S --from F1 --to F2 [--limit N]"
+                                                     : "Usage: ttd memory-at --space S --frame F [--tinframe T] [--offset O] [--length N] "
+                                                       "(--space cpu without --frame: the machine now)") +
+                                        NEWLINE
+                                  : std::string()));
+        return;
+    }
+    const StateNode& b = reply.body;
+    std::ostringstream ss;
+    if (diff)
+    {
+        ss << b.find("space")->s << ": " << b.find("changed_bytes")->i << " bytes differ between frame "
+           << b.find("at_from")->i << " and frame " << b.find("at_to")->i << NEWLINE;
+        for (const StateNode& r : b.find("ranges")->items)
+            ss << "  0x" << std::hex << std::uppercase << std::setw(5) << std::setfill('0') << r.find("offset")->i << std::dec
+               << " +" << r.find("length")->i << NEWLINE;
+        if (b.find("truncated")->b)
+            ss << "  ... (more: --limit)" << NEWLINE;
+    }
+    else
+    {
+        const std::string& hex = b.find("hex")->s;
+        // space cpu without --frame (or at the machine's own frame past the history): the machine now
+        const StateNode* live = b.find("live");
+        if (live && live->b)
+            ss << "cpu at frame " << b.find("at_frame")->i << " t=" << b.find("at_tinframe")->i << " (the machine now"
+               << (b.find("exact")->b ? "" : ", not the asked T-state") << "):" << NEWLINE;
+        else
+            ss << b.find("space")->s << " at frame " << b.find("at_frame")->i
+               << (b.find("tinframe")->i ? " t=" + std::to_string(b.find("tinframe")->i) : std::string())
+               << (b.find("exact")->b ? "" : " (the checkpoint at or before frame " + std::to_string(b.find("frame")->i) + ")")
+               << ":" << NEWLINE;
+        const int64_t offset = b.find("offset")->i;
+        for (size_t i = 0; i < hex.size(); i += 32)
+        {
+            ss << "  0x" << std::hex << std::uppercase << std::setw(5) << std::setfill('0') << offset + static_cast<int64_t>(i / 2)
+               << std::dec << ":";
+            for (size_t j = i; j < std::min(i + 32, hex.size()); j += 2)
+                ss << " " << hex.substr(j, 2);
+            ss << NEWLINE;
+        }
     }
     session.SendResponse(ss.str());
 }

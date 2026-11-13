@@ -1,4 +1,6 @@
 #pragma once
+
+#include <memory>
 #ifndef BREAKPOINTEDITOR_H
 #define BREAKPOINTEDITOR_H
 
@@ -19,11 +21,15 @@ class BreakpointEditor : public QDialog
 public:
     enum Mode { Add, Edit };
     
-    explicit BreakpointEditor(Emulator* emulator, Mode mode, QWidget* parent = nullptr);
-    explicit BreakpointEditor(Emulator* emulator, Mode mode, uint16_t breakpointId, QWidget* parent = nullptr);
+    explicit BreakpointEditor(std::shared_ptr<Emulator> emulator, Mode mode, QWidget* parent = nullptr);
+    explicit BreakpointEditor(std::shared_ptr<Emulator> emulator, Mode mode, uint16_t breakpointId, QWidget* parent = nullptr);
     ~BreakpointEditor();
     
     BreakpointDescriptor getBreakpointDescriptor() const;
+
+    /// A condition compile refusal split for the editor: the message without the "condition: " prefix and the
+    /// " at column N" suffix, and the 1-based column (0: none)
+    static QString SplitConditionError(const QString& error, int& column);
     
 private slots:
     void onTypeChanged(int index);
@@ -33,18 +39,28 @@ private slots:
     
 private:
     void setupUI();
+    void addNextTypes();  // the ZX Next kinds into the type list (once)
     void populateGroupComboBox();
     void loadBreakpointData(uint16_t breakpointId);
+    bool keyAddress(const QString& text, uint16_t& address);
     bool validateAddress(const QString& text, uint16_t& address);
+    /// The access bits of the selected kind (BRK_MEM_*, BRK_IO_*, BRK_KEY_*; NextREG: BRK_IO_IN read, OUT write)
+    uint8_t selectedAccess(BreakpointTypeEnum type) const;
+    /// Compiles the condition for the selected kind and access (the manager's check: trigger, labels, this machine)
+    /// and shows what it reads as or why it is refused, the place marked. False when refused
+    bool checkCondition();
     
-    Emulator* _emulator;
+    std::shared_ptr<Emulator> _emulator;
     Mode _mode;
     uint16_t _breakpointId;
     BreakpointDescriptor _descriptor;
     
     QComboBox* _typeCombo;
+    QLabel* _addressLabel;      // "Address:", "Port:", "Register:", "Line:", "List index:", "Key:"
     QLineEdit* _addressEdit;
+    QLabel* _endLabel;
     QLineEdit* _endEdit;        // optional range end
+    QWidget* _pageRow;          // memory only
     QLineEdit* _pageEdit;       // optional page "ram5": a physical breakpoint
     QCheckBox* _slotOnlyCheck;  // with a page: only through the slot of the address
     QLineEdit* _maskEdit;       // ports: optional mask
@@ -56,9 +72,31 @@ private:
     QCheckBox* _executeCheck;
     QCheckBox* _inCheck;
     QCheckBox* _outCheck;
+    // ZX Next: NextREG (read / write, the doors a write comes through, a value), beam (the pixel clock), magic opcode
+    QGroupBox* _nextRegBox;
+    QCheckBox* _nrReadCheck;
+    QCheckBox* _nrWriteCheck;
+    QCheckBox* _doorNextRegCheck;
+    QCheckBox* _doorPortCheck;
+    QCheckBox* _doorCopperCheck;
+    QLineEdit* _nrValueEdit;      // optional: stop only on this value
+    QLineEdit* _nrValueMaskEdit;  // optional: compare only these bits (#FF with a value)
+    QGroupBox* _beamBox;
+    QLineEdit* _hcEdit;           // the pixel clock in the row, 0..511
+    QGroupBox* _magicBox;
+    QComboBox* _magicCombo;       // ED FF, DD 01
+    QGroupBox* _keyboardBox;
+    QCheckBox* _keyPressCheck;
+    QCheckBox* _keyReleaseCheck;
+    QWidget* _conditionRow;       // the kinds that take a condition (not keyboard)
+    QLineEdit* _conditionEdit;    // optional: stop only when it holds
+    QLabel* _conditionStatus;     // what it reads as, or why it is refused
+    QString _loadedCondition;      // the edited breakpoint's condition as loaded
+    QString _loadedConditionError; // and why it failed while running ("" while it works)
     QComboBox* _groupCombo;
     QLineEdit* _noteEdit;
     QCheckBox* _activeCheck;
+    QCheckBox* _countOnlyCheck;  // BreakpointSpec::stop = false: only counts the hits
     
     QPushButton* _okButton;
     QPushButton* _cancelButton;

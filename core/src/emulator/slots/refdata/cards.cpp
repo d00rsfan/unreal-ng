@@ -170,11 +170,13 @@ constexpr When kDipSd{ Opt::Dip, Bit(3) };
 constexpr PortClaim kMultisoundClaims[] = {
     // YM register / control: A15-A14 = 11, A3-A0 = 1101; IORQGE only with A13 = 1 (#FFFD); #DFFD passive, co-written
     // with the machine's own #DFFD
-    { .mask = 0xE00F, .match = 0xE00D, .dir = Dir::InOut, .iorqge = Iorqge::Yes, .when = kDipYm, .port = 0xFFFD },
+    { .mask = 0xE00F, .match = 0xE00D, .dir = Dir::InOut, .iorqge = Iorqge::Yes, .when = kDipYm, .port = 0xFFFD,
+      .channel = Channel::SelectIndexed, .channelMask = 0x000F, .input = InputRole::AyIo, .channelName = "reg" },
     { .mask = 0xE00F, .match = 0xC00D, .dir = Dir::InOut, .when = kDipYm, .port = 0xDFFD },
     // YM data: the CPLD's IORQGE has no direction term, so an IN #BFFD asserts it too while the card leaves the data
     // bus alone (hardware reference §3.1, §3.4): the read is hidden from the board and floats
-    { .mask = 0xC00F, .match = 0x800D, .dir = Dir::InOut, .iorqge = Iorqge::Yes, .when = kDipYm, .port = 0xBFFD },
+    { .mask = 0xC00F, .match = 0x800D, .dir = Dir::InOut, .iorqge = Iorqge::Yes, .when = kDipYm, .port = 0xBFFD,
+      .channel = Channel::Indexed, .input = InputRole::AyIo, .channelName = "reg" },
     // SAA #FF data / #1FF address: passive since 2023-12, ROM-fetch lock
     { .mask = 0x00FF, .match = 0x00FF, .dir = Dir::Out, .romLock = true, .when = kDipSaa },
     { .mask = 0x00FF, .match = 0x00B3, .dir = Dir::InOut, .iorqge = Iorqge::Yes, .when = kDipGs },
@@ -251,6 +253,111 @@ constexpr Src kWifiSources[] = { Src::IzzxZxWifi, Src::IzzxZxWifiReadme, Src::Re
 
 // endregion
 
+// region <fuller-box (research-cards.md "Fuller Box"): AY on #3F / #5F, stick on #7F, passive, no /DOS gating>
+
+constexpr OptionValue kFullerDecodeValues[] = {
+    { "full-low", "full low byte (FUSE)" }, { "a7a6a5", "A7-A5 only (zxsp)" },
+};
+constexpr When kFullerFullLow{ Opt::Decode, Bit(0) };
+constexpr When kFullerA7A6A5{ Opt::Decode, Bit(1) };
+
+constexpr PortClaim kFullerClaims[] = {
+    // #3F: register select (write), register data (read: FUSE, zxsp, nocash; MAME reads #5F)
+    { .mask = 0x00FF, .match = 0x003F, .dir = Dir::InOut, .when = kFullerFullLow,
+      .channel = Channel::SelectIndexed, .channelMask = 0x000F, .input = InputRole::AyIo, .channelName = "reg" },
+    { .mask = 0x00FF, .match = 0x005F, .dir = Dir::Out, .when = kFullerFullLow,
+      .channel = Channel::Indexed, .input = InputRole::AyIo, .channelName = "reg" },
+    { .mask = 0x00FF, .match = 0x007F, .dir = Dir::In, .when = kFullerFullLow,
+      .input = InputRole::FullerJoystick },
+    { .mask = 0x00E0, .match = 0x0020, .dir = Dir::InOut, .when = kFullerA7A6A5, .port = 0x003F,
+      .channel = Channel::SelectIndexed, .channelMask = 0x000F, .input = InputRole::AyIo, .channelName = "reg" },
+    { .mask = 0x00E0, .match = 0x0040, .dir = Dir::Out, .when = kFullerA7A6A5, .port = 0x005F,
+      .channel = Channel::Indexed, .input = InputRole::AyIo, .channelName = "reg" },
+    { .mask = 0x00E0, .match = 0x0060, .dir = Dir::In, .when = kFullerA7A6A5, .port = 0x007F,
+      .input = InputRole::FullerJoystick },
+};
+
+constexpr FunctionUse kFullerFunctions[] = {
+    { .function = Function::FullerAy },
+    { .function = Function::FullerJoystick },
+};
+
+constexpr OptionDef kFullerOptions[] = {
+    { .key = Opt::Decode, .kind = OptionKind::Enum, .values = kFullerDecodeValues, .defaultBits = Bit(0),
+      .description = "port decode: the full low byte, or A7-A5 only (no schematic survives)" },
+};
+
+constexpr Src kFullerSources[] = { Src::FuseFuller, Src::MameFuller, Src::ZxspFullerBox, Src::RepoSlotsResearchCards };
+
+// endregion
+
+// region <amx-mouse (controller manager research-retro-hardware.md §2.2): a Z80 PIO on A7 = 0, buttons on #DF, IM 2>
+
+constexpr OptionValue kAmxDecodeValues[] = {
+    { "a7", "A7-A5 (schematic)" }, { "full-low", "full low byte" },
+};
+constexpr When kAmxA7{ Opt::Decode, Bit(0) };
+constexpr When kAmxFullLow{ Opt::Decode, Bit(1) };
+
+constexpr PortClaim kAmxClaims[] = {
+    // The PIO: /CE = A7, B/A = A5, C/D = A6 (data A #1F, data B #3F, control A #5F, control B #7F)
+    { .mask = 0x00E0, .match = 0x0000, .dir = Dir::InOut, .when = kAmxA7, .port = 0x001F, .input = InputRole::AmxMouse },
+    { .mask = 0x00E0, .match = 0x0020, .dir = Dir::InOut, .when = kAmxA7, .port = 0x003F, .input = InputRole::AmxMouse },
+    { .mask = 0x00E0, .match = 0x0040, .dir = Dir::Out, .when = kAmxA7, .port = 0x005F, .input = InputRole::AmxMouse },
+    { .mask = 0x00E0, .match = 0x0060, .dir = Dir::Out, .when = kAmxA7, .port = 0x007F, .input = InputRole::AmxMouse },
+    // The buttons: A7 = 1, A6 = 1, A5 = 0 with /RD
+    { .mask = 0x00E0, .match = 0x00C0, .dir = Dir::In, .when = kAmxA7, .port = 0x00DF, .input = InputRole::AmxMouse },
+    { .mask = 0x00FF, .match = 0x001F, .dir = Dir::InOut, .when = kAmxFullLow, .input = InputRole::AmxMouse },
+    { .mask = 0x00FF, .match = 0x003F, .dir = Dir::InOut, .when = kAmxFullLow, .input = InputRole::AmxMouse },
+    { .mask = 0x00FF, .match = 0x005F, .dir = Dir::Out, .when = kAmxFullLow, .input = InputRole::AmxMouse },
+    { .mask = 0x00FF, .match = 0x007F, .dir = Dir::Out, .when = kAmxFullLow, .input = InputRole::AmxMouse },
+    { .mask = 0x00FF, .match = 0x00DF, .dir = Dir::In, .when = kAmxFullLow, .input = InputRole::AmxMouse },
+};
+
+constexpr FunctionUse kAmxFunctions[] = {
+    { .function = Function::AmxMouse },
+};
+
+constexpr OptionDef kAmxOptions[] = {
+    { .key = Opt::Decode, .kind = OptionKind::Enum, .values = kAmxDecodeValues, .defaultBits = Bit(0),
+      .description = "port decode: the schematic's partial decode (A7, A6, A5), or the documented ports only" },
+};
+
+constexpr Src kAmxSources[] = { Src::VelesoftAmxSchematic, Src::SinclairWikiAmx, Src::LunterAmxNotes,
+                                Src::ZilogUm0081, Src::MameZ80Pio };
+
+// endregion
+
+// region <kempston: the Kempston joystick interface on the Sinclair edge (KempstonCard: kempstoncard.h)>
+
+// Issue 4: A7-A5 = 000 by a 74LS138 with /RD and /M1 = 1 (zxsp, MAME); the early boards decode A5 alone (Sinc Times).
+// Read only, no IORQGE. Gated outside DOS: behind a Beta 128 the interface sees no cycle while TR-DOS is paged in
+// (MAME beta128.cpp), as the Pentagon's built-in
+constexpr OptionValue kKempstonDecodeValues[] = {
+    { "a7a6a5", "A7-A5 = 000 (issue 4)" }, { "a5", "A5 = 0 only (early boards)" },
+};
+
+constexpr PortClaim kKempstonCardClaims[] = {
+    { .mask = 0x00E0, .match = 0x0000, .dir = Dir::In, .gate = Gate::NonDos, .when = { Opt::Decode, Bit(0) },
+      .port = 0x001F, .input = InputRole::KempstonJoystick },
+    { .mask = 0x0020, .match = 0x0000, .dir = Dir::In, .gate = Gate::NonDos, .when = { Opt::Decode, Bit(1) },
+      .port = 0x001F, .input = InputRole::KempstonJoystick },
+};
+
+constexpr FunctionUse kKempstonCardFunctions[] = {
+    { .function = Function::KempstonJoystick },
+};
+
+constexpr OptionDef kKempstonCardOptions[] = {
+    { .key = Opt::Decode, .kind = OptionKind::Enum, .values = kKempstonDecodeValues, .defaultBits = Bit(0),
+      .description = "port decode: A7-A5 (issue 4, 74LS138), or A5 alone (the early boards)" },
+};
+
+constexpr Src kKempstonCardSources[] = { Src::ZxspKempstonJoy, Src::MameKempjoy, Src::SincTimesKempston,
+                                         Src::MameBeta128 };
+
+// endregion
+
 constexpr CardDef kCards[] = {
     { .id = "ay", .name = "machine's own AY (socket default)", .bus = BusKind::AySocket, .needs = kNone,
       .socketDefault = true, .portsNote = "host decode",
@@ -278,6 +385,14 @@ constexpr CardDef kCards[] = {
     { .id = "soundrive", .name = "SounDrive 1.05", .bus = BusKind::ZxBus, .needs = kNone,
       .options = kSoundriveOptions, .functions = kSoundriveFunctions, .claims = kSoundriveClaims,
       .sources = kSoundriveSources },
+    { .id = "fuller-box", .name = "Fuller Box (AY + joystick)", .bus = BusKind::SinclairEdge, .needs = kNone,
+      .options = kFullerOptions, .functions = kFullerFunctions, .claims = kFullerClaims, .sources = kFullerSources },
+    { .id = "amx-mouse", .name = "AMX mouse (Z80 PIO interface)", .bus = BusKind::SinclairEdge,
+      .needs = BusSignal::Int | BusSignal::M1, .options = kAmxOptions, .functions = kAmxFunctions,
+      .claims = kAmxClaims, .sources = kAmxSources },
+    { .id = "kempston", .name = "Kempston joystick interface", .bus = BusKind::SinclairEdge, .needs = kNone,
+      .options = kKempstonCardOptions, .functions = kKempstonCardFunctions, .claims = kKempstonCardClaims,
+      .sources = kKempstonCardSources },
     { .id = "multisound", .name = "ZX-MultiSound rev.A2", .bus = BusKind::ZxBus,
       .needs = BusSignal::Iorqge | BusSignal::Plus12V, .detection = CycleDetection::RdWr,
       .options = kMultisoundOptions, .functions = kMultisoundFunctions, .claims = kMultisoundClaims,

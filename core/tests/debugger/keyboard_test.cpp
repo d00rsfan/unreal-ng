@@ -104,6 +104,15 @@ TEST_F(DebugKeyboardManager_test, ResolveKeyName_SpecialKeys)
     EXPECT_EQ(key, ZXKEY_SYM_SHIFT);
 }
 
+/// The long shift names come in pairs: a script that sends caps_shift may send symbol_shift too
+TEST_F(DebugKeyboardManager_test, ResolveKeyName_ShiftNamePairs)
+{
+    EXPECT_EQ(DebugKeyboardManager::ResolveKeyName("caps_shift"), ZXKEY_CAPS_SHIFT);
+    EXPECT_EQ(DebugKeyboardManager::ResolveKeyName("symbol_shift"), ZXKEY_SYM_SHIFT);
+    EXPECT_EQ(DebugKeyboardManager::ResolveKeyName("SYMBOL_SHIFT"), ZXKEY_SYM_SHIFT);
+    EXPECT_FALSE(DebugKeyboardManager::IsKnownKeyName("symbolshift_x")) << "an unknown name is refused, not dropped";
+}
+
 TEST_F(DebugKeyboardManager_test, ResolveKeyName_InvalidKey)
 {
     auto key = DebugKeyboardManager::ResolveKeyName("invalid_key");
@@ -344,6 +353,45 @@ TEST_F(DebugKeyboardManager_test, OnFrame_TypeTextCompletes)
         _keyboardManager->OnFrame();
     }
     
+    EXPECT_FALSE(_keyboardManager->IsSequenceRunning());
+}
+
+namespace
+{
+    // Runs the queued sequence to its end; counts the frames ENTER goes down
+    int CountEnterPresses(DebugKeyboardManager* keys)
+    {
+        int presses = 0;
+        bool wasDown = false;
+        for (int i = 0; i < 200 && keys->IsSequenceRunning(); i++)
+        {
+            keys->OnFrame();
+            const bool down = keys->IsKeyPressed(ZXKEY_ENTER);
+            if (down && !wasDown)
+                presses++;
+            wasDown = down;
+        }
+        return presses;
+    }
+}
+
+TEST_F(DebugKeyboardManager_test, TypeText_LineEndPressesEnter)
+{
+    EXPECT_TRUE(_keyboardManager->TypeText("G,,1:TEST\n", 1).empty());
+    EXPECT_EQ(CountEnterPresses(_keyboardManager), 1);
+}
+
+TEST_F(DebugKeyboardManager_test, TypeText_CrLfIsOneEnter)
+{
+    EXPECT_TRUE(_keyboardManager->TypeText("A\r\nB\rC\n", 1).empty());
+    EXPECT_EQ(CountEnterPresses(_keyboardManager), 3);
+}
+
+TEST_F(DebugKeyboardManager_test, TypeText_UntypeableCharacterRefusesTheWholeText)
+{
+    const std::string untypeable = _keyboardManager->TypeText("A\tB~", 1);
+
+    EXPECT_EQ(untypeable, std::string("\t~"));
     EXPECT_FALSE(_keyboardManager->IsSequenceRunning());
 }
 

@@ -32,6 +32,14 @@ Even on the MCP path, endpoints without a smart tool go through the
 | Best for | scripts, CI, curl/jq one-liners, full WebAPI surface | LLM agents, IDEs, intent-level calls, local-file upload |
 | Auth | none | none |
 | Sessions | none (state lives in emulator instances) | none (no `Mcp-Session-Id`, fully stateless) |
+| Run control | `POST .../control/session`, its id in `X-Unreal-Session`; without one a change opens an implicit session (15 s lease) | `control_execution take_control` / `release_control`; without it the same implicit session, the MCP server's own |
+
+**Both planes on one emulator** (a host script over the WebAPI and an agent over MCP): one session holds run
+control, and another client's change is refused `held_by_other`; its `message` and `holder` (`implicit`,
+`lease_seconds_left`) say who holds it and what to do. Take control explicitly once, on the MCP side
+(`take_control`; the MCP server cannot adopt a script's id): that takes over the script's implicit session. Then
+send its id (in the take's reply) from the script as `X-Unreal-Session`. `DELETE .../control/session` without the header ends a client's own
+implicit session; `GET .../control/session` shows its id (`session`) only to that client.
 
 ## WebAPI idioms
 
@@ -53,12 +61,11 @@ curl -s -X PUT "$BASE/emulator/$EMU_ID/feature/porttrace" \
 Error envelope (same everywhere):
 
 ```json
-{ "error": "Conflict", "message": "Cannot insert a tape while TTD is recording: … stop the recording first." }
+{ "error": "Conflict", "message": "This action is not allowed while TTD is recording. Stop the recording first." }
 ```
 
 HTTP codes carry meaning: `400` bad body/state, `404` unknown instance,
-`409` lifecycle conflict (TTD scrub while recording on `backend: v1` - the
-engine pauses the recording instead; buffer reconfig while capturing), `501`
+`409` lifecycle conflict (buffer reconfig while capturing), `501`
 build lacks the subsystem.
 
 Interactive endpoint browser: `http://localhost:8090/api/v1/openapi.json`
@@ -83,20 +90,29 @@ Every tool answers **dual content**: `content[]` (human/LLM summary) plus
 returns). Tool-level failures are `isError: true` results with remediation
 hints, not JSON-RPC errors.
 
+**Keep answers short with `max_chars`.** Any tool takes `"max_chars": 2000`
+(500 or more): the answer fits in that many characters, keeps its first lines
+and the last ones, and one line says what was left out and how to get it
+(`... 230 of 260 lines (17,412 chars) left out for max_chars=2000; narrow the
+call or raise max_chars`); JSON loses the tail of its biggest arrays and says so in
+`truncated`. Use it on reads whose size you cannot guess (a memory read, a
+disassembly, a label list, a trace) instead of reading everything and asking
+again. REST and WebSocket calls take `?max_chars=2000` the same way.
+
 Tool catalog (16: 14 smart tools + the 2 router tools):
 
 | Tool | Highlights |
 |:--|:--|
 | `emulator_manage` | create/list/status/start/stop/pause/resume/reset/destroy, `list_models`, `server` |
 | `load_software` | snapshots/tapes/disks, `play`, `autostart`, local-file upload |
-| `control_execution` | run/pause/resume/step/step_n/step_over/step_out, run_frame/run_frames/run_tstates/run_to_interrupt, breakpoints (bp_add/remove/enable/disable/clear/list) |
+| `control_execution` | run/pause/resume/step/step_n/step_over/step_out, run_frame/run_frames/run_tstates/run_to_interrupt, run_until (frame-end rules: condition, text, screen, event), watch_add/list/remove, wait, breakpoints (bp_add/remove/enable/disable/clear/list) |
 | `inspect_state` | aspects: machine (identity, `ram_kb`), registers, memory, memory_map, disasm, stack, breakpoints, memory_banks, paging, ports, video, screen, screen_flash, screen_attributes, screen_ocr/image/digest, timing, video_layout, video_text, rom, audio_ay/fm/gs/covox/moonsound/opl4_fm/opl4_pcm, audio_mixer, fdc, ide, cdaudio, rtc, isa, network, mouse, ttd (TTD status + position), contention, tsconf, tsconf_tsu, sprinter, sprinter_ports/text/video/palette/sound_ring/bios/zx_mode/pld_journal, memory_region, video_changes |
 | `type_input` | type (`tokenized`: a BASIC line typed into the ROM editor, every key verified, no ENTER; BASIC commands with ENTER and a result: `basic/run` via `invoke_api`), tap/press/release, combo, macro, release_all, list_keys |
 | `mouse_input` | Kempston move/press/click/wheel |
 | `joystick_input` | Kempston joystick press/release/set/tap/status |
 | `media` | media slots by slot name: list, info, insert, eject, swap, save, export and more (see [use-media-slots.md](../media/use-media-slots.md)) |
 | `rzx_playback` | RZX input recordings: play / stop / status |
-| `time_travel` | status, start/stop/invalidate, position, markers, seek, step_back/forward_frame, step_back/forward_instruction, reverse_step, reverse_continue, find_last, resume, dump/load, bookmark_add/list/delete, seek_bookmark, coverage_probe/scan/summary, port_events, file_info, history_limit, journal_on/off, journal_build, export_clip |
+| `time_travel` | status, start/stop/invalidate, position, markers, seek, step_back/forward_frame, step_back/forward_instruction, reverse_step, reverse_continue, find_last, resume, dump/load, bookmark_add/list/note/export/delete, seek_bookmark, coverage_probe/scan/summary, port_events, file_info, history_limit, journal_on/off, journal_build, export_clip |
 | `manage_symbols` | labels + sjasmplus listings, step_line, run_to_line |
 | `debug_code` | disassemble, assemble, find_bytes, trace (calltrace) |
 | `analyze_performance` | coverage_*, frame_cost, profiler suites, porttrace |

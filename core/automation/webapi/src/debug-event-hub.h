@@ -23,6 +23,9 @@ class DebugEventHub
 public:
     /// Sends one text message to a client (thread-safe; a closed client ignores it)
     using Send = std::function<void(const std::string& text)>;
+    /// Gets every event, numbered, as published (the `debug.*` topics of /api/v1/ws, WsHub): `topic` is "debug" or
+    /// "asm_sync". Called on the producer's thread with the hub's lock held: it must only queue
+    using Sink = std::function<void(const std::string& topic, const Json::Value& event)>;
 
     static DebugEventHub& Instance();
 
@@ -32,7 +35,8 @@ public:
     DebugEventHub& operator=(const DebugEventHub&) = delete;
 
     /// Follow the core's notifications (idempotent): NC_EMULATOR_STATE_CHANGE, NC_EXECUTION_CPU_STEP,
-    /// NC_BREAKPOINTS_CHANGED on the default MessageCenter
+    /// NC_BREAKPOINTS_CHANGED, NC_SCRIPT_CALLBACKS_CHANGED, NC_FRAME_WATCH, NC_SECTION_TIMER, NC_ASM_SYNC on the default
+    /// MessageCenter
     void Start();
     void Stop();
 
@@ -42,6 +46,10 @@ public:
     void HandleMessage(const void* client, const std::string& text, const Send& send);
     /// The connection closed: drop its subscriptions
     void RemoveClient(const void* client);
+
+    /// Adds a sink (returns its id); RemoveSink returns once no call of it runs
+    uint64_t AddSink(Sink sink);
+    void RemoveSink(uint64_t id);
 
     /// The topics this build publishes; a subscription naming others is told so in its reply
     static const std::set<std::string>& PublishedTopics();
@@ -62,6 +70,14 @@ private:
     void OnStateChange(Message* message);
     void OnCpuStep(Message* message);
     void OnBreakpointsChanged(Message* message);
+    void OnScriptCallbacksChanged(Message* message);  // NC_SCRIPT_CALLBACKS_CHANGED: callbacks_changed on debug
+    void OnFrameWatch(Message* message);              // NC_FRAME_WATCH: watch_hit / _added / _removed / _error on debug
+    void OnSectionTimer(Message* message);  // NC_SECTION_TIMER: section_timer_started / _stopped / _cleared / _break
+    void OnEdited(Message* message);          // NC_DEBUG_EDITED: edited (a tool's edit of the machine went through)
+    void OnRunControl(Message* message);      // NC_RUN_CONTROL_CHANGED: run_control (a session took / lost control)
+    void OnLabelsChanged(Message* message);   // NC_LABEL_CHANGED: labels_changed
+    void OnTargetsChanged(Message* message);  // NC_DEBUG_TARGETS_CHANGED: targets_changed (a card CPU came or went)
+    void OnAsmSync(Message* message);   // NC_ASM_SYNC: topic asm_sync
 
     /// Numbers the event (per emulator), then sends it to every matching subscription
     void Publish(const std::string& emulatorId, const std::string& topic, Json::Value event);
@@ -70,5 +86,7 @@ private:
     std::mutex _mutex;
     std::map<const void*, Client> _clients;
     std::map<std::string, uint64_t> _seq;  // the last event number per emulator
+    std::map<uint64_t, Sink> _sinks;
+    uint64_t _nextSink = 1;
     std::vector<std::pair<std::string, uint64_t>> _observers;  // topic, observer id
 };

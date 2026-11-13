@@ -1,9 +1,14 @@
 #include "stdafx.h"
 #include "pch.h"
 
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <thread>
 #include <vector>
 
+#include "_helpers/testthread.h"
+#include "_helpers/testwaithelper.h"
 #include "common/sound/audioringbuffer.h"
 
 /// AudioRingBuffer tests (audio-sync design, Fix 2 groundwork):
@@ -76,33 +81,39 @@ TEST(AudioRingBuffer_Test, SPSC_ConcurrentIntegrity)
     // consumer must observe a strictly sequential stream with no tears,
     // duplications, or gaps. Exercises the acquire/release index protocol
     // (previously plain size_t - an actual data race).
-    static AudioRingBuffer<int16_t, 4096> ring;
+    // Bounded on every path: a broken sequence stops the producer (it would
+    // spin on a full ring forever and the join would hang the run), a ring
+    // that stops delivering fails after the deadline, and each run (also a
+    // --gtest_repeat one) starts from an empty ring of its own.
+    auto ring = std::make_unique<AudioRingBuffer<int16_t, 4096>>();
     constexpr int TOTAL = 200000;
+    std::atomic<bool> stop{false};
 
-    std::thread producer([&]() {
+    TestThread producer([&]() {
         int16_t value = 0;
         int produced = 0;
         int16_t chunk[128];
-        while (produced < TOTAL)
+        while (produced < TOTAL && !stop.load(std::memory_order_relaxed))
         {
             int n = std::min(128, TOTAL - produced);
             for (int i = 0; i < n; i++)
                 chunk[i] = static_cast<int16_t>(value + i);
-            size_t written = ring.enqueue(chunk, n);
+            size_t written = ring->enqueue(chunk, n);
             value = static_cast<int16_t>(value + written);
             produced += static_cast<int>(written);
             if (written == 0)
                 std::this_thread::yield();
         }
-    });
+    }, [&] { stop = true; });
 
     int consumed = 0;
     int16_t expected = 0;
     bool sequenceOk = true;
     int16_t chunk[128];
-    while (consumed < TOTAL)
+    const auto deadline = std::chrono::steady_clock::now() + TestWait::Scaled(std::chrono::seconds(10));
+    while (consumed < TOTAL && std::chrono::steady_clock::now() < deadline)
     {
-        size_t got = ring.dequeue(chunk, 128);
+        size_t got = ring->dequeue(chunk, 128);
         for (size_t i = 0; i < got; i++)
         {
             if (chunk[i] != expected)
@@ -119,8 +130,8 @@ TEST(AudioRingBuffer_Test, SPSC_ConcurrentIntegrity)
             std::this_thread::yield();
     }
 
-    producer.join();
-    EXPECT_TRUE(sequenceOk) << "SPSC stream must be strictly sequential (no tears/gaps)";
+    producer.Join();
+    EXPECT_TRUE(sequenceOk) << "SPSC stream must be strictly sequential (no tears/gaps), broke after " << consumed;
     EXPECT_EQ(consumed, TOTAL);
 }
 
@@ -160,4 +171,26 @@ TEST(AudioRingBuffer_Test, DiscardAdvancesReadPointer)
     // Discard beyond occupancy clamps to what exists
     EXPECT_EQ(ring.discard(100000), 396u);
     EXPECT_EQ(ring.getOccupancyStereoFrames(), 0u);
+}
+
+/// The stream positions the audio clock maps to time: written counts what got in, read counts
+/// everything that left (played, discarded by a hard resync, dropped by clear)
+TEST(AudioRingBuffer_Test, LifetimeStreamPositions)
+{
+    AudioRingBuffer<int16_t, 64> ring;
+    int16_t samples[80] = {0};
+
+    EXPECT_EQ(ring.enqueue(samples, 40), 40u);  // 20 frames
+    EXPECT_EQ(ring.enqueue(samples, 40), 23u);  // full: 63 samples fit, 23 of these
+    EXPECT_EQ(ring.getWrittenStereoFrames(), 31u) << "only what got in; 63 samples, frame units round down";
+
+    int16_t out[80];
+    EXPECT_EQ(ring.dequeue(out, 20), 20u);
+    EXPECT_EQ(ring.getReadStereoFrames(), 10u);
+    EXPECT_EQ(ring.discard(10), 10u);
+    EXPECT_EQ(ring.getReadStereoFrames(), 15u);
+    ring.clear();
+    EXPECT_EQ(ring.getReadStereoFrames(), ring.getWrittenStereoFrames()) << "clear drops the rest";
+    EXPECT_EQ(ring.dequeue(out, 20), 0u) << "an underrun reads nothing";
+    EXPECT_EQ(ring.getReadStereoFrames(), ring.getWrittenStereoFrames());
 }

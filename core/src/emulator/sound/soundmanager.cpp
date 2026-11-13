@@ -1,8 +1,11 @@
 #include "soundmanager.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
+#include "emulator/sound/chips/ayhistory.h"
+#include "emulator/readoutschanged.h"
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "base/featuremanager.h"
 #include "common/dumphelper.h"
@@ -11,6 +14,7 @@
 #include "common/stringhelper.h"
 #include "debugger/analyzers/analyzermanager.h"  // Analyzer audio tap (MCP automation)
 #include "debugger/debugmanager.h"
+#include "emulator/coordinator/ports.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/io/ide/ata/cdaudioplayer.h"
@@ -102,6 +106,17 @@ SoundManager::SoundManager(EmulatorContext* context)
             _turboSound = new SoundChip_TurboSound(_context);
             break;
     }
+    // The AY history: one per machine whatever device takes the AY ports, named by the registry (the slot plan is
+    // made before the sound manager); a machine whose registry has the AY ports gets it without the TurboSound slot
+    // device too (the Next's three AYs, NextAudio, write into it)
+    if (_turboSound || AYHistoryDeclared(_context))
+    {
+        _ayHistory = std::make_unique<AYHistory>([context = _context]() { return AYHistoryDevice(context); },
+                                                 "AY register writes", kAYHistoryRing);
+        _context->histories.Add(_ayHistory.get());
+        if (_turboSound)
+            _turboSound->setHistory(_ayHistory.get());
+    }
     if (_turboSound)
     {
         _turboSound->setDecimatorQuality(_context->config.sound.decimatorHighFidelity
@@ -114,6 +129,20 @@ SoundManager::SoundManager(EmulatorContext* context)
                 chip->setStereoMode(_context->config.sound.ayStereo);
         }
     }
+    // The AY socket's stereo mode and chip model as requested so far: what the chips start with
+    _requestedAYStereo.store(static_cast<uint8_t>(_context->config.sound.ayStereo), std::memory_order_relaxed);
+    _appliedAYStereo = static_cast<uint8_t>(_context->config.sound.ayStereo);
+    {
+        SoundChip_AY8910* chip0 = _turboSound ? _turboSound->getChip(0) : nullptr;
+        const AYChipModel model = chip0 && !_turboSound->hasFm() ? chip0->getChipModel() : AYChipModel::AY8910;
+        _requestedAYChipModel.store(static_cast<uint8_t>(model), std::memory_order_relaxed);
+        _appliedAYChipModel = static_cast<uint8_t>(model);
+    }
+    _appliedAYDevice = _turboSound;
+    // TSFM at the board's measured FM level: one chip's full FM word is 0.70 of full scale, two chips 1.4, with the
+    // SSGs up to 2.4 (TSFM ISSUES.md #6). The float bus and the master limiter own the master mix, as for MoonSound
+    if (_turboSound && _turboSound->hasFm())
+        enableWideMix(true);
 
     // Build the device registry based on what this machine has
     // Beeper is always present
@@ -156,8 +185,9 @@ SoundManager::SoundManager(EmulatorContext* context)
     // Covox / SoundDrive when either config flag is set. The same 4-channel
     // DAC class serves both: SD=1 wires the full SoundDrive quad (#F1/#F3/
     // #F9/#FB), CovoxFB=1 alone wires only the mono Covox port #FB
-    // (see attachToPorts)
-    if (_context->config.sound.covoxFB || _context->config.sound.sd)
+    // (see attachToPorts). CovoxDD=1 on a Scorpion fits the printer-port DAC (#DD) in the same device
+    if (_context->config.sound.covoxFB || _context->config.sound.sd ||
+        (_context->config.sound.covoxDD && Covox::PrinterDecodeOf(_context->config.mem_model).mask != 0))
     {
         _covox = new Covox(_context, _coreRate);
         _devices.push_back({AudioSourceType::COVOX, "COVOX", false, false, 1.0f, 0.0f, false});
@@ -189,6 +219,7 @@ SoundManager::SoundManager(EmulatorContext* context)
             gsKind = GSTypeKind::LW;
         }
         _gs = createGeneralSoundCard(gsKind);
+        attachGeneralSoundHistory();
         // The slot set names the personality the machine has (the TTD fingerprint and registry check follow it)
         if (_gs && gsKind != _context->config.sound.gsTypeKind && _context->pSlotManager)
             _context->pSlotManager->FollowGeneralSoundSwitch(gsKind);
@@ -263,6 +294,13 @@ SoundManager::SoundManager(EmulatorContext* context)
 
 SoundManager::~SoundManager()
 {
+    if (_ayHistory)
+        _context->histories.Remove(_ayHistory.get());
+    if (_gsHistory)
+        _context->histories.Remove(_gsHistory.get());
+    if (_gsExecHistory)
+        _context->histories.Remove(_gsExecHistory.get());
+
     if (_covox)
     {
         delete _covox;
@@ -312,7 +350,7 @@ void SoundManager::reset()
         _moonsound->reset();
 #endif
     // Slot-built cards: the ZX /RESET line is on their bus
-    for (ICard* card : _slotCards)
+    for (ICardAudio* card : _slotCards)
         card->BusReset();
 
     std::fill(_beeperBuffer, _beeperBuffer + AUDIO_BUFFER_SAMPLES_PER_FRAME, 0);
@@ -320,10 +358,13 @@ void SoundManager::reset()
     std::fill(_mixBus, _mixBus + AUDIO_BUFFER_SAMPLES_PER_FRAME, 0.0f);
     _limiter.Reset();
 
+    // Character chains: a machine reset / snapshot load is a gap in the stream
+    resetCharacterChains();
+
     // Voicing: clear filter state and pre-roll history (the profile stays)
     _ayVoicing0.reset();
     _ayVoicing1.reset();
-    for (CardVoicing& v : _cardVoicing)
+    for (CardSsgRow& v : _cardSsgRows)
         v.stage->reset();
 
     // Restart the exact sample accumulator (machine change / hard reset /
@@ -347,11 +388,15 @@ void SoundManager::enableWideMix(bool enable)
 
 void SoundManager::mute()
 {
+    if (!_mute)
+        NotifyReadoutsChanged(_context, "audio.mixer");  // the master mute a deck shows (audio.mute), paused too
     _mute = true;
 }
 
 void SoundManager::unmute()
 {
+    if (_mute)
+        NotifyReadoutsChanged(_context, "audio.mixer");
     _mute = false;
 }
 
@@ -367,6 +412,8 @@ const char* SoundManager::HostHoldReasonName(HostHoldReason reason)
             return "ttd_replay";
         case HostHoldReason::Turbo:
             return "turbo";
+        case HostHoldReason::Unpaced:
+            return "unpaced";
     }
     return "unknown";
 }
@@ -376,14 +423,14 @@ SoundManager::HostOutputHold::HostOutputHold(SoundManager* sound, HostHoldReason
     if (sound)
     {
         _epoch = sound->acquireHostHold(reason);
-        _sound = sound;
+        _sound.store(sound, std::memory_order_release);
     }
 }
 
 SoundManager::HostOutputHold::HostOutputHold(HostOutputHold&& other) noexcept
-    : _sound(other._sound), _reason(other._reason), _epoch(other._epoch)
+    : _reason(other._reason), _epoch(other._epoch)
 {
-    other._sound = nullptr;
+    _sound.store(other._sound.exchange(nullptr, std::memory_order_acq_rel), std::memory_order_release);
 }
 
 SoundManager::HostOutputHold& SoundManager::HostOutputHold::operator=(HostOutputHold&& other) noexcept
@@ -391,22 +438,17 @@ SoundManager::HostOutputHold& SoundManager::HostOutputHold::operator=(HostOutput
     if (this != &other)
     {
         Release();
-        _sound = other._sound;
         _reason = other._reason;
         _epoch = other._epoch;
-        other._sound = nullptr;
+        _sound.store(other._sound.exchange(nullptr, std::memory_order_acq_rel), std::memory_order_release);
     }
     return *this;
 }
 
 void SoundManager::HostOutputHold::Release()
 {
-    if (_sound)
-    {
-        SoundManager* sound = _sound;
-        _sound = nullptr;
+    if (SoundManager* sound = _sound.exchange(nullptr, std::memory_order_acq_rel))
         sound->releaseHostHold(_reason, _epoch);
-    }
 }
 
 uint32_t SoundManager::acquireHostHold(HostHoldReason reason)
@@ -442,9 +484,10 @@ bool SoundManager::isHostOutputHeld() const
     return false;
 }
 
-int SoundManager::reconcileHostOutputHolds(bool directRunActive, bool ttdReplayActive, bool turboActive)
+int SoundManager::reconcileHostOutputHolds(bool directRunActive, bool ttdReplayActive, bool turboActive,
+                                           bool unpacedActive)
 {
-    const bool active[kHostHoldReasons] = {directRunActive, ttdReplayActive, turboActive};
+    const bool active[kHostHoldReasons] = {directRunActive, ttdReplayActive, turboActive, unpacedActive};
     int dropped = 0;
     for (size_t i = 0; i < kHostHoldReasons; i++)
     {
@@ -479,6 +522,22 @@ void SoundManager::onEmulatorPaused()
         d.activeRecently = false;
     }
     _activityIndicators.stop(_context->emulatorId);
+}
+
+void SoundManager::beginReplayTelemetry()
+{
+    if (_gs && !_gsCountersBeforeReplay)
+        _gsCountersBeforeReplay = _gs->getActivityCounters();
+}
+
+void SoundManager::endReplayTelemetry()
+{
+    if (_gs && _gsCountersBeforeReplay)
+    {
+        _gs->resetActivityCounters();
+        _gs->accumulateActivityCounters(*_gsCountersBeforeReplay);
+    }
+    _gsCountersBeforeReplay.reset();
 }
 
 const AudioFrameDescriptor& SoundManager::getAudioBufferDescriptor()
@@ -576,9 +635,152 @@ const int16_t* SoundManager::deviceBuffer(AudioSourceType type) const
     }
 }
 
+bool SoundManager::hasDeviceBuffer(AudioSourceType type) const
+{
+    switch (type)
+    {
+        case AudioSourceType::AY1_All:
+        case AudioSourceType::AY2_All:
+            return _turboSound != nullptr;
+        case AudioSourceType::FM1:
+        case AudioSourceType::FM2:
+            return _turboSound && _turboSound->hasFm();
+        default:
+            return deviceBuffer(type) != nullptr;
+    }
+}
+
+/// region <Haptic taps>
+
+namespace
+{
+/// The part of a model audio source that is its DAC (the Next's), or -1
+/// The part of a machine's own sound device a tap reads alone, -1 for none: the part of that type; on a device with
+/// parts COVOX is its DAC part (NextDac) and the AY sockets' sources are its chips (the Next's three AYs)
+int ModelPartFor(const IModelAudioSource* model, AudioSourceType source)
+{
+    if (model == nullptr)
+        return -1;
+    AudioSourceType wanted = source;
+    if (source == AudioSourceType::COVOX)
+        wanted = AudioSourceType::NextDac;
+    else if (source == AudioSourceType::AY1_All)
+        wanted = AudioSourceType::NextAy1;
+    else if (source == AudioSourceType::AY2_All)
+        wanted = AudioSourceType::NextAy2;
+    else if (source == AudioSourceType::AY3_All)
+        wanted = AudioSourceType::NextAy3;
+    for (size_t part = 0; part < model->AudioPartCount(); part++)
+        if (model->AudioPartType(part) == wanted)
+            return static_cast<int>(part);
+    return -1;
+}
+}  // namespace
+
+void SoundManager::setHapticTaps(const std::vector<AudioSourceType>& sources)
+{
+    std::vector<HapticTapSource> specs;
+    for (AudioSourceType source : sources)
+        specs.push_back({source, AudioSourceType::Custom, -1});
+    setHapticTaps(specs);
+}
+
+void SoundManager::setHapticTaps(const std::vector<HapticTapSource>& sources)
+{
+    _hapticTaps.clear();
+    std::vector<bool> parts(_modelAudio != nullptr ? _modelAudio->AudioPartCount() : 0, false);
+    bool channels = false;
+    for (const HapticTapSource& source : sources)
+    {
+        HapticTap tap;
+        tap.source = source.source;
+        tap.also = source.also;
+        tap.dacChannel = source.dacChannel;
+        _hapticTaps.push_back(tap);
+        const int part = source.dacChannel < 0 ? ModelPartFor(_modelAudio, source.source) : -1;
+        if (part >= 0)
+            parts[static_cast<size_t>(part)] = true;
+        channels = channels || source.dacChannel >= 0;
+    }
+    for (size_t part = 0; part < parts.size(); part++)
+        _modelAudio->SetAudioPartTap(part, parts[part]);
+    if (_covox != nullptr)
+        _covox->SetChannelTap(channels);
+}
+
+const int16_t* SoundManager::hapticTap(size_t index, size_t& count) const
+{
+    count = 0;
+    if (index >= _hapticTaps.size())
+        return nullptr;
+    count = _hapticTaps[index].count;
+    return _hapticTaps[index].samples.data();
+}
+
+void SoundManager::takeHapticTaps()
+{
+    for (HapticTap& tap : _hapticTaps)
+        tap.count = 0;
+}
+
+void SoundManager::captureHapticTaps(size_t samplesThisFrame)
+{
+    const uint32_t rate = static_cast<uint32_t>(_coreRate);
+    for (HapticTap& tap : _hapticTaps)
+    {
+        tap.count = 0;
+        const int16_t* source = nullptr;
+        const int16_t* also = nullptr;
+        size_t stride = AUDIO_CHANNELS;
+        const int part = tap.dacChannel < 0 ? ModelPartFor(_modelAudio, tap.source) : -1;
+        if (tap.dacChannel >= 0)
+        {
+            source = _covox != nullptr && _modelAudio == nullptr ? _covox->ChannelTap(tap.dacChannel) : nullptr;
+            stride = 1;
+        }
+        else if (part >= 0)
+        {
+            source = _modelAudio->AudioPartTap(static_cast<size_t>(part));
+            stride = 1;
+        }
+        else if (tap.source != AudioSourceType::NextDac)
+        {
+            source = deviceBuffer(tap.source);
+            if (tap.also != AudioSourceType::Custom)
+                also = deviceBuffer(tap.also);
+            if (source == nullptr)
+                std::swap(source, also);
+        }
+        if (source == nullptr || samplesThisFrame == 0 || rate < kHapticTapRate)
+            continue;
+        // A box average down to kHapticTapRate: each input sample adds kHapticTapRate to the phase, an output is due
+        // each time it passes the core rate. Integers only: the same samples on every compiler
+        for (size_t i = 0; i < samplesThisFrame; i++)
+        {
+            int32_t mono = stride == 1 ? source[i]
+                                       : (static_cast<int32_t>(source[i * stride]) + source[i * stride + 1]) / 2;
+            if (also != nullptr)
+                mono = std::clamp<int32_t>(
+                    mono + (static_cast<int32_t>(also[i * stride]) + also[i * stride + 1]) / 2, -32768, 32767);
+            tap.sum += mono;
+            tap.summed++;
+            tap.phase += kHapticTapRate;
+            if (tap.phase < rate)
+                continue;
+            tap.phase -= rate;
+            if (tap.count < tap.samples.size())
+                tap.samples[tap.count++] = static_cast<int16_t>(tap.sum / static_cast<int32_t>(tap.summed));
+            tap.sum = 0;
+            tap.summed = 0;
+        }
+    }
+}
+
+/// endregion </Haptic taps>
+
 const int16_t* SoundManager::slotCardBuffer(AudioSourceType type) const
 {
-    for (const ICard* card : _slotCards)
+    for (const ICardAudio* card : _slotCards)
     {
         if (const int16_t* buffer = card->MixerBuffer(type))
             return buffer;
@@ -588,14 +790,16 @@ const int16_t* SoundManager::slotCardBuffer(AudioSourceType type) const
 
 bool SoundManager::wideMixNeeded() const
 {
+    if (_turboSound && _turboSound->hasFm())
+        return true;
 #ifdef UNREALNG_HAVE_OPL4
     if (_moonsound)
         return true;
 #endif
-    return std::any_of(_slotCards.begin(), _slotCards.end(), [](const ICard* card) { return card->WantsWideMix(); });
+    return std::any_of(_slotCards.begin(), _slotCards.end(), [](const ICardAudio* card) { return card->WantsWideMix(); });
 }
 
-void SoundManager::attachSlotCard(ICard* card)
+void SoundManager::attachSlotCard(ICardAudio* card)
 {
     if (!card || std::find(_slotCards.begin(), _slotCards.end(), card) != _slotCards.end())
         return;
@@ -606,18 +810,21 @@ void SoundManager::attachSlotCard(ICard* card)
     for (const CardMixerRow& row : rows)
     {
         _devices.push_back({row.type, row.name, false, false, 1.0f, 0.0f, false});
-        if (row.ssgVoicing)
+        if (row.ssgRow)
         {
             // The AY / SSG tone voicing the socket's chips run, at the same profile (requested one: a change in
-            // flight lands on every stage at the next frame)
-            CardVoicing v;
+            // flight lands on every stage at the next frame), then their character chain at the same settings
+            CardSsgRow v;
             v.card = card;
             v.type = row.type;
             v.stage = std::make_unique<VoicingStage>(MAX_SAMPLES_PER_FRAME);
             v.stage->setup(static_cast<double>(_coreRate));
             v.stage->setPresetImmediate(_ayVoicing0.requested());
+            v.chain = std::make_unique<AudioCharacterChain>();
+            v.chain->setup(static_cast<double>(_coreRate));
+            configureCardChain(*v.chain);
             v.renderEpoch = card->RenderEpoch();
-            _cardVoicing.push_back(std::move(v));
+            _cardSsgRows.push_back(std::move(v));
         }
     }
     // Several full-scale sources: the float bus and the master limiter own the master mix while the card is fitted
@@ -625,13 +832,13 @@ void SoundManager::attachSlotCard(ICard* card)
         enableWideMix(true);
 }
 
-void SoundManager::detachSlotCard(ICard* card)
+void SoundManager::detachSlotCard(ICardAudio* card)
 {
     const auto it = std::find(_slotCards.begin(), _slotCards.end(), card);
     if (it == _slotCards.end())
         return;
     _slotCards.erase(it);
-    std::erase_if(_cardVoicing, [card](const CardVoicing& v) { return v.card == card; });
+    std::erase_if(_cardSsgRows, [card](const CardSsgRow& v) { return v.card == card; });
     std::vector<CardMixerRow> rows;
     card->MixerRows(rows);
     for (const CardMixerRow& row : rows)
@@ -687,14 +894,20 @@ void SoundManager::syncCdAudioDevices()
 
 void SoundManager::setDeviceMute(AudioSourceType type, bool mute)
 {
-    if (auto* d = device(type))
+    if (auto* d = device(type); d != nullptr && d->mute != mute)
+    {
         d->mute = mute;
+        NotifyReadoutsChanged(_context, "audio.mixer");
+    }
 }
 
 void SoundManager::setDeviceSolo(AudioSourceType type, bool solo)
 {
-    if (auto* d = device(type))
+    if (auto* d = device(type); d != nullptr && d->solo != solo)
+    {
         d->solo = solo;
+        NotifyReadoutsChanged(_context, "audio.mixer");
+    }
 }
 
 bool SoundManager::setFmTrimDb(double db)
@@ -705,7 +918,7 @@ bool SoundManager::setFmTrimDb(double db)
         _turboSound->setFmTrimDb(db);
         any = true;
     }
-    for (ICard* card : _slotCards)
+    for (ICardAudio* card : _slotCards)
         any = card->SetFmTrimDb(db) || any;
     return any;
 }
@@ -717,7 +930,7 @@ bool SoundManager::fmTrimDb(double& db) const
         db = _turboSound->fmTrimDb();
         return true;
     }
-    for (const ICard* card : _slotCards)
+    for (const ICardAudio* card : _slotCards)
         if (card->FmTrimDb(db))
             return true;
     return false;
@@ -726,7 +939,42 @@ bool SoundManager::fmTrimDb(double& db) const
 void SoundManager::setDeviceVolume(AudioSourceType type, float volume)
 {
     if (auto* d = device(type))
-        d->volume = std::clamp(volume, 0.0f, 1.0f);
+    {
+        const float next = std::clamp(volume, 0.0f, 1.0f);
+        if (d->volume != next)
+            NotifyReadoutsChanged(_context, "audio.mixer");
+        d->volume = next;
+    }
+}
+
+void SoundManager::resetCharacterChains()
+{
+    _ayChain0.reset();
+    _ayChain1.reset();
+    _fmChain0.reset();
+    _fmChain1.reset();
+    _beeperChain.reset();
+    for (CardSsgRow& v : _cardSsgRows)
+        v.chain->reset();
+}
+
+void SoundManager::resetVoicing()
+{
+    _ayVoicing0.reset();
+    _ayVoicing1.reset();
+    for (CardSsgRow& v : _cardSsgRows)
+        v.stage->reset();
+}
+
+void SoundManager::onStateRestored()
+{
+    // The deltas of the timeline that was left never reach a frame end: drop them now (a search restores and
+    // replays one frame many times, each pass adding its deltas again until the integrator overflows)
+    if (_beeper)
+        _beeper->discardPending();
+    if (_covox)
+        _covox->discardPending();
+    _stateRestored.store(true, std::memory_order_release);
 }
 
 void SoundManager::syncAYChainSettings()
@@ -743,13 +991,25 @@ void SoundManager::syncAYChainSettings()
     _appliedAYRoom = static_cast<uint8_t>(_ayChain0.getRoomMode());
     _requestedAYPunch.store(_appliedAYPunch, std::memory_order_release);
     _requestedAYRoom.store(_appliedAYRoom, std::memory_order_release);
+
+    for (CardSsgRow& v : _cardSsgRows)
+        configureCardChain(*v.chain);
+}
+
+void SoundManager::configureCardChain(AudioCharacterChain& chain) const
+{
+    // Chip type before the room mode (setRoomMode derives the room from it)
+    chain.setChipType(_ayChain0.getChipType());
+    chain.setPunchPreset(_ayChain0.getPunchPreset());
+    chain.setPunchEnabled(_ayChain0.isPunchEnabled());
+    chain.setRoomMode(_ayChain0.getRoomMode());
 }
 
 void SoundManager::setAYVoicing(FilterVoicing::Preset preset)
 {
     _ayVoicing0.request(preset);
     _ayVoicing1.request(preset);
-    for (CardVoicing& v : _cardVoicing)
+    for (CardSsgRow& v : _cardSsgRows)
         v.stage->request(preset);
 }
 
@@ -775,6 +1035,8 @@ void SoundManager::applyCharacterRequests()
     {
         _ayChain0.setPunchEnabled(ayPunch);
         _ayChain1.setPunchEnabled(ayPunch);
+        for (CardSsgRow& v : _cardSsgRows)
+            v.chain->setPunchEnabled(ayPunch);
         _appliedAYPunch = ayPunch;
     }
 
@@ -784,6 +1046,8 @@ void SoundManager::applyCharacterRequests()
         const auto mode = static_cast<AudioCharacterChain::RoomMode>(ayRoom);
         _ayChain0.setRoomMode(mode);
         _ayChain1.setRoomMode(mode);
+        for (CardSsgRow& v : _cardSsgRows)
+            v.chain->setRoomMode(mode);
         _appliedAYRoom = ayRoom;
     }
 
@@ -812,6 +1076,24 @@ void SoundManager::setBeeperVolume(double volume)
 /// endregion </Methods>
 
 /// region <Emulation events>
+uint64_t SoundManager::addFrameAudioTap(FrameAudioTap tap)
+{
+    std::lock_guard<std::mutex> lock(_frameAudioTapMutex);
+    const uint64_t id = _nextFrameAudioTapId++;
+    _frameAudioTaps.emplace_back(id, std::move(tap));
+    _frameAudioTapCount.store(_frameAudioTaps.size(), std::memory_order_release);
+    return id;
+}
+
+void SoundManager::removeFrameAudioTap(uint64_t id)
+{
+    std::lock_guard<std::mutex> lock(_frameAudioTapMutex);
+    _frameAudioTaps.erase(std::remove_if(_frameAudioTaps.begin(), _frameAudioTaps.end(),
+                                         [id](const auto& entry) { return entry.first == id; }),
+                          _frameAudioTaps.end());
+    _frameAudioTapCount.store(_frameAudioTaps.size(), std::memory_order_release);
+}
+
 void SoundManager::requestCoreRate(uint32_t rate)
 {
     if (!IsSupportedCoreRate(rate))
@@ -866,7 +1148,7 @@ void SoundManager::applyCoreRate(size_t rate)
     if (_moonsound)
         _moonsound->setCoreRate(rate);
 #endif
-    for (ICard* card : _slotCards)
+    for (ICardAudio* card : _slotCards)
         card->SetOutputRate(static_cast<uint32_t>(rate));
 
     // AY: sample PLL increment, decimation ratios, anti-alias FIR redesign
@@ -887,8 +1169,11 @@ void SoundManager::applyCoreRate(size_t rate)
     // would pass a step); the pre-roll history holds old-rate samples and is dropped
     _ayVoicing0.setup(static_cast<double>(rate));
     _ayVoicing1.setup(static_cast<double>(rate));
-    for (CardVoicing& v : _cardVoicing)
+    for (CardSsgRow& v : _cardSsgRows)
+    {
         v.stage->setup(static_cast<double>(rate));
+        v.chain->setup(static_cast<double>(rate));
+    }
 
     // Restart the exact sample accumulator - its residue is in old-rate units
     _sampleAccumulator = 0;
@@ -908,6 +1193,17 @@ void SoundManager::applyCoreRate(size_t rate)
 
 void SoundManager::handleFrameStart()
 {
+    _emulationThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+
+    // The TTD render pin first (ITurboSoundDevice::setTtdRenderPinned): bound to a timeline, the device changes its
+    // render mode only at its frame start (a recording) or not at all (a replay), whatever the settings below ask.
+    // Then the turbo low-quality override, set on whatever thread toggled turbo (setTurboLowQualityOverride)
+    if (_turboSound)
+    {
+        _turboSound->setTtdRenderPinned(ttdPinsTurboSoundRender(), ttdRecordsTurboSoundRender());
+        _turboSound->setHQEnabled(isHQActive());
+    }
+
     // Apply a pending live core-rate change at the frame boundary (the
     // emulation thread owns all DSP state here). Deferred while a recording
     // is in progress - a recording must keep one rate end to end.
@@ -915,9 +1211,10 @@ void SoundManager::handleFrameStart()
     if (pending != 0)
     {
 #ifdef ENABLE_RECORDING
-        const bool recording = _context->pRecordingManager && _context->pRecordingManager->IsRecording();
+        const bool recording = (_context->pRecordingManager && _context->pRecordingManager->IsRecording()) ||
+                               hasFrameAudioTaps();
 #else
-        const bool recording = false;
+        const bool recording = hasFrameAudioTaps();
 #endif  // ENABLE_RECORDING
         if (recording)
         {
@@ -947,6 +1244,12 @@ void SoundManager::handleFrameStart()
     if (_gs)
         _gs->setStereoMode(neoGSStereoMode()); // NeoGS listening choice; the others ignore it
 
+    // The user's AY socket settings, the Next's part gains and the mixer's channel state (host-side), before the
+    // devices start their frame: a device that steps its level for a change does it at the frame's start
+    applyAYSocketRequests();
+    applyModelAudioParts();
+    applyMixerChannels();
+
     // Turbo mode without audio: no synthesis at all this frame. Decided once here so
     // the per-step and per-edge paths only test a cached bool. Recording keeps the
     // full path so captured audio stays intact.
@@ -957,12 +1260,15 @@ void SoundManager::handleFrameStart()
         if (suppressed && _context->pRecordingManager && _context->pRecordingManager->IsRecording())
             suppressed = false;
 #endif
+        if (suppressed && hasFrameAudioTaps())
+            suppressed = false;
         _synthesisSuppressed = suppressed;
 
         // Sound feature off = GENERATION off for every generator, exactly like turbo without audio:
         // the port / register / level state keeps being tracked (what the program can read back and
         // what the first edge after un-muting depends on), only synthesis and filtering stop
         const bool generationOff = suppressed || !_feature_sound_enabled;
+        _generationOff = generationOff;
         _beeper->setSynthesisSuppressed(generationOff);
         if (_covox)
             _covox->setSynthesisSuppressed(generationOff);
@@ -1024,7 +1330,7 @@ void SoundManager::handleFrameStart()
             _modelAudio->AudioFrameStart(generationOff);
 
         // Slot-built cards: the same rule - a card's coprocessors are machine state
-        for (ICard* card : _slotCards)
+        for (ICardAudio* card : _slotCards)
             card->FrameStart();
 
         if (suppressed)
@@ -1050,8 +1356,14 @@ void SoundManager::handleStep()
     // work is unobservable to the program: the AY register file is written
     // by PortDecoder on OUT. Recording keeps the full path so DSD
     // native-rate capture and recorded audio stay intact.
-    if (_turboSound)
-        _turboSound->handleStep();
+    if (!_turboSound)
+        return;
+    // The device's step gate tested here, without the call: most steps only note where they ended
+    Core* core = _context->pCore;
+    const EmulatorState& state = _context->emulatorState;
+    if (core && _turboSound->noteGatedStep(state.AudioTstate(core->GetZ80()->t), state.HostSpeedMultiplier()))
+        return;
+    _turboSound->handleStep();
 }
 
 void SoundManager::renderCdAudio(size_t samples)
@@ -1108,14 +1420,21 @@ void SoundManager::handleFrameEnd()
     // or a turbo stretch would change the machine's trajectory and its TTD
     // checkpoints. Only the host-audio work below (sample accounting,
     // character chains, mixing, delivery) is skipped - the same condition
-    // MainLoop used to gate this whole call on
+    // MainLoop used to gate this whole call on. A frame audio tap takes every frame's sound and number: it runs the
+    // frame as turbo with audio does
     const CONFIG& frameConfig = _context->config;
-    if (frameConfig.turbo_mode && !frameConfig.turbo_mode_audio)
+    if (frameConfig.turbo_mode && !frameConfig.turbo_mode_audio && !hasFrameAudioTaps())
     {
+        // The TurboSound device rendered this frame for the TTD pin: the sample accumulator counts the frame as the
+        // device did, or the next frame start (followSamplePhase) would take the device's phase back
+        if (_turboSound && _turboSound->getRenderedSamplesThisFrame() > 0 && frameConfig.frame > 0)
+            _sampleAccumulator = (_sampleAccumulator + uint64_t(frameConfig.frame) * _coreRate) % CPU_CLOCK_RATE;
         // A gap in the voiced stream: the pre-roll history no longer precedes the next frame
+        // (and the character chains restart at the next frame with audio)
+        _chainsGap = true;
         _ayVoicing0.invalidateHistory();
         _ayVoicing1.invalidateHistory();
-        for (CardVoicing& v : _cardVoicing)
+        for (CardSsgRow& v : _cardSsgRows)
             v.stage->invalidateHistory();
         if (_gs)
             _gs->handleFrameEnd(0);
@@ -1127,7 +1446,7 @@ void SoundManager::handleFrameEnd()
         if (_moonsound)
             _moonsound->handleFrameEnd(0);
 #endif
-        for (ICard* card : _slotCards)
+        for (ICardAudio* card : _slotCards)
             card->FrameEnd(0);
         return;
     }
@@ -1194,27 +1513,66 @@ void SoundManager::handleFrameEnd()
     /// endregion </Determine actual samples for this frame>
 
     /// region <Process AY through its character chain>
-    // The character chains (punch / room) are HQ-only post-processing: with
-    // `soundhq` off (or the turbo override on) they are skipped entirely -
-    // no float round trip, no per-sample DSP - and the raw chip / beeper
-    // buffers go straight to the mixer, the same as the LQ boxcar path
-    // inside the devices. On the first HQ frame after a bypass the chains'
-    // delay lines and envelopes are cleared so they do not replay audio
-    // from before the switch.
+    // The character chains (punch / room) are HQ-only post-processing. A
+    // chain with every effect off - or gated off by `soundhq` off / the turbo
+    // override - leaves its buffer untouched (no float round trip, no
+    // per-sample work: AudioCharacterChain::isBypassed()), and the raw chip /
+    // beeper buffers go straight to the mixer. Switching an effect or Sound HQ
+    // ramps over one frame (no click); a gap (sound off, turbo without audio,
+    // a TTD restore) resets the chains, so no delay line or envelope replays
+    // audio from before it. A TTD restore also resets the AY / SSG voicing of
+    // the restored rows (filter state and pre-roll history), as the card rows'
+    // voicing restarts with the card's render epoch.
     // Sound feature off: no generator runs, no character chain runs, nothing is mixed. The frame
     // buffers are zeroed instead, so the output path (and the per-device meters) see silence
     const bool soundOff = !_feature_sound_enabled;
 
-    const bool chainsActive = isHQActive() && !soundOff;
-    if (chainsActive && _chainsBypassed)
+    if (soundOff)
+        _chainsGap = true;
+    else if (_chainsGap)
+    {
+        resetCharacterChains();
+        _chainsGap = false;
+    }
+
+    // A TTD restore of the whole machine (checkpoint, return to the live state): every host stream restarts -
+    // the character chains (socket AY / FM, beeper, card SSG rows) and the AY / SSG voicing. Applied on the first
+    // frame with audio after it (turbo without audio keeps the request)
+    const bool machineRestored = _stateRestored.exchange(false, std::memory_order_acq_rel);
+    if (machineRestored)
+    {
+        resetCharacterChains();
+        resetVoicing();
+    }
+
+    // The TurboSound device restored on its own (its render epoch moved: TTDLoadState) or replaced: its chains
+    // restart, and on a restore its voicing too
+    const bool deviceChanged = _turboSound != _chainsDevice;
+    const bool deviceRestored = !deviceChanged && _turboSound && _turboSound->renderEpoch() != _chainsDeviceEpoch;
+    if (deviceChanged || deviceRestored)
     {
         _ayChain0.reset();
         _ayChain1.reset();
         _fmChain0.reset();
         _fmChain1.reset();
-        _beeperChain.reset();
+        if (deviceRestored && !machineRestored)
+        {
+            _ayVoicing0.reset();
+            _ayVoicing1.reset();
+        }
+        _chainsDevice = _turboSound;
+        _chainsDeviceEpoch = _turboSound ? _turboSound->renderEpoch() : 0;
     }
-    _chainsBypassed = !chainsActive;
+
+    // Sound HQ gates every chain (applied at this frame boundary: a switch ramps)
+    const bool chainsActive = isHQActive();
+    _ayChain0.setActive(chainsActive);
+    _ayChain1.setActive(chainsActive);
+    _fmChain0.setActive(chainsActive);
+    _fmChain1.setActive(chainsActive);
+    _beeperChain.setActive(chainsActive);
+    for (CardSsgRow& v : _cardSsgRows)
+        v.chain->setActive(chainsActive);
 
     // Punch / room changes requested since the last frame (GUI, automation)
     applyCharacterRequests();
@@ -1239,7 +1597,7 @@ void SoundManager::handleFrameEnd()
     // AY chain: gentler punch (square waves already have harmonics)
     // Room uses no LP to preserve brightness
     // Process per-chip buffers with separate chain instances to preserve DSP state
-    if (_turboSound && chainsActive)
+    if (_turboSound && !soundOff)
     {
         int16_t* chip0Buf = _turboSound->getChipBuffer(0);
         int16_t* chip1Buf = _turboSound->getChipBuffer(1);
@@ -1301,8 +1659,7 @@ void SoundManager::handleFrameEnd()
         }
 
         // Beeper chain: operates on alias-free blip_buf output (HQ only, see above)
-        if (chainsActive)
-            _beeperChain.processInt16(_beeperBuffer, samplesThisFrame);
+        _beeperChain.processInt16(_beeperBuffer, static_cast<int32_t>(samplesThisFrame));
     }
     /// endregion </Process beeper>
 
@@ -1338,22 +1695,27 @@ void SoundManager::handleFrameEnd()
         _gs->handleFrameEnd(samplesThisFrame);
 
     // Slot-built cards: run to the frame end and render their rows
-    for (ICard* card : _slotCards)
+    for (ICardAudio* card : _slotCards)
         card->FrameEnd(samplesThisFrame);
 
-    // The cards' SSG rows: the same AY / SSG tone voicing as the socket's chips above (sound off: a gap)
-    for (CardVoicing& v : _cardVoicing)
+    // The cards' SSG rows: the same AY / SSG tone voicing and then the same AY character chain (punch, room; HQ
+    // only) as the socket's chips above (sound off: a gap)
+    for (CardSsgRow& v : _cardSsgRows)
     {
-        // The card restarted its render layers (a TTD restore): the voicing restarts with them, so the row after a
-        // restore does not depend on what played before it - the card's contract for its rows
+        // The card restarted its render layers (a TTD restore): the voicing and the chain restart with them, so the
+        // row after a restore does not depend on what played before it - the card's contract for its rows
         if (v.card->RenderEpoch() != v.renderEpoch)
         {
             v.stage->reset();
+            v.chain->reset();
             v.renderEpoch = v.card->RenderEpoch();
         }
-        int16_t* row = soundOff ? nullptr : v.card->VoicedMixerBuffer(v.type);
+        int16_t* row = soundOff ? nullptr : v.card->SsgMixerBuffer(v.type);
         if (row)
+        {
             v.stage->process(row, samplesThisFrame);
+            v.chain->processInt16(row, static_cast<int32_t>(samplesThisFrame));
+        }
         else
             v.stage->invalidateHistory();
     }
@@ -1397,6 +1759,18 @@ void SoundManager::handleFrameEnd()
         // otherwise, non-muted devices are audible
         bool audible = soloActive ? d.solo : !d.mute;
 
+        // A part of the model audio source (the Next's AYs and DAC): its mute / solo / volume are in the device's own
+        // mix already (applyModelAudioParts), its meter is the device's. The device's one buffer is mixed with the
+        // first part, at unity, where the COVOX row of a device without parts mixes it
+        if (const int part = _modelAudio ? modelAudioPart(d.type) : -1; part >= 0)
+        {
+            d.peak = _modelAudio->AudioPartPeak(static_cast<size_t>(part));
+            d.activeRecently = _modelAudio->AudioPartActive(static_cast<size_t>(part));
+            if (part != 0)
+                continue;
+            audible = true;
+        }
+
         // Get the device's buffer
         const int16_t* srcBuffer = nullptr;
         switch (d.type)
@@ -1418,6 +1792,9 @@ void SoundManager::handleFrameEnd()
                 break;
             case AudioSourceType::COVOX:
                 srcBuffer = _modelAudio ? _modelAudio->AudioBuffer() : _covox ? _covox->getBuffer() : nullptr;
+                break;
+            case AudioSourceType::NextAy1:  // the lead part (the others continued above)
+                srcBuffer = _modelAudio ? _modelAudio->AudioBuffer() : nullptr;
                 break;
             case AudioSourceType::GeneralSound:
                 srcBuffer = _gs ? _gs->getBuffer() : nullptr;
@@ -1453,16 +1830,20 @@ void SoundManager::handleFrameEnd()
         if (!srcBuffer)
             continue;
 
-        // Compute peak and activity (always, even if muted — for UI meters)
-        float peak = 0.0f;
+        // Compute peak and activity (always, even if muted — for UI meters). The largest |sample| in integers, scaled
+        // once: |s| / 32768 is exact and ordered as |s| is, so this is the largest of the scaled values
+        int32_t peakAbs = 0;
         for (size_t i = 0; i < samplesThisFrame * AUDIO_CHANNELS; i++)
+            peakAbs = std::max(peakAbs, std::abs(static_cast<int32_t>(srcBuffer[i])));
+        const float peak = static_cast<float>(peakAbs) / 32768.0f;
+        const bool modelPart = _modelAudio && modelAudioPart(d.type) >= 0;  // the meter came from the device
+        if (!modelPart)
+            d.peak = peak;
+        if (modelPart)
         {
-            float absVal = std::abs(static_cast<float>(srcBuffer[i])) / 32768.0f;
-            if (absVal > peak)
-                peak = absVal;
+            // Peak and activity: the device's part meter (read above), not the shared buffer's
         }
-        d.peak = peak;
-        if (d.type == AudioSourceType::GeneralSound)
+        else if (d.type == AudioSourceType::GeneralSound)
         {
             // Peak amplitude alone is the wrong signal for GS: a DAC channel
             // latched away from centre by a command (a one-shot digi sample's
@@ -1502,10 +1883,10 @@ void SoundManager::handleFrameEnd()
             d.activeRecently = (peak > AUDIO_ACTIVITY_PEAK);
         }
 
-        // Mix into output if audible
-        if (audible && d.volume > 0.0f)
+        // Mix into output if audible. A silent buffer adds +0 to every sample: nothing to mix
+        if (audible && (modelPart || d.volume > 0.0f) && peakAbs != 0)
         {
-            float vol = d.volume;
+            float vol = modelPart ? 1.0f : d.volume;
             if (_wideMix)
             {
                 // Wide path (5.2): unclipped float accumulation - clipping
@@ -1525,6 +1906,10 @@ void SoundManager::handleFrameEnd()
         }
     }
     /// endregion </Registry-driven mixing>
+
+    // The metered channels (MoonSound's FM channels and PCM slots) of the rows somebody reads
+    if (!soundOff)
+        readMixerChannelMeters();
 
     // HUD audio nudges: the LEDs just computed, held for a second - one
     // measurement, so every nudge agrees with its LED
@@ -1554,6 +1939,19 @@ void SoundManager::handleFrameEnd()
         _context->pRecordingManager->CaptureAudio(_outBuffer, samplesThisFrame * AUDIO_CHANNELS);
     }
 #endif
+
+    // The frame audio taps (the GUI window recording): the same vantage as the recording above
+    if (hasFrameAudioTaps())
+    {
+        std::lock_guard<std::mutex> lock(_frameAudioTapMutex);
+        const uint64_t frame = _context->emulatorState.frame_counter;
+        for (const auto& entry : _frameAudioTaps)
+            entry.second(_outBuffer, samplesThisFrame, frame);
+    }
+
+    // The haptic feed's streams (the same vantage); nothing to do without one
+    if (!_hapticTaps.empty())
+        captureHapticTaps(samplesThisFrame);
 
     /// region <Analyzer audio tap (MCP automation)>
     // Post-mix, pre-mute/DRC vantage — identical to the recording tap above.
@@ -1644,6 +2042,17 @@ void SoundManager::handleFrameEnd()
         try
         {
             callback(obj, _deviceBuffer, deviceFrames * AUDIO_CHANNELS);
+
+            // The frame's sound ends where the callback left the ring's stream, or as many frames later as the delay
+            // line still holds it back
+            const AudioDeviceDescriptor* device = _context->pAudioDeviceDescriptor.load(std::memory_order_acquire);
+            if (device)
+            {
+                _frameAudioEnd = device->streamWritten.load(std::memory_order_acquire) +
+                                 static_cast<uint64_t>(_outputDelayFrames) * deviceFrames;
+                _frameAudioFrames = static_cast<uint32_t>(deviceFrames);
+                _frameAudioEndValid = true;
+            }
         }
         catch (const std::exception& e)
         {
@@ -1656,6 +2065,20 @@ void SoundManager::handleFrameEnd()
             LOGERROR("SoundManager::handleFrameEnd - Audio callback failed with unknown exception\n");
         }
     }
+}
+
+bool SoundManager::takeFrameAudioEnd(uint64_t* streamFrame, uint32_t* deviceFramesPerFrame)
+{
+    const bool valid = _frameAudioEndValid;
+    _frameAudioEndValid = false;
+    if (valid)
+    {
+        if (streamFrame)
+            *streamFrame = _frameAudioEnd;
+        if (deviceFramesPerFrame)
+            *deviceFramesPerFrame = _frameAudioFrames;
+    }
+    return valid;
 }
 
 /// DRC PI controller (audio-sync design 5.1): holds ring occupancy at
@@ -1681,7 +2104,8 @@ void SoundManager::updateDrcControl()
     const uint32_t devRateRaw = _context->pAudioDeviceSampleRate.load(std::memory_order_relaxed);
     const double devRate = (devRateRaw == 0) ? static_cast<double>(_coreRate)
                                              : static_cast<double>(devRateRaw);
-    const double baseRatio = devRate / static_cast<double>(_coreRate);
+    // a machine clock faster than the T-states' base plays the same samples in less time
+    const double baseRatio = devRate / static_cast<double>(_coreRate) / _machineClockScale;
 
     const double occMs = occCell->load(std::memory_order_relaxed) * 1000.0 / devRate;
 
@@ -1721,6 +2145,17 @@ void SoundManager::updateDrcControl()
     }
 
     _drcResampler.setRatio(baseRatio * (1.0 + trim));
+}
+
+bool SoundManager::ttdPinsTurboSoundRender() const
+{
+    return _context && _context->pFeatureManager && _context->pFeatureManager->isTtdTimelineBound();
+}
+
+bool SoundManager::ttdRecordsTurboSoundRender() const
+{
+    return _context && _context->pFeatureManager && _context->pFeatureManager->isTtdRecordingActive() &&
+           !_context->ttdReplayActive;
 }
 
 /// @brief Update feature cache flags from FeatureManager.
@@ -1766,10 +2201,16 @@ void SoundManager::UpdateFeatureCache()
 
         _feature_sound_enabled = newSoundEnabled;
 
-        // Propagate the effective HQ flag (feature state minus the turbo override) to TurboSound
+        // Propagate the effective HQ flag (feature state minus the turbo override) to TurboSound. From the thread that
+        // runs the frames (or before the first frame) at once. From any other thread (GUI, WebAPI, CLI toggling a
+        // feature while the machine runs) NOT here: the device's setters settle the step gate, i.e. run stepAt -
+        // concurrently with the emulation thread's own stepAt on the same buffers (ASan: emplace_back on the
+        // quiet-ticks vector, SIGSEGV). handleFrameStart hands the flag over on the emulation thread every frame
         if (_turboSound)
         {
-            _turboSound->setHQEnabled(isHQActive());
+            const std::thread::id owner = _emulationThread.load(std::memory_order_relaxed);
+            if (owner == std::thread::id() || owner == std::this_thread::get_id())
+                _turboSound->setHQEnabled(isHQActive());
         }
 
         // GS personality follows the gs_lightweight feature (runtime
@@ -1816,14 +2257,8 @@ void SoundManager::UpdateFeatureCache()
 
 void SoundManager::setTurboLowQualityOverride(bool enabled)
 {
-    if (_turboLowQualityOverride == enabled)
-        return;
-
-    _turboLowQualityOverride = enabled;
-    if (_turboSound)
-    {
-        _turboSound->setHQEnabled(isHQActive());
-    }
+    // The device's render state belongs to the emulation thread: handleFrameStart hands the switch over
+    _turboLowQualityOverride.store(enabled, std::memory_order_relaxed);
 }
 
 /// endregion </Emulation events>
@@ -1864,6 +2299,28 @@ void SoundManager::SoundManager::writeToWaveFile(uint8_t* buffer, size_t len)
 /// endregion </Wave file export>
 
 /// region <General Sound personality switching>
+
+void SoundManager::attachGeneralSoundHistory()
+{
+    if (_gs == nullptr)
+        return;
+    if (!_gsHistory)
+    {
+        _gsHistory = std::make_unique<GSHistory>([context = _context]() { return GSHistoryDevice(context); },
+                                                 "GS port and activity events", GSPortTraceRecorder::kDefaultCapacity);
+        _context->histories.Add(_gsHistory.get());
+    }
+    _gs->attachPortTrace(_gsHistory.get());
+    if (!_gsExecHistory)
+    {
+        _gsExecHistory = std::make_unique<history::DeviceHistory<ExecRecord>>(
+            [context = _context]() { return GSHistoryDevice(context) + ".cpu"; }, "instructions the card's Z80 starts",
+            kExecHistoryRing);
+        _gsExecHistory->EnableFastPush();
+        _context->histories.Add(_gsExecHistory.get());
+    }
+    _gs->attachExecHistory(_gsExecHistory.get(), _context);
+}
 
 GeneralSoundCard* SoundManager::createGeneralSoundCard(GSTypeKind kind) const
 {
@@ -1935,22 +2392,30 @@ bool SoundManager::switchGeneralSoundCard(GSTypeKind target)
     if (_gs->implementation() == targetImplementation)
         return true; // already the requested personality
 
-    // FR-4: the switch changes the device set under any TTD history. A user
-    // recording refuses it (the reason is also reported at request time);
-    // a stopped session or a debugger's live history is dropped, since no
-    // checkpoint could restore the outgoing card into the new one
-    if (ttd::ITimeTravelHooks* ttd = _context->pTimeTravelHooks)
-    {
-        const std::string refusal = ttd->RecordingGuard(ttd::TTDGuardedAction::SwitchGsCard);
-        if (!refusal.empty())
-        {
-            LOGWARNING("SoundManager: %s", refusal.c_str());
-            return false;
-        }
-        if (ttd->HasHistory())
-            ttd->OnConfigurationChange(ttd::TTDConfigChangeKind::GsCard, "gs-card-switch");
-    }
+    // FR-4: the switch changes the device set under any TTD history: the coordinator ends the session and drops its
+    // history (no checkpoint could restore the outgoing card into the new one); a refusal is also reported at request
+    // time
+    coordinator::MachineOp op;
+    op.kind = coordinator::OpKind::GsCardSwitch;
+    op.summary = std::string(gsImplementationLabel(_gs->implementation())) + " -> " +
+                 gsImplementationLabel(targetImplementation);
+    op.sessionReason = "gs-card-switch";
+    bool switched = false;
+    const coordinator::OpResult result =
+        coordinator::RunCommit(_context->pMachineOps, std::move(op), [&](coordinator::OpStage& stage) {
+            stage.CommitPoint();
+            switched = switchGeneralSoundCardNow(target, targetImplementation);
+            if (!switched)
+                stage.error = "the General Sound card could not be switched";
+            return switched;
+        });
+    if (result.status == coordinator::OpStatus::Refused)
+        LOGWARNING("SoundManager: %s", result.reason.c_str());
+    return switched;
+}
 
+bool SoundManager::switchGeneralSoundCardNow(GSTypeKind target, GSCardImplementation targetImplementation)
+{
     const char* from = gsImplementationLabel(_gs->implementation());
     const char* to = gsImplementationLabel(targetImplementation);
 
@@ -1964,7 +2429,7 @@ bool SoundManager::switchGeneralSoundCard(GSTypeKind target)
     const bool hadModule = _gs->captureModuleUpload(moduleBytes, wasPlaying);
     // The outgoing card's TTD slot - captured before delete below, since
     // it's read through the about-to-be-freed pointer (see 3b.)
-    const ttd::PeripheralId outgoingTtdId = _gs->TTDPeripheralId();
+    const ttd::TTDDeviceType outgoingTtdType = _gs->TTDType();
 
     // 2. Unregister the host ports first - the decoder holds the outgoing
     //    card's raw pointer and must never dispatch into a deleted object
@@ -1993,22 +2458,22 @@ bool SoundManager::switchGeneralSoundCard(GSTypeKind target)
 
     delete _gs;
     _gs = card;
+    attachGeneralSoundHistory();
 
     // 3b. Re-point the TTD peripheral registry at the new card. TTD registers
     //     the GS slot by raw pointer only at StartRecording/session load
     //     (RegisterModelPeripherals) - without this, a switch during an
     //     active recording leaves the registry holding a pointer to the card
     //     just deleted above, and the next checkpoint's TTDSaveState call is
-    //     a use-after-free. LLE and LW register under different peripheral
-    //     ids (GeneralSound vs GeneralSoundLightweight, same split as the
+    //     a use-after-free. LLE and LW are different device types
+    //     (GeneralSound vs GeneralSoundLightweight, same split as the
     //     TurboSound/TSFM slots) so a checkpoint recorded on one personality
-    //     cannot silently restore into the other - UpdatePeripheral moves the
-    //     registration from the outgoing card's slot to the new card's own
-    //     TTDPeripheralId(), which differs across a personality switch by
-    //     construction. Safe to call unconditionally: a null
-    //     TimeTravelManager (TTD unavailable) no-ops.
+    //     cannot silently restore into the other - UpdatePeripheral drops the
+    //     outgoing card's type and registers the new card under its own key.
+    //     Safe to call unconditionally: a null TimeTravelController (TTD
+    //     unavailable) no-ops.
     if (_context && _context->pTimeTravelHooks)
-        _context->pTimeTravelHooks->UpdatePeripheral(outgoingTtdId, _gs->TTDPeripheralId(), _gs);
+        _context->pTimeTravelHooks->UpdatePeripheral(outgoingTtdType, _gs);
 
     // 4. Re-register the host ports for the new card (#B3/#BB/#33, GS design §6)
     bool portsRegistered = true;
@@ -2045,6 +2510,10 @@ bool SoundManager::switchGeneralSoundCard(GSTypeKind target)
     // The slot set names the new personality, and so does the TTD configuration fingerprint (ZX-bus slots SL-6)
     if (_context->pSlotManager)
         _context->pSlotManager->FollowGeneralSoundSwitch(target);
+
+    // The card CPU debugger's hooks go to the new card (after the handoff above ran it)
+    if (_context->pDebugManager)
+        _context->pDebugManager->OnGeneralSoundCardCreated();
 
     LOGINFO("SoundManager: General Sound personality switched %s -> %s%s", from, to,
             hadModule ? " (module upload replayed)" : "");
@@ -2089,15 +2558,16 @@ bool SoundManager::requestGeneralSoundCardSwitch(GSTypeKind target, std::string*
     if (!gsImplementationOf(target, targetImplementation))
         return false;
 
-    // A real change while a user recording runs is refused (FR-4, see switchGeneralSoundCard)
-    if (_gs && _gs->implementation() != targetImplementation && _context->pTimeTravelHooks)
+    // A real change the coordinator's rules refuse (FR-4, see switchGeneralSoundCard)
+    if (_gs && _gs->implementation() != targetImplementation && _context->pMachineOps)
     {
-        const std::string refusal =
-            _context->pTimeTravelHooks->RecordingGuard(ttd::TTDGuardedAction::SwitchGsCard);
-        if (!refusal.empty())
+        coordinator::MachineOp op;
+        op.kind = coordinator::OpKind::GsCardSwitch;
+        const coordinator::OpResult asked = _context->pMachineOps->WouldRefuse(op);
+        if (!asked.Ok())
         {
             if (error)
-                *error = refusal;
+                *error = asked.reason;
             return false;
         }
     }
@@ -2149,6 +2619,18 @@ bool SoundManager::attachToPorts()
                 generalSoundDeviceName().c_str());
         delete _gs;
         _gs = nullptr;
+        if (_gsHistory)
+        {
+            _context->histories.Remove(_gsHistory.get());
+            _gsHistory.reset();
+        }
+        if (_gsExecHistory)
+        {
+            _context->histories.Remove(_gsExecHistory.get());
+            _gsExecHistory.reset();
+        }
+        if (_context->pDebugManager)
+            _context->pDebugManager->OnGeneralSoundCardCreated();  // the hooks' card is gone
         _devices.erase(std::remove_if(_devices.begin(), _devices.end(),
                                       [](const AudioDeviceInfo& d) {
                                           return d.type == AudioSourceType::GeneralSound ||
@@ -2226,6 +2708,15 @@ void SoundManager::attachModelAudioSource(IModelAudioSource* source)
     _modelAudio = source;
     source->AudioSetSampleRate(_coreRate);
 
+    // A device with parts (the Next): one row per part, where the COVOX row would be; the device's one buffer is
+    // mixed with the first part (handleFrameEnd)
+    if (const size_t parts = source->AudioPartCount(); parts > 0)
+    {
+        for (size_t p = 0; p < parts; p++)
+            _devices.push_back({source->AudioPartType(p), source->AudioPartName(p), false, false, 1.0f, 0.0f, false});
+        return;
+    }
+
     // The COVOX row carries the device's name; one row only
     for (AudioDeviceInfo& d : _devices)
     {
@@ -2246,6 +2737,15 @@ void SoundManager::detachModelAudioSource(IModelAudioSource* source)
     if (!source || _modelAudio != source)
         return;
     _modelAudio = nullptr;
+    if (const size_t parts = source->AudioPartCount(); parts > 0)
+    {
+        for (size_t p = 0; p < parts; p++)
+        {
+            const AudioSourceType type = source->AudioPartType(p);
+            std::erase_if(_devices, [type](const AudioDeviceInfo& d) { return d.type == type; });
+        }
+        return;
+    }
     for (auto it = _devices.begin(); it != _devices.end(); ++it)
     {
         if (it->type != AudioSourceType::COVOX)

@@ -3,8 +3,8 @@
 // A card is saved mid-transfer and the blob loaded into a second card; both
 // then run on and must stay identical: the SD card's protocol, the decoder's
 // FIFO and minimp3 state, the DMA modules' phase and FIFOs all travel in the
-// blob. The card RAM and the flash are not in the blob (large memories are not
-// snapshotted in TTD v1 - they wait for TTD v2 memory regions): the test copies
+// blob. The card RAM and the flash are not in the blob (the engine records them as
+// regions 4 and 5): the test copies
 // them itself, standing in for those regions, so the blob is checked for
 // everything else. The replay through the TTD engine itself is in
 // debugger/ttd/ttdneogs_test.cpp.
@@ -81,7 +81,7 @@ struct Card
 /// Runs `a` and a copy made from its blob side by side
 void expectContinuesIdentically(Card& a, Card& b, int frames, const std::string& from)
 {
-    ASSERT_LT(a.save().size(), a.chip->getRamSizeKB() * 1024) << from << ": the blob must leave the card memory out (TTD v1)";
+    ASSERT_LT(a.save().size(), a.chip->getRamSizeKB() * 1024) << from << ": the blob must leave the card memory out";
     b.copyMemoriesFrom(a);
     b.chip->TTDLoadState(a.save().data());
     ASSERT_EQ(b.chip->TTDHashState(), a.chip->TTDHashState()) << from;
@@ -192,4 +192,29 @@ TEST(SoundChip_NeoGS_Ttd, Mp3DmaSnapshotsContinueIdentically)
         EXPECT_GT(b.chip->mp3Decoder()->framesDecoded(), 15u) << "the decoder must have played";
         EXPECT_EQ(b.chip->mp3Decoder()->bytesReceived(), a.chip->mp3Decoder()->bytesReceived());
     }
+}
+
+// The HUD's activity latches (telemetry) after a restore: the restored ZX-DMA byte counts are the ones "seen", so the
+// first frame after it reports what that frame moves - nothing here - not the difference to the counts before the
+// restore (state registry §5: "one false LED pulse" after every seek)
+TEST(SoundChip_NeoGS_Ttd, ARestoreLeavesNoFalseActivityPulse)
+{
+    NeoGSConfig config;
+    config.mp3Support = NGSMP3SupportKind::None;
+    Card a(config);
+    a.frame();
+    std::vector<uint8_t> blob = a.save();
+    // The recording's card had moved 1000 bytes by then (bytesRead, NeoGSZxDma state offset 29, little endian)
+    const uint64_t moved = 1000;
+    for (int i = 0; i < 8; i++)
+        blob[SoundChip_NeoGS::TTD_ZX_OFFSET + 29 + i] = static_cast<uint8_t>(moved >> (8 * i));
+
+    Card b(config);
+    b.frame();
+    b.chip->TTDLoadState(blob.data());
+    ASSERT_EQ(b.chip->zxDma().bytesRead(), moved) << "the counts are restored";
+    EXPECT_FALSE(b.chip->hadHostTransferActivityLastFrame()) << "nothing ran since the restore";
+    b.frame();
+    EXPECT_FALSE(b.chip->hadHostTransferActivityLastFrame()) << "the frame after the restore moved nothing";
+    EXPECT_FALSE(b.chip->hadDmaActivityLastFrame());
 }

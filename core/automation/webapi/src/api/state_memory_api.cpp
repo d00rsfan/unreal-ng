@@ -4,13 +4,15 @@
 #include "debugger/memory/memoryread.h"
 #include "debugger/search/memorysearch.h"
 #include "debugger/breakpoints/breakpointmanager.h"
+#include "../common/cpu_selector.h"
 #include "../common/binaryresponse.h"
 #include "../common/jsonnumber.h"
 #include "../emulator_api.h"
 #include "../common/statenode_json.h"
 
 #include <drogon/HttpResponse.h>
-#include <debugger/ttd/timetravelmanager.h>  // TimeTravelManager (Item 6 markers)
+#include <mutex>
+#include <unordered_set>
 #include <emulator/config.h>
 #include <emulator/emulator.h>
 #include <emulator/emulatormanager.h>
@@ -94,7 +96,7 @@ Json::Value RenderMemoryWindowFormat(const uint8_t* data, size_t size, uint32_t 
 
 /// @brief GET /api/v1/emulator/{id}/state/memory
 /// @brief Get complete memory configuration
-void EmulatorAPI::getStateMemory(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+void EmulatorAPI::getStateMemory(const HttpRequestPtr& /*req*/, std::function<void(const HttpResponsePtr&)>&& callback,
                                  const std::string& id) const
 {
     auto manager = EmulatorManager::GetInstance();
@@ -149,6 +151,10 @@ void EmulatorAPI::getStateMemory(const HttpRequestPtr& req, std::function<void(c
     ram["bank2"] = static_cast<int>(memory.GetRAMPageForBank2());
     ram["bank3"] = static_cast<int>(memory.GetRAMPageForBank3());
     ret["ram"] = ram;
+
+    // GMX: the card's register file next to the host Scorpion's latches (DeviceState::GmxPaging)
+    if (config.mem_model == MM_GMX)
+        ret["gmx"] = StateNodeToJson(DeviceState::GmxPaging(context));
 
     // Sprinter: #7FFD / #1FFD and the windows live in the PLD (DeviceState::SprinterPaging)
     if (config.mem_model == MM_SPRINTER)
@@ -224,7 +230,8 @@ void EmulatorAPI::getStateMemory(const HttpRequestPtr& req, std::function<void(c
 
 /// @brief GET /api/v1/emulator/{id}/state/memory/ram
 /// @brief Get RAM banking details
-void EmulatorAPI::getStateMemoryRAM(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+void EmulatorAPI::getStateMemoryRAM(const HttpRequestPtr& /*req*/,
+                                    std::function<void(const HttpResponsePtr&)>&& callback,
                                     const std::string& id) const
 {
     auto manager = EmulatorManager::GetInstance();
@@ -314,6 +321,10 @@ void EmulatorAPI::getStateMemoryRAM(const HttpRequestPtr& req, std::function<voi
 
     ret["banks"] = banks;
 
+    // GMX: the card's register file (DeviceState::GmxPaging)
+    if (config.mem_model == MM_GMX)
+        ret["gmx"] = StateNodeToJson(DeviceState::GmxPaging(context));
+
     // Sprinter: the window kinds (fast RAM, vROM, graphics, ISA) and the PLD latches
     if (config.mem_model == MM_SPRINTER)
     {
@@ -339,7 +350,7 @@ void EmulatorAPI::getStateMemoryRAM(const HttpRequestPtr& req, std::function<voi
 
 /// @brief GET /api/v1/emulator/{id}/state/memory/rom
 /// @brief Get ROM configuration with signatures
-void EmulatorAPI::getStateMemoryROM(const HttpRequestPtr& req,
+void EmulatorAPI::getStateMemoryROM(const HttpRequestPtr& /*req*/,
                                     std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                     const std::string& id) const
 {
@@ -439,9 +450,9 @@ void EmulatorAPI::getStateMemoryROM(const HttpRequestPtr& req,
         uint8_t* pagePtr = memory.ROMPageHostAddress(pageNum);
         if (pagePtr && rom)
         {
-            std::string signature = rom->CalculateSignature(pagePtr, 0x4000);
-            pageInfo["signature"] = signature;
-            std::string title = rom->GetROMTitle(signature);
+            pageInfo["signature"] = rom->CalculateSignature(pagePtr, 0x4000);
+            // Blank pages and copies of a lower page say so (ROM::GetROMPageTitle, the same on every surface)
+            std::string title = rom->GetROMPageTitle(static_cast<uint8_t>(pageNum));
             pageInfo["title"] = title.empty() ? "Unknown ROM" : title;
         }
 
@@ -474,7 +485,7 @@ void EmulatorAPI::getStateMemoryROM(const HttpRequestPtr& req,
         if (activePagePtr && rom)
         {
             std::string sig = rom->CalculateSignature(activePagePtr, 0x4000);
-            std::string title = rom->GetROMTitle(sig);
+            std::string title = rom->GetROMPageTitle(memory.GetROMPage());
             mapping["bank0_rom_title"] = title.empty() ? "Unknown ROM" : title;
             mapping["bank0_rom_signature"] = sig;
         }
@@ -498,8 +509,39 @@ void EmulatorAPI::getStateMemoryROM(const HttpRequestPtr& req,
     callback(resp);
 }
 
-// Static flag for ROM write protection (default: protected)
-static bool s_romWriteProtected = true;
+// ROM write protection of the WebAPI's page writes, per emulator instance (by its id; default: protected). It was one
+// flag for the process: unprotecting one instance unprotected them all
+namespace
+{
+std::mutex s_romProtectMutex;
+std::unordered_set<std::string> s_romUnprotected;   ///< instances whose ROM pages the page write may change
+
+bool RomWriteProtected(const Emulator& emulator)
+{
+    std::lock_guard<std::mutex> lock(s_romProtectMutex);
+    return s_romUnprotected.count(emulator.GetId()) == 0;
+}
+
+void SetRomWriteProtected(const Emulator& emulator, bool on)
+{
+    std::lock_guard<std::mutex> lock(s_romProtectMutex);
+    if (on)
+        s_romUnprotected.erase(emulator.GetId());
+    else
+        s_romUnprotected.insert(emulator.GetId());
+}
+
+void ReplyEmulatorNotFound(std::function<void(const HttpResponsePtr&)>& callback)
+{
+    Json::Value error;
+    error["error"] = "Not Found";
+    error["message"] = "Emulator with specified ID not found";
+    auto resp = HttpResponse::newHttpJsonResponse(error);
+    resp->setStatusCode(HttpStatusCode::k404NotFound);
+    addCorsHeaders(resp);
+    callback(resp);
+}
+}  // namespace
 
 /// @brief GET /api/v1/emulator/{id}/memory/read/{address}
 /// @brief Read memory at Z80 address
@@ -575,9 +617,14 @@ void EmulatorAPI::readMemory(const HttpRequestPtr& req, std::function<void(const
     auto filterParam = req->getOptionalParameter<std::string>("filter");
     if (formatParam && !formatParam->empty()) format = *formatParam;
     else if (filterParam && *filterParam == "sparse") format = "sparse";
+    // ?cpu=gs / ms: the sound card CPU's view instead of the main CPU's (cpuview.h)
+    DebugCpuId cpu = DebugCpuId::Main;
+    if (!webapi_cpu::CpuOrError(emulator, req, callback, cpu))
+        return;
     if (format == "binary")
     {
-        const MemoryRead::Result read = MemoryRead::Bytes(emulator->GetContext(), "cpu", address, std::max<uint32_t>(length, 1));
+        const MemoryRead::Result read = MemoryRead::Bytes(emulator->GetContext(), IsCardCpu(cpu) ? DebugCpuName(cpu) : "cpu",
+                                                          address, std::max<uint32_t>(length, 1));
         if (!read.error.empty())
         {
             Json::Value error;
@@ -606,10 +653,15 @@ void EmulatorAPI::readMemory(const HttpRequestPtr& req, std::function<void(const
     }
 
     std::vector<uint8_t> buffer(length);
-    for (uint32_t i = 0; i < length; i++)
-        buffer[i] = memory->DirectReadFromZ80Memory(static_cast<uint16_t>(address + i));
+    if (IsCardCpu(cpu))
+        CpuView::Read(emulator->GetContext(), cpu, address, length, buffer);
+    else
+        for (uint32_t i = 0; i < length; i++)
+            buffer[i] = memory->DirectReadFromZ80Memory(static_cast<uint16_t>(address + i));
 
     Json::Value ret;
+    if (IsCardCpu(cpu))
+        ret["cpu"] = DebugCpuName(cpu);
     ret["address"] = StringHelper::Format("0x%04X", address);
     ret["length"] = length;
     const Json::Value payload = RenderMemoryWindowFormat(buffer.data(), buffer.size(), address, format);
@@ -696,20 +748,49 @@ void EmulatorAPI::writeMemory(const HttpRequestPtr& req, std::function<void(cons
     // Write data
     Json::Value& data = (*body)["data"];
     size_t bytesWritten = 0;
+    // "cpu": gs / ms writes the sound card CPU's view (cpuview.h)
+    DebugCpuId cpu = DebugCpuId::Main;
+    if (!webapi_cpu::CpuOrError(emulator, req, callback, cpu))
+        return;
 
     // A tool edit (Emulator::EditMemoryFromTool): it parks a running machine and,
     // while TTD records, records the write as an event with its bytes, so a
-    // replay reproduces it (D9)
-    emulator->EditMemoryFromTool("WebAPI memory write", [&]() {
-        for (Json::ArrayIndex i = 0; i < data.size(); i++)
-        {
-            memory->DirectWriteToZ80Memory(address + i, static_cast<uint8_t>(data[i].asUInt()));
-            bytesWritten++;
-        }
-    });
+    // replay reproduces it (D9). Refused in the recorded past (409)
+    std::string refused;
+    if (IsCardCpu(cpu))
+    {
+        std::vector<uint8_t> bytes;
+        for (const Json::Value& value : data)
+            bytes.push_back(static_cast<uint8_t>(value.asUInt()));
+        // A read-only window keeps its bytes: bytes_written counts the ones that landed
+        refused = CpuView::Write(emulator.get(), cpu, "WebAPI memory write", address, bytes, &bytesWritten);
+    }
+    else
+        refused = emulator->EditMemoryFromTool(Emulator::ToolEdit::Of("WebAPI memory write", "memory", address,
+                                                                      data.size()),
+                                               [&]() {
+            for (Json::ArrayIndex i = 0; i < data.size(); i++)
+            {
+                memory->DirectWriteToZ80Memory(address + i, static_cast<uint8_t>(data[i].asUInt()));
+                bytesWritten++;
+            }
+        });
+    if (!refused.empty())
+    {
+        Json::Value error;
+        error["error"] = "Conflict";
+        error["message"] = refused;
+        auto resp = HttpResponse::newHttpJsonResponse(error);
+        resp->setStatusCode(HttpStatusCode::k409Conflict);
+        addCorsHeaders(resp);
+        callback(resp);
+        return;
+    }
 
     Json::Value ret;
     ret["success"] = true;
+    if (IsCardCpu(cpu))
+        ret["cpu"] = DebugCpuName(cpu);
     ret["address"] = StringHelper::Format("0x%04X", address);
     ret["bytes_written"] = static_cast<Json::UInt>(bytesWritten);
 
@@ -839,7 +920,12 @@ void EmulatorAPI::findMemory(const HttpRequestPtr& req, std::function<void(const
     for (const MemorySearchMatch& m : result.matches)
     {
         Json::Value match;
-        if (m.page < 0)
+        if (!m.region.empty())
+        {
+            match["region"] = m.region;
+            match["offset"] = StringHelper::Format("0x%05X", m.address);
+        }
+        else if (m.page < 0)
             match["address"] = StringHelper::Format("0x%04X", m.address);
         else
         {
@@ -1018,13 +1104,14 @@ void EmulatorAPI::readPage(const HttpRequestPtr& req, std::function<void(const H
 
     bool isROM = (type == "rom");
     bool isRAM = (type == "ram");
-    if (!isROM && !isRAM && ReadRegionPage(req, emulator->GetContext(), type, pageStr, callback))
+    const bool isCache = (type == "cache");   // the CPU's fast RAM pages (the Sprinter's), as page_read takes them
+    if (!isROM && !isRAM && !isCache && ReadRegionPage(req, emulator->GetContext(), type, pageStr, callback))
         return;  // a device memory region by name (/memory/page/vram/{n}: the Sprinter's video RAM)
-    if (!isROM && !isRAM)
+    if (!isROM && !isRAM && !isCache)
     {
         Json::Value error;
         error["error"] = "Bad Request";
-        error["message"] = "Type must be 'ram', 'rom' or a device memory region (GET /memory/regions)";
+        error["message"] = "Type must be 'ram', 'rom', 'cache' or a device memory region (GET /memory/regions)";
 
         auto resp = HttpResponse::newHttpJsonResponse(error);
         resp->setStatusCode(HttpStatusCode::k400BadRequest);
@@ -1080,7 +1167,7 @@ void EmulatorAPI::readPage(const HttpRequestPtr& req, std::function<void(const H
         return;
     }
 
-    const uint64_t maxPage = isRAM ? MAX_RAM_PAGES - 1 : MAX_ROM_PAGES - 1;
+    const uint64_t maxPage = isRAM ? MAX_RAM_PAGES - 1 : isCache ? MAX_CACHE_PAGES - 1 : MAX_ROM_PAGES - 1;
     if (page > maxPage)
     {
         Json::Value error;
@@ -1094,7 +1181,9 @@ void EmulatorAPI::readPage(const HttpRequestPtr& req, std::function<void(const H
         return;
     }
 
-    uint8_t* pagePtr = isRAM ? memory->RAMPageAddress(static_cast<uint16_t>(page)) : memory->ROMPageHostAddress(static_cast<uint8_t>(page));
+    uint8_t* pagePtr = isCache ? (memory->CacheBase() ? memory->CacheBase() + page * PAGE_SIZE : nullptr)
+                       : isRAM ? memory->RAMPageAddress(static_cast<uint16_t>(page))
+                               : memory->ROMPageHostAddress(static_cast<uint8_t>(page));
     if (!pagePtr)
     {
         Json::Value error;
@@ -1190,10 +1279,23 @@ void EmulatorAPI::writePage(const HttpRequestPtr& req, std::function<void(const 
     Memory* memory = emulator->GetMemory();
     bool isROM = (type == "rom");
     bool isRAM = (type == "ram");
-    if (!isROM && !isRAM && WriteRegionPage(req, emulator->GetContext(), type, pageStr, callback))
+    const bool isCache = (type == "cache");
+    if (!isROM && !isRAM && !isCache && WriteRegionPage(req, emulator->GetContext(), type, pageStr, callback))
         return;  // a device memory region by name (DeviceMemory::Write: the device's own write path)
+    if (!isROM && !isRAM && !isCache)
+    {
+        // Any other name wrote ROM pages before (the pointer below falls back to ROM)
+        Json::Value error;
+        error["error"] = "Bad Request";
+        error["message"] = "Type must be 'ram', 'rom', 'cache' or a device memory region (GET /memory/regions)";
+        auto resp = HttpResponse::newHttpJsonResponse(error);
+        resp->setStatusCode(HttpStatusCode::k400BadRequest);
+        addCorsHeaders(resp);
+        callback(resp);
+        return;
+    }
 
-    if (isROM && s_romWriteProtected)
+    if (isROM && RomWriteProtected(*emulator))
     {
         Json::Value error;
         error["error"] = "Forbidden";
@@ -1236,7 +1338,7 @@ void EmulatorAPI::writePage(const HttpRequestPtr& req, std::function<void(const 
         callback(resp);
         return;
     }
-    const uint64_t maxWritePage = isRAM ? MAX_RAM_PAGES - 1 : MAX_ROM_PAGES - 1;
+    const uint64_t maxWritePage = isRAM ? MAX_RAM_PAGES - 1 : isCache ? MAX_CACHE_PAGES - 1 : MAX_ROM_PAGES - 1;
     if (page > maxWritePage)
     {
         Json::Value error;
@@ -1268,7 +1370,9 @@ void EmulatorAPI::writePage(const HttpRequestPtr& req, std::function<void(const 
         return;
     }
 
-    uint8_t* pagePtr = isRAM ? memory->RAMPageAddress(static_cast<uint16_t>(page)) : memory->ROMPageHostAddress(static_cast<uint8_t>(page));
+    uint8_t* pagePtr = isCache ? (memory->CacheBase() ? memory->CacheBase() + page * PAGE_SIZE : nullptr)
+                       : isRAM ? memory->RAMPageAddress(static_cast<uint16_t>(page))
+                               : memory->ROMPageHostAddress(static_cast<uint8_t>(page));
     if (!pagePtr)
     {
         Json::Value error;
@@ -1285,7 +1389,10 @@ void EmulatorAPI::writePage(const HttpRequestPtr& req, std::function<void(const 
     Json::Value& data = (*body)["data"];
     size_t bytesWritten = 0;
     // A page edit behind the CPU's back: TTD must see it like any other tool write
-    emulator->EditMemoryFromTool("WebAPI page write", [&] {
+    Emulator::ToolEdit what = Emulator::ToolEdit::Of("WebAPI page write", "page", static_cast<int32_t>(offset),
+                                                     data.size());
+    what.page = std::string(isCache ? "CACHE" : isRAM ? "RAM" : "ROM") + std::to_string(page);
+    const std::string refused = emulator->EditMemoryFromTool(what, [&] {
         for (Json::ArrayIndex i = 0; i < data.size() && (offset + i) < PAGE_SIZE; i++)
         {
             pagePtr[offset + i] = static_cast<uint8_t>(data[i].asUInt());
@@ -1294,6 +1401,17 @@ void EmulatorAPI::writePage(const HttpRequestPtr& req, std::function<void(const 
         if (isRAM)
             memory->MarkRamPageEdited(page);
     });
+    if (!refused.empty())
+    {
+        Json::Value error;
+        error["error"] = "Conflict";
+        error["message"] = refused;
+        auto resp = HttpResponse::newHttpJsonResponse(error);
+        resp->setStatusCode(HttpStatusCode::k409Conflict);
+        addCorsHeaders(resp);
+        callback(resp);
+        return;
+    }
 
     Json::Value ret;
     ret["success"] = true;
@@ -1309,12 +1427,19 @@ void EmulatorAPI::writePage(const HttpRequestPtr& req, std::function<void(const 
 
 /// @brief GET /api/v1/emulator/{id}/memory/rom/protect
 /// @brief Get ROM write protection status
-void EmulatorAPI::getROMProtect(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+void EmulatorAPI::getROMProtect(const HttpRequestPtr& /*req*/, std::function<void(const HttpResponsePtr&)>&& callback,
                                 const std::string& id) const
 {
+    auto emulator = EmulatorManager::GetInstance()->GetEmulator(id);
+    if (!emulator)
+    {
+        ReplyEmulatorNotFound(callback);
+        return;
+    }
+    const bool on = RomWriteProtected(*emulator);
     Json::Value ret;
-    ret["protected"] = s_romWriteProtected;
-    ret["message"] = s_romWriteProtected ? "ROM pages are write-protected" : "ROM pages are writable";
+    ret["protected"] = on;
+    ret["message"] = on ? "ROM pages are write-protected" : "ROM pages are writable";
 
     auto resp = HttpResponse::newHttpJsonResponse(ret);
     addCorsHeaders(resp);
@@ -1326,6 +1451,12 @@ void EmulatorAPI::getROMProtect(const HttpRequestPtr& req, std::function<void(co
 void EmulatorAPI::setROMProtect(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
                                 const std::string& id) const
 {
+    auto emulator = EmulatorManager::GetInstance()->GetEmulator(id);
+    if (!emulator)
+    {
+        ReplyEmulatorNotFound(callback);
+        return;
+    }
     auto body = req->getJsonObject();
     if (!body || !body->isMember("protected"))
     {
@@ -1340,12 +1471,13 @@ void EmulatorAPI::setROMProtect(const HttpRequestPtr& req, std::function<void(co
         return;
     }
 
-    s_romWriteProtected = (*body)["protected"].asBool();
+    const bool on = (*body)["protected"].asBool();
+    SetRomWriteProtected(*emulator, on);
 
     Json::Value ret;
     ret["success"] = true;
-    ret["protected"] = s_romWriteProtected;
-    ret["message"] = s_romWriteProtected ? "ROM write protection enabled" : "ROM write protection disabled - ROM pages are now writable";
+    ret["protected"] = on;
+    ret["message"] = on ? "ROM write protection enabled" : "ROM write protection disabled - ROM pages are now writable";
 
     auto resp = HttpResponse::newHttpJsonResponse(ret);
     addCorsHeaders(resp);
@@ -1488,7 +1620,7 @@ Json::Value DecodeLatchValue(PagingLatch latch, uint32_t value, MEM_MODEL model,
 
 /// @brief GET /api/v1/emulator/{id}/state/paging
 /// @brief Get unified paging state assembled from the tagged port registry (P1-2)
-void EmulatorAPI::getStatePaging(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+void EmulatorAPI::getStatePaging(const HttpRequestPtr& /*req*/, std::function<void(const HttpResponsePtr&)>&& callback,
                                  const std::string& id) const
 {
     auto manager = EmulatorManager::GetInstance();
@@ -1592,9 +1724,9 @@ void EmulatorAPI::getStatePaging(const HttpRequestPtr& req, std::function<void(c
                 if (pagePtr)
                 {
                     std::string signature = rom->CalculateSignature(pagePtr, 0x4000);
-                    // GetROMTitle already carries the "Unknown ROM, <digest>"
-                    // fallback - identical wording on every surface
-                    bank["name"] = rom->GetROMTitle(signature);
+                    // GetROMPageTitle: the "Unknown ROM, <digest>" fallback, blank
+                    // pages and copies named - identical wording on every surface
+                    bank["name"] = rom->GetROMPageTitle(romPage);
                     bank["signature"] = signature;
                 }
                 // Role: what the model layout says this slot is (core single
@@ -1669,6 +1801,10 @@ void EmulatorAPI::getStatePaging(const HttpRequestPtr& req, std::function<void(c
     }
 
     ret["banks"] = banks;
+
+    // GMX: the card's register file, the same view every interface shows (DeviceState::GmxPaging)
+    if (config.mem_model == MM_GMX)
+        ret["gmx"] = StateNodeToJson(DeviceState::GmxPaging(context));
 
     // Top-level flags
     ret["paging_locked"] = (state.p7FFD & PORT_7FFD_LOCK) != 0;

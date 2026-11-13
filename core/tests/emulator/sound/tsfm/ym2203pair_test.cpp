@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -20,7 +21,7 @@
 #include "_helpers/testpathhelper.h"
 #include "base/featuremanager.h"
 #include "debugger/analyzers/analyzermanager.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/memory/memory.h"
 #include "debugger/analyzers/audiocapture/audiocaptureanalyzer.h"
 #include "debugger/debugmanager.h"
@@ -492,7 +493,7 @@ TEST_F(Ym2203Pair_Test, TsfmDescriptorTimeFieldsAreMastersThroughThePair)
     EXPECT_EQ(d.stateSize, 2008u);
 
     ttd::TTDPeripheralRegistry registry;
-    registry.Register(ttd::PeripheralId::TSFM, &tsfm);
+    registry.Register(&tsfm);
     std::string error;
     EXPECT_TRUE(registry.CheckDeviceTable(error)) << error;
 }
@@ -530,7 +531,7 @@ TEST_F(Ym2203Pair_Test, PairBlobMatchesItsDescriptorAndItsTimeFieldsAdvance)
     Ym2203Pair pair(_context, RatioConfig());
     PairDevice device(pair);
     ttd::TTDPeripheralRegistry registry;
-    registry.Register(ttd::PeripheralId::TSFM, &device);
+    registry.Register(&device);
     std::string error;
     EXPECT_TRUE(registry.CheckDeviceTable(error)) << error;
 
@@ -739,6 +740,17 @@ public:
 
     double Rate() const { return double(Context()->pSoundManager->getCoreRate()); }
 
+    /// `seconds` of one source, interleaved stereo as mixed, from the next frame on
+    void CaptureStereo(AudioSourceType source, double seconds, std::vector<int16_t>& out)
+    {
+        const size_t rate = Context()->pSoundManager->getCoreRate();
+        _capture->startCapture(static_cast<size_t>(seconds * double(rate)) * 2, source);
+        for (int guard = 0; guard < 400 && !_capture->isCaptureComplete(); guard++)
+            Machine().RunFrame(true);
+        out.assign(_capture->getBuffer().begin(), _capture->getBuffer().begin() + static_cast<std::ptrdiff_t>(_capture->getCapturedSamples()));
+        _capture->stopCapture();
+    }
+
 private:
     Board _board;
     multisoundtest::StagedMachine _m;
@@ -850,7 +862,9 @@ TEST_P(Ym2203PairBoards_Test, ToneSurvivesEventAtAnyTState)
     }
     m.Frames(4);   // the note's attack, the decimators and the coupling settle
     if (event == Event::CoreRate)
+    {
         ASSERT_EQ(m.Rate(), 48000.0) << where;
+    }
 
     Ym2203Pair& pair = *m.Pair();
     const uint64_t anchors = pair.renderAnchors();
@@ -930,7 +944,7 @@ TEST(Ym2203PairBoardsTtd_Test, SeekAndReplayKeepTheCursorAndTheAudio)
         features->setFeature(Features::kDebugMode, true);
         features->setFeature(Features::kTimeTravel, true);
         m.Context()->pMemory->UpdateFeatureCache();
-        ttd::TimeTravelManager* ttd = m.Context()->pTimeTravelManager;
+        ttd::TimeTravelController* ttd = m.Context()->pTimeTravelController;
         ASSERT_NE(ttd, nullptr);
         Ym2203Pair& pair = *m.Pair();
         const uint64_t& frame = m.Context()->emulatorState.frame_counter;
@@ -986,7 +1000,7 @@ TEST(Ym2203PairBoardsTtd_Test, SeekAndReplayKeepTheCursorAndTheAudio)
 }
 
 /// The same register writes on both boards come out at the same level: the YM2203 FM calibration is one ([SOUND]
-/// TSFM_FmTrimDb, the audio settings' FM trim drives both). Per chip, the FM row's RMS of the TSFM in the socket and of
+/// TSFM_FmLevelDb, the audio settings' FM trim drives both). Per chip, the FM row's RMS of the TSFM in the socket and of
 /// the MultiSound agree within 0.1 dB at the shipped trim and at another one, and so do the master mixes of an
 /// FM-only program; the SSG rows differ by the MultiSound board's own SSG weight, at every AY / SSG tone voicing preset
 /// (both boards' SSG is voiced alike, FM on neither). (~0.5 s: two machines per trim and
@@ -1007,9 +1021,9 @@ TEST(Ym2203PairBoardsLevel_Test, FmRowsAndMasterAtTheSameLevelOnBothBoards)
     bool haveReference = false;
     for (const FilterVoicing::Preset voicing :
          {FilterVoicing::Preset::Flat, FilterVoicing::Preset::Classic, FilterVoicing::Preset::Headphones})
-    for (const double trim : {7.4, 0.0})
+    for (const double trim : {0.0, -7.4})
     {
-        if (trim == 0.0 && voicing != FilterVoicing::Preset::Flat)
+        if (trim != 0.0 && voicing != FilterVoicing::Preset::Flat)
             continue;   // the trim is independent of the voicing: one preset covers it
         for (const int fmChip : {0, 1})
         {
@@ -1023,6 +1037,9 @@ TEST(Ym2203PairBoardsLevel_Test, FmRowsAndMasterAtTheSameLevelOnBothBoards)
                 ASSERT_TRUE(m.Init());
                 ASSERT_TRUE(m.Context()->pSoundManager->setFmTrimDb(trim));
                 m.Context()->pSoundManager->setAYVoicing(voicing);
+                // The board weights without the AY room crossfeed, which brings back the 0.1 of SSG A the emulator's
+                // ABC pan law puts on the TSFM's right (SsgRatioIsTheSchematicWeightAndTheRoomCrossfeedExplainsTheRest)
+                m.Context()->pSoundManager->setAYRoomMode(AudioCharacterChain::RoomMode::Off);
                 double readBack = -100.0;
                 ASSERT_TRUE(m.Context()->pSoundManager->fmTrimDb(readBack));
                 EXPECT_DOUBLE_EQ(readBack, trim);
@@ -1049,7 +1066,7 @@ TEST(Ym2203PairBoardsLevel_Test, FmRowsAndMasterAtTheSameLevelOnBothBoards)
             }
             const std::string where = "voicing " + std::to_string(int(voicing)) + ", trim " + std::to_string(trim) +
                                       " dB, FM chip " + std::to_string(fmChip);
-            if (trim == 7.4)
+            if (trim == 0.0)
             {
                 if (!haveReference || voicing == FilterVoicing::Preset::Flat)
                 {
@@ -1070,7 +1087,7 @@ TEST(Ym2203PairBoardsLevel_Test, FmRowsAndMasterAtTheSameLevelOnBothBoards)
             // The SSG is the board's own balance, not a calibration: the MultiSound sums SSG A through 24 k against
             // the FM's 10 k (R13 / R14 vs R18; weight 0.417 = -7.6 dB), the TSFM gives FM and SSG equal weights. Same
             // chip-level SSG unit on both (0.30 per channel), so the card's SSG row sits the schematic's -7.6 dB below
-            // the TSFM's (the TSFM's ABC pan law adds 0.06 dB)
+            // the TSFM's (whose ABC pan law gives channel A 0.9 / 3 = the same 0.30 on the left)
             // Both SSGs go through the same AY / SSG tone voicing ([SOUND] AYVoicing): at every preset the card / TSFM
             // ratio is the Flat one (master 7bbc2eaaa made Classic the default: the card's then unvoiced SSG sat
             // 0.09 dB off it, Headphones 0.05 dB the other way). Measured: within 0.006 dB
@@ -1080,15 +1097,286 @@ TEST(Ym2203PairBoardsLevel_Test, FmRowsAndMasterAtTheSameLevelOnBothBoards)
             else
                 EXPECT_NEAR(ssgRatioDb, ssgFlatRatioDb, 0.02) << where << ": the card's SSG voiced unlike the TSFM's";
             // And the ratio is the schematic's SSG weight (-7.60 dB: SSG A through 24 k against the FM's 10 k; the
-            // TSFM gives SSG and FM equal weights). Measured -7.75 dB at Flat: the 0.15 dB residual is a rendering
-            // difference of the two SSG paths (the card's per-channel decimators and coupling vs the TSFM's mixed
-            // stream), the same at every preset; not a calibration
-            EXPECT_NEAR(ssgRatioDb, 20.0 * std::log10(MultiSoundBoard::kWeightSsgSide), 0.2)
+            // TSFM gives SSG and FM equal weights). With the room on, -7.75 dB: the room crossfeed's +0.14 dB on the
+            // TSFM's row (SsgRatioIsTheSchematicWeightAndTheRoomCrossfeedExplainsTheRest); room off, within 0.01 dB
+            EXPECT_NEAR(ssgRatioDb, 20.0 * std::log10(MultiSoundBoard::kWeightSsgSide), 0.03)
                 << where << ": SSG row, card vs TSFM";
         }
         haveReference = haveReference || voicing == FilterVoicing::Preset::Flat;
     }
 }
 
+
+/// The AY character chain (`[SOUND]` AY punch / AY room, Sound HQ) runs on the card's SSG rows as on the socket's
+/// chips (owner decision 2026-10-07). With punch and room off both SSG rows sit exactly the schematic's SSG weight
+/// apart. With either on, each board's row is the chain applied to that board's chain-off row: a standalone
+/// AudioCharacterChain at the same settings and rate, run over the chain-off capture from the first frame, gives the
+/// chain-on capture sample for sample - the same effect for the same input on both boards. The room shows on each
+/// board by its own wiring: the emulator's ABC pan law puts 0.1 of the socket chip's A on the right, the board wires
+/// the card's A to the left only, so the room (the opposite channel 2 ms late at 0.35) changes the TSFM's left (+0.14
+/// dB at the 427 Hz test tone, the square's triangle autocorrelation at that lag) and puts the card's A on its right.
+/// (~0.8 s: eight machines, 0.7 s of audio each - two boards x punch x room)
+TEST(Ym2203PairBoardsLevel_Test, SsgRatioIsTheSchematicWeightAndTheChainActsAlikeOnBothBoards)
+{
+    using namespace pairboards;
+    constexpr double kSeconds = 0.7;
+    constexpr double kTailSeconds = 0.3;   // past the card's coupling capacitors charging (0.66 Hz corner)
+    std::vector<int16_t> captured[2][2][2];   // [punch][room][board]: the SSG row, interleaved stereo, from frame 0
+    double rate = 44100.0;
+    for (const bool punch : {false, true})
+    for (const bool room : {false, true})
+    for (const Board board : {Board::Tsfm, Board::MultiSound})
+    {
+        PairMachine m(board);
+        ASSERT_TRUE(m.Init());
+        SoundManager* sound = m.Context()->pSoundManager;
+        ASSERT_TRUE(sound->isHQActive()) << "the character chain runs with Sound HQ";
+        sound->setAYVoicing(FilterVoicing::Preset::Flat);
+        sound->setAYPunch(punch);
+        sound->setAYRoomMode(room ? AudioCharacterChain::RoomMode::Room_9dB : AudioCharacterChain::RoomMode::Off);
+        m.PlayTones(0);
+        std::vector<int16_t>& x = captured[punch][room][board == Board::Tsfm ? 0 : 1];
+        m.CaptureStereo(m.SsgSource(1), kSeconds, x);
+        ASSERT_GT(x.size(), size_t(kSeconds * 0.9 * m.Rate()) * 2);
+        if (board == Board::MultiSound)
+        {
+            const AudioCharacterChain* chain = sound->getCardCharacterChain(m.SsgSource(1));
+            ASSERT_NE(chain, nullptr) << "the card's SSG row runs the character chain";
+            EXPECT_EQ(chain->isPunchEnabled(), punch);
+            EXPECT_EQ(chain->getRoomMode(), room ? AudioCharacterChain::RoomMode::Room_9dB : AudioCharacterChain::RoomMode::Off);
+            EXPECT_EQ(sound->getCardCharacterChain(m.FmSource(0)), nullptr) << "FM rows do not run it";
+        }
+        rate = m.Rate();
+    }
+
+    // Left channel of the tail, mean removed
+    auto tailRms = [&](const std::vector<int16_t>& x)
+    {
+        const size_t frames = x.size() / 2;
+        const size_t from = frames - std::min(frames, size_t(kTailSeconds * rate));
+        double mean = 0.0;
+        for (size_t i = from; i < frames; i++)
+            mean += x[i * 2];
+        mean /= double(std::max<size_t>(frames - from, 1));
+        double sum = 0.0;
+        for (size_t i = from; i < frames; i++)
+            sum += (x[i * 2] - mean) * (x[i * 2] - mean);
+        return std::sqrt(sum / double(std::max<size_t>(frames - from, 1)));
+    };
+    auto db = [](double a, double b) { return 20.0 * std::log10(a / b); };
+    const double schematicDb = 20.0 * std::log10(MultiSoundBoard::kWeightSsgSide);
+
+    // Punch and room off: the board's SSG weight (measured within 0.01 dB)
+    const double tsfmDry = tailRms(captured[0][0][0]);
+    ASSERT_GT(tsfmDry, 1000.0);
+    EXPECT_NEAR(db(tailRms(captured[0][0][1]), tsfmDry), schematicDb, 0.03) << "SSG row, card vs TSFM";
+
+    // Punch / room on: every board's row is the chain run over its own chain-off row
+    for (const bool punch : {false, true})
+    for (const bool room : {false, true})
+    {
+        if (!punch && !room)
+            continue;
+        for (int b = 0; b < 2; b++)
+        {
+            const std::string where = std::string(b == 0 ? "TSFM" : "card") + (punch ? ", punch on" : ", punch off") +
+                                      (room ? ", room on" : ", room off");
+            const std::vector<int16_t>& dry = captured[0][0][b];
+            const std::vector<int16_t>& wet = captured[punch][room][b];
+            const size_t n = std::min(dry.size(), wet.size());
+            AudioCharacterChain reference;
+            reference.setup(rate);
+            reference.setChipType(AudioCharacterChain::ChipType::AY);
+            reference.setPunchPreset(AudioCharacterChain::PunchPreset::AY);
+            reference.setPunchEnabled(punch);
+            reference.setRoomMode(room ? AudioCharacterChain::RoomMode::Room_9dB : AudioCharacterChain::RoomMode::Off);
+            std::vector<int16_t> expected(dry.begin(), dry.begin() + static_cast<std::ptrdiff_t>(n));
+            reference.processInt16(expected.data(), static_cast<int32_t>(n / 2));
+            // The chain-off row is the row as rendered (a chain with every effect off passes it bit-identical), and
+            // the settings are in force from the first frame: the reference reproduces the row sample for sample
+            int worst = 0;
+            double errorEnergy = 0.0;
+            double effectEnergy = 0.0;
+            for (size_t i = 0; i < n; i++)
+            {
+                const double error = double(wet[i]) - double(expected[i]);
+                const double effect = double(wet[i]) - double(dry[i]);
+                worst = std::max(worst, int(std::abs(error)));
+                errorEnergy += error * error;
+                effectEnergy += effect * effect;
+            }
+            const double errorRms = std::sqrt(errorEnergy / double(std::max<size_t>(n, 1)));
+            const double effectRms = std::sqrt(effectEnergy / double(std::max<size_t>(n, 1)));
+            EXPECT_EQ(worst, 0) << where << ": the row is not the chain applied to the chain-off row";
+            EXPECT_GT(effectRms, 10.0 * errorRms) << where << ": the chain's effect is lost in the rounding";
+            std::printf("[ chain    ] %s: effect RMS %.1f, off the reference by RMS %.2f, at most %d\n", where.c_str(),
+                        effectRms, errorRms, worst);
+        }
+    }
+
+    // The room's own content on each board's wiring
+    {
+        // The TSFM's left with the room: x(t) + k x(t - d), k = 0.35 x 0.1 / 0.9, d = int(2 ms x rate) samples; for a
+        // square of period P the correlation at lag d is 1 - 4 min(f, 1 - f), f = frac(d / P)
+        const double k = 0.35 * 0.1 / 0.9;
+        const double lag = std::floor(0.002 * rate) * kSsgToneHz / rate;
+        const double f = lag - std::floor(lag);
+        const double rho = 1.0 - 4.0 * std::min(f, 1.0 - f);
+        const double predictedDb = 10.0 * std::log10(1.0 + k * k + 2.0 * k * rho);
+        EXPECT_GT(predictedDb, 0.1) << "the test tone sits where the crossfeed adds";
+        EXPECT_NEAR(db(tailRms(captured[0][1][0]), tsfmDry), predictedDb, 0.02) << "the room on the TSFM's SSG row";
+
+        // The card's A is on the left only: the room leaves the left alone and puts 0.35 of it, 2 ms late, on the
+        // right, where the dry row has nothing
+        const std::vector<int16_t>& dry = captured[0][0][1];
+        const std::vector<int16_t>& wet = captured[0][1][1];
+        EXPECT_NEAR(db(tailRms(wet), tailRms(dry)), 0.0, 0.01) << "the room moved the card's left";
+        auto rightRms = [&](const std::vector<int16_t>& x)
+        {
+            std::vector<int16_t> swapped(x.size());
+            for (size_t i = 0; i + 1 < x.size(); i += 2)
+            {
+                swapped[i] = x[i + 1];
+                swapped[i + 1] = x[i];
+            }
+            return tailRms(swapped);
+        };
+        EXPECT_LT(rightRms(dry), tailRms(dry) * 0.01) << "the card's A is wired to the left only";
+        EXPECT_NEAR(rightRms(wet) / tailRms(dry), 0.35, 0.02) << "the room's crossfeed on the card's right";
+    }
+}
+
 /// endregion </Render-cursor invariant on both boards>
 #endif // UNREALNG_HAVE_SAM2695
+
+// The key-on mirror the state report shows (fmKeyOn: the last #28 mask per channel) is not chip state: a restored pair
+// derives it from its restored envelopes, so the report after a seek shows the keys of that position (state registry
+// §5: "wrong in the state report")
+TEST_F(Ym2203Pair_Test, TtdRestoreDerivesTheKeyOnMirror)
+{
+    Ym2203Pair a(_context, RatioConfig());
+    a.syncTo(0);
+    ProgramFmNote(a, 0);
+    a.syncTo(5000);
+    const uint8_t keyed = a.chip(0)->fmKeyOn[2];
+    ASSERT_NE(keyed, 0) << "the note keys channel 3";
+    std::vector<uint8_t> on(a.TTDStateSize());
+    a.TTDSaveState(on.data());
+
+    Reg(a, 0, 0x28, 0x02);   // key off, channel 3
+    a.syncTo(10000);
+    ASSERT_EQ(a.chip(0)->fmKeyOn[2], 0);
+    std::vector<uint8_t> off(a.TTDStateSize());
+    a.TTDSaveState(off.data());
+
+    Ym2203Pair b(_context, RatioConfig());
+    b.TTDLoadState(on.data(), 5000);
+    EXPECT_EQ(b.chip(0)->fmKeyOn[2], keyed) << "keyed where the blob was taken";
+    EXPECT_EQ(b.chip(0)->fmKeyOn[0], 0);
+    b.TTDLoadState(off.data(), 10000);
+    EXPECT_EQ(b.chip(0)->fmKeyOn[2], 0) << "released where the second blob was taken";
+}
+
+// Idle FM fast path (ymfm patch 6, Ym2203Pair::advanceChip): a released FM half is clocked in one go between timer
+// expiries. Two pairs in lockstep, one with the fast path and one clocking every sample, get the same random FM
+// traffic - notes keyed and released into silence, timers A/B with CSM key-ons, prescaler changes - and syncs of
+// random length: the TTD blobs and the FM words (time and value) must stay equal after every action
+TEST_F(Ym2203Pair_Test, IdleFmFastPathMatchesTheClockedPair)
+{
+    Ym2203Pair fast(_context);
+    Ym2203Pair clocked(_context);
+    clocked.setFmIdleFastPath(false);
+    uint64_t t = 1000;
+    fast.syncTo(t);
+    clocked.syncTo(t);
+
+    uint32_t seed = 20261012;
+    auto rnd = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    std::vector<FmWord> wordsFast;
+    std::vector<FmWord> wordsClocked;
+    auto drain = [](Ym2203Pair& p, std::vector<FmWord>& out) {
+        for (int i = 0; i < 2; i++)
+        {
+            Ym2203Chip& c = *p.chip(i);
+            while (c.words.size() > 0)
+            {
+                out.push_back(c.words.front());
+                c.words.pop();
+            }
+        }
+    };
+    for (int action = 0; action < 3000; action++)
+    {
+        const int chip = int(rnd() % 2);
+        const uint32_t kind = rnd() % 16;
+        uint8_t reg = 0;
+        uint8_t data = uint8_t(rnd());
+        bool write = true;
+        switch (kind)
+        {
+            case 0: reg = uint8_t(0x30 + rnd() % 16); break;                     // DT / MUL
+            case 1: reg = uint8_t(0x40 + rnd() % 16); data &= 0x3F; break;       // TL
+            case 2: reg = uint8_t(0x50 + rnd() % 16); data |= 0x10; break;       // KS / AR (fast)
+            case 3: reg = uint8_t(0x60 + rnd() % 16); break;                     // D1R
+            case 4: reg = uint8_t(0x80 + rnd() % 16); data |= 0x0C; break;       // SL / RR (releases end)
+            case 5: reg = uint8_t(0xA0 + rnd() % 3); break;                      // F-number low
+            case 6: reg = uint8_t(0xA4 + rnd() % 3); data &= 0x3F; break;        // block / F-number high
+            case 7: reg = uint8_t(0xB0 + rnd() % 3); break;                      // FB / algorithm
+            case 8: reg = 0x28; data = uint8_t((rnd() % 2 ? 0xF0 : 0x00) | (rnd() % 3)); break;  // key on / off
+            case 9: reg = uint8_t(0x24 + rnd() % 3); break;                      // timer A / B loads
+            case 10: reg = 0x27; data = uint8_t(data & 0xBF) | ((rnd() % 4 == 0) ? 0x80 : 0x00); break;  // timers, CSM
+            case 11: reg = uint8_t(0x2D + rnd() % 3); break;                     // prescaler
+            case 12:  // everything released
+                for (int ch = 0; ch < 3; ch++)
+                {
+                    for (Ym2203Pair* p : {&fast, &clocked})
+                        Reg(*p, chip, 0x28, uint8_t(ch));
+                }
+                write = false;
+                break;
+            default:
+            {
+                const uint64_t clocks = (rnd() % 4 == 0) ? 1 + rnd() % 200 : 1 + rnd() % 150000;
+                t += clocks;
+                fast.syncTo(t);
+                clocked.syncTo(t);
+                write = false;
+                break;
+            }
+        }
+        if (write)
+        {
+            Reg(fast, chip, reg, data);
+            Reg(clocked, chip, reg, data);
+        }
+        if (t > 3'000'000)
+        {
+            // Keep the frame-relative axis small, as the TSFM's frame rollover does
+            fast.rebaseFrame(t - 70000);
+            clocked.rebaseFrame(t - 70000);
+            t -= 70000;
+        }
+        drain(fast, wordsFast);
+        drain(clocked, wordsClocked);
+        ASSERT_EQ(wordsFast.size(), wordsClocked.size()) << "action " << action;
+        for (size_t i = 0; i < wordsFast.size(); i++)
+        {
+            ASSERT_EQ(wordsFast[i].t, wordsClocked[i].t) << "action " << action;
+            ASSERT_EQ(wordsFast[i].word, wordsClocked[i].word) << "action " << action;
+        }
+        wordsFast.clear();
+        wordsClocked.clear();
+        std::vector<uint8_t> a(fast.TTDStateSize());
+        std::vector<uint8_t> b(clocked.TTDStateSize());
+        fast.TTDSaveState(a.data());
+        clocked.TTDSaveState(b.data());
+        ASSERT_EQ(a, b) << "pair state differs after action " << action;
+        ASSERT_EQ(fast.readStatus(0), clocked.readStatus(0));
+        ASSERT_EQ(fast.readStatus(1), clocked.readStatus(1));
+    }
+    EXPECT_GT(fast.fmIdleSamples(), 0u) << "the released stretches took the fast path";
+    EXPECT_EQ(clocked.fmIdleSamples(), 0u);
+}

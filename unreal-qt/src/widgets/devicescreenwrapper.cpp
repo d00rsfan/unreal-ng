@@ -1,11 +1,12 @@
 #include "devicescreenwrapper.h"
 #include "devicescreen.h"
-#include "devicescreen_gl.h"
 #include "devicescreenglwindow.h"
 #include "hud/qt/hudoverlay.h"
 
 #include <QDebug>
 #include <QKeyEvent>
+#include <QPixmap>
+#include <cstring>
 #include <QWidget>
 #include <QWindow>
 
@@ -15,7 +16,7 @@
 #include "emulator/mousecapturecontroller.h"
 
 DeviceScreenWrapper::DeviceScreenWrapper(QWidget* parent)
-    : DeviceScreenWrapper(parent, DeviceScreenFactory::probeGPUAcceleration())
+    : DeviceScreenWrapper(parent, DeviceScreenGLWindow::probeGPUAcceleration())
 {
 }
 
@@ -23,7 +24,7 @@ DeviceScreenWrapper::DeviceScreenWrapper(QWidget* parent, bool useGPU)
     : QObject(parent)
 {
     // Try GPU-accelerated rendering with QOpenGLWindow for tear-free vsync
-    if (useGPU && DeviceScreenFactory::probeGPUAcceleration())
+    if (useGPU && DeviceScreenGLWindow::probeGPUAcceleration())
     {
         try
         {
@@ -102,6 +103,9 @@ void DeviceScreenWrapper::setupMouseCapture()
         _mouseCapture->setSourceSizeProvider([screen] { return screen->displaySourceRect().size(); });
         screen->setMouseCapture(_mouseCapture);
     }
+    // gamescope composes the Steam Deck's touchscreen as an absolute pointer (motion and a press, no touch events):
+    // captured, the pointer is a relative pad, not a mouse to warp
+    surface.pointerIsTouch = qEnvironmentVariable("XDG_CURRENT_DESKTOP") == QLatin1String("gamescope");
     _mouseCapture->setSurface(std::move(surface));
 
     _mouseCapture->setHostSettingsProvider([this] {
@@ -159,14 +163,29 @@ DeviceScreenWrapper::~DeviceScreenWrapper()
     _software = nullptr;
 }
 
-void DeviceScreenWrapper::init(uint16_t width, uint16_t height, void* buffer)
+void DeviceScreenWrapper::init(uint16_t width, uint16_t height, void* buffer, float aspect)
 {
+    _pictureAspect = aspect > 0.0f ? aspect : 0.0f;
     if (_useGPU && _gpuWindow)
-        _gpuWindow->init(width, height, buffer);
+        _gpuWindow->init(width, height, buffer, _pictureAspect);
     else if (_software)
-        _software->init(width, height, buffer);
+        _software->init(width, height, buffer, _pictureAspect);
 
     emit screenInitialized();
+    emit pictureGeometryChanged();
+}
+
+void DeviceScreenWrapper::init(const FramebufferDescriptor& framebuffer, const Screen& screen)
+{
+    init(framebuffer.width, framebuffer.height, framebuffer.memoryBuffer, PictureAspect(framebuffer, screen));
+}
+
+float DeviceScreenWrapper::PictureAspect(const FramebufferDescriptor& framebuffer, const Screen& screen)
+{
+    // The machine's raster is a CRT picture (DisplayGeometry); a video card's picture (VGA modes) is not
+    if (!screen.IsExternalPictureActive() || framebuffer.height == 0)
+        return 0.0f;
+    return static_cast<float>(framebuffer.width) / static_cast<float>(framebuffer.height);
 }
 
 void DeviceScreenWrapper::detach()
@@ -212,12 +231,105 @@ QRectF DeviceScreenWrapper::pictureSourceRect() const
     return {};
 }
 
-void DeviceScreenWrapper::setFrameSource(std::function<bool(uint8_t*, size_t)> fn)
+bool DeviceScreenWrapper::grabWindowPicture(QImage& image, std::string& error, int pictureHeight)
 {
     if (_useGPU && _gpuWindow)
-        _gpuWindow->setFrameSource(fn);
+    {
+        image = _gpuWindow->renderWindowImage(false, pictureHeight);
+        if (!image.isNull() && pictureHeight <= 0)  // a picture drawn at its own height is the whole image
+            image = image.copy(_gpuWindow->pictureDeviceRect().intersected(image.rect()));
+    }
     else if (_software)
-        _software->setFrameSource(fn);
+    {
+        const QPixmap pixmap = _software->grab();
+        image = pixmap.toImage();
+        const QWidget* parent = _software->parentWidget();
+        const QRect picture = parent ? _software->geometry() : QRect(QPoint(0, 0), _software->size());
+        image = image.copy(QRect(QPoint(0, 0), (QSizeF(picture.size()) * pixmap.devicePixelRatio()).toSize()));
+    }
+    if (image.isNull())
+    {
+        error = "The screen has drawn no picture yet";
+        return false;
+    }
+    return true;
+}
+
+bool DeviceScreenWrapper::grabWindowView(WindowViewGrab& out, std::string& error, bool hud, int pictureHeight)
+{
+    QImage image;
+    QRect viewport;
+    QRect picture;
+    double ratio = 1.0;
+    if (_useGPU && _gpuWindow)
+    {
+        // The GL window fills the screen area; paintGL draws the picture centered in it at drawnPictureSize. Rendered
+        // afresh: the back buffer QOpenGLWindow::grabFramebuffer reads holds the frame before the last swap, so a
+        // paused machine would show a setting changed after its last frame only on the next one
+        image = _gpuWindow->renderWindowImage(hud, pictureHeight);
+        ratio = _gpuWindow->devicePixelRatio();
+        viewport = QRect(0, 0, _gpuWindow->width(), _gpuWindow->height());
+        const QSize drawn = _gpuWindow->drawnPictureSize();
+        picture = QRect((viewport.width() - drawn.width()) / 2, (viewport.height() - drawn.height()) / 2, drawn.width(),
+                        drawn.height());
+        out.backend = "gpu";
+    }
+    else if (_software)
+    {
+        // The widget keeps the picture's shape inside its parent (fitToParent): the widget is the picture
+        const QPixmap pixmap = _software->grab();
+        image = pixmap.toImage();
+        ratio = pixmap.devicePixelRatio();
+        const QWidget* parent = _software->parentWidget();
+        viewport = parent ? QRect(QPoint(0, 0), parent->size()) : QRect(QPoint(0, 0), _software->size());
+        picture = parent ? _software->geometry() : viewport;
+        image = image.copy(QRect(QPoint(0, 0), (QSizeF(picture.size()) * ratio).toSize()));
+        out.backend = "software";
+    }
+    if (image.isNull() || picture.isEmpty())
+    {
+        error = "The screen has drawn no picture yet";
+        return false;
+    }
+
+    if (out.backend == "gpu" && pictureHeight <= 0)  // a picture drawn at its own height is the whole image
+        image = image.copy(_gpuWindow->pictureDeviceRect().intersected(image.rect()));
+    image = image.convertToFormat(QImage::Format_RGBA8888);
+
+    out.width = static_cast<uint16_t>(image.width());
+    out.height = static_cast<uint16_t>(image.height());
+    const size_t lineBytes = static_cast<size_t>(out.width) * 4;
+    out.rgba.resize(lineBytes * out.height);
+    for (int y = 0; y < image.height(); ++y)
+        std::memcpy(out.rgba.data() + lineBytes * static_cast<size_t>(y), image.constScanLine(y), lineBytes);
+    // The grab has no alpha of its own: what the window shows is opaque
+    for (size_t i = 3; i < out.rgba.size(); i += 4)
+        out.rgba[i] = 0xFF;
+
+    auto rect = [](const QRect& r) {
+        return PictureRect{static_cast<uint16_t>(r.x()), static_cast<uint16_t>(r.y()), static_cast<uint16_t>(r.width()),
+                           static_cast<uint16_t>(r.height())};
+    };
+    out.viewport = rect(viewport);
+    out.picture = rect(picture);
+    out.devicePixelRatio = ratio;
+    return true;
+}
+
+void DeviceScreenWrapper::setFrameSource(ScreenFrames source)
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->setFrameSource(std::move(source));
+    else if (_software)
+        _software->setFrameSource(std::move(source));
+}
+
+void DeviceScreenWrapper::setGameVideo(const smoothmotion::GameVideo* game)
+{
+    if (_gpuWindow)
+        _gpuWindow->setGameVideo(game);
+    if (_software)
+        _software->setGameVideo(game);
 }
 
 void DeviceScreenWrapper::clearFrameSource()
@@ -251,6 +363,18 @@ void DeviceScreenWrapper::setDisplayViewport(const DisplayViewport& viewport)
         _gpuWindow->setDisplayViewport(viewport);
     else if (_software)
         _software->setDisplayViewport(viewport);
+
+    emit pictureGeometryChanged();
+}
+
+void DeviceScreenWrapper::setPictureView(PictureView::Mode mode)
+{
+    _pictureView = mode;
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->setPictureView(mode);
+    else if (_software)
+        _software->setPictureView(mode);
+    emit pictureGeometryChanged();
 }
 
 void DeviceScreenWrapper::setHudOverlay(HudOverlay* overlay)
@@ -263,6 +387,27 @@ void DeviceScreenWrapper::setHudOverlay(HudOverlay* overlay)
     }
 }
 
+bool DeviceScreenWrapper::setOverlayPainter(std::function<void(QPainter&, int width, int height)> painter)
+{
+    if (!_useGPU || !_gpuWindow)
+        return false;
+    _gpuWindow->setOverlayPainter(std::move(painter));
+    _gpuWindow->requestUpdate();
+    return true;
+}
+
+void DeviceScreenWrapper::setOverlayPointer(std::function<bool(QEvent::Type, const QPointF&, int, int)> pointer)
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->setOverlayPointer(std::move(pointer));
+}
+
+void DeviceScreenWrapper::updateOverlay()
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->requestUpdate();
+}
+
 void DeviceScreenWrapper::clearDisplayViewport()
 {
     _hasViewport = false;
@@ -271,6 +416,8 @@ void DeviceScreenWrapper::clearDisplayViewport()
         _gpuWindow->clearDisplayViewport();
     else if (_software)
         _software->clearDisplayViewport();
+
+    emit pictureGeometryChanged();
 }
 
 void DeviceScreenWrapper::prepareForShutdown()
@@ -377,11 +524,57 @@ CRTProfileParams DeviceScreenWrapper::crtParams() const
     return CRTProfileParams::None();
 }
 
+void DeviceScreenWrapper::setCRTParams(const CRTProfileParams& params)
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->setCRTParams(params);
+    else if (_software)
+        _software->setCRTParams(params);
+}
+
+std::vector<SlangPresetRunner::Parameter> DeviceScreenWrapper::presetParameters() const
+{
+    if (_useGPU && _gpuWindow)
+        return _gpuWindow->presetParameters();
+    return {};
+}
+
+bool DeviceScreenWrapper::setPresetParameter(const QString& name, float value)
+{
+    return _useGPU && _gpuWindow && _gpuWindow->setPresetParameter(name, value);
+}
+
+void DeviceScreenWrapper::resetPresetParameters()
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->resetPresetParameters();
+}
+
+std::map<QString, float> DeviceScreenWrapper::presetOverrides() const
+{
+    if (_useGPU && _gpuWindow)
+        return _gpuWindow->presetOverrides();
+    return {};
+}
+
+void DeviceScreenWrapper::setPresetOverrides(const std::map<QString, float>& overrides)
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->setPresetOverrides(overrides);
+}
+
 bool DeviceScreenWrapper::loadCustomShader(const QString& name)
 {
     if (_useGPU && _gpuWindow)
         return _gpuWindow->loadCustomShader(name);
     return false;
+}
+
+QString DeviceScreenWrapper::customShader() const
+{
+    if (_useGPU && _gpuWindow)
+        return _gpuWindow->customShader();
+    return QString();
 }
 
 std::vector<QString> DeviceScreenWrapper::availableShaders()
@@ -391,7 +584,12 @@ std::vector<QString> DeviceScreenWrapper::availableShaders()
 
 bool DeviceScreenWrapper::isGPUAvailable()
 {
-    return DeviceScreenFactory::probeGPUAcceleration();
+    return DeviceScreenGLWindow::probeGPUAcceleration();
+}
+
+bool DeviceScreenWrapper::recheckGPUAvailable()
+{
+    return DeviceScreenGLWindow::reprobeGPUAcceleration();
 }
 
 void DeviceScreenWrapper::setTemporalBlendingEnabled(bool enabled)
@@ -400,6 +598,15 @@ void DeviceScreenWrapper::setTemporalBlendingEnabled(bool enabled)
         _gpuWindow->setTemporalBlendingEnabled(enabled);
     else if (_software)
         _software->setTemporalBlendingEnabled(enabled);
+}
+
+WindowPresentStats DeviceScreenWrapper::presentStats() const
+{
+    if (_useGPU && _gpuWindow)
+        return _gpuWindow->presentStats();
+    if (_software)
+        return _software->presentStats();
+    return {};
 }
 
 bool DeviceScreenWrapper::temporalBlendingEnabled() const
@@ -443,4 +650,21 @@ int DeviceScreenWrapper::temporalWeightMode() const
     else if (_software)
         return _software->temporalWeightMode();
     return 0;
+}
+
+void DeviceScreenWrapper::setTemporalDecay(float decay)
+{
+    if (_useGPU && _gpuWindow)
+        _gpuWindow->setTemporalDecay(decay);
+    else if (_software)
+        _software->setTemporalDecay(decay);
+}
+
+float DeviceScreenWrapper::temporalDecay() const
+{
+    if (_useGPU && _gpuWindow)
+        return _gpuWindow->temporalDecay();
+    else if (_software)
+        return _software->temporalDecay();
+    return 0.5f;
 }

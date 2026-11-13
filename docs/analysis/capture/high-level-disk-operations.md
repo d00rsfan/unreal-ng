@@ -6,7 +6,7 @@ Design document for a high-level analyzer that captures interactions between the
 
 ## 1. Problem Statement
 
-The current [WD1793Collector](../../../core/src/emulator/io/fdc/wd1793_collector.h#15-143) provides **low-level port access logging** (every IN/OUT to FDC ports), which generates thousands of records per disk operation. This is valuable for hardware debugging but overwhelming for understanding *what the software is actually doing*.
+(2026-10-31: `WD1793Collector` is removed: it grew without a bound and nothing read it. The controller keeps a ring of its last commands instead, `WD1793::GetCommandHistory`, reported as `history` in `DeviceState::Fdc`.) The then-current `WD1793Collector` provided **low-level port access logging** (every IN/OUT to FDC ports), which generates thousands of records per disk operation. This is valuable for hardware debugging but overwhelming for understanding *what the software is actually doing*.
 
 **Goal**: Create a **Stage 1 (High-Level) Analyzer** that interprets the low-level FDC interactions and produces human-readable semantic events like:
 
@@ -63,7 +63,7 @@ graph TD
    - Interprets state to produce semantic events
 
 2. **`FDCEventInterpreter`** (New) - Command-level interpreter
-   - Wraps [WD1793Collector](../../../core/src/emulator/io/fdc/wd1793_collector.h#15-143) events
+   - Wraps `WD1793Collector` events
    - Converts low-level port accesses to command events
    - Tracks sector data flow
 
@@ -263,7 +263,7 @@ Extract from catalog entry at offset `0x08` (type byte).
 
 ### Phase 3: FDC Command Interpretation
 
-- [ ] Hook into [WD1793Collector](../../../core/src/emulator/io/fdc/wd1793_collector.h#15-143) for low-level events
+- [ ] Hook into `WD1793Collector` for low-level events
 - [ ] Aggregate port accesses into semantic FDC commands
 - [ ] Track sector data flow (read/write byte counts)
 - [ ] Detect head movement and seek patterns
@@ -339,7 +339,7 @@ public:
 | Execution breakpoints | ✅ | `requestExecutionBreakpoint(addr, id)` |
 | Memory watchpoints | ✅ | `requestMemoryBreakpoint(addr, r, w, id)` |
 | CPU step hooks | ✅ | `subscribeCPUStep(fn, ctx, id)` |
-| Memory read/write hooks | ✅ | `subscribeMemoryRead/Write(fn, ctx, id)` |
+| Memory read/write hooks | removed 2026-10-26 | never dispatched; a write watch is `requestMemoryBreakpoint` (a tap) |
 | Frame events | ✅ | `dispatchFrameStart()`, `dispatchFrameEnd()` |
 | Auto-cleanup on deactivate | ✅ | Breakpoints + subscriptions cleared |
 | Master enable/disable | ✅ | `setEnabled(bool)` |
@@ -569,7 +569,7 @@ Use a **ring buffer with configurable size** (default 10K events) to prevent unb
 | `AnalyzerManager` | ✅ Done | [analyzermanager.cpp](../../../core/src/debugger/analyzers/analyzermanager.cpp) |
 | Page-Specific Breakpoints | ✅ Done | `requestExecutionBreakpointInPage()` |
 | Silent Dispatch Pattern | ✅ Done | Analyzer breakpoints bypass MessageCenter |
-| Auto-Feature Enable | ✅ Done | `ensureDebugFeaturesEnabled()` |
+| No debug features needed | ✅ Done (2026-10-26) | analyzer breakpoints are taps ([breakpoint-taps](../../inprogress/2026-10-26-breakpoint-taps/README.md)) |
 | CLI `analyzer` commands | ✅ Done | [cli-processor-analyzer-mgr.cpp](../../../core/automation/cli/src/commands/cli-processor-analyzer-mgr.cpp) |
 | DebugManager registration | ✅ Done | [debugmanager.cpp](../../../core/src/debugger/debugmanager.cpp) |
 | Integration Tests | ✅ Done | [analyzermanager_integration_test.cpp](../../../core/tests/debugger/analyzermanager/analyzermanager_integration_test.cpp) |
@@ -2105,25 +2105,16 @@ TEST_F(AnalyzerManagerIntegration_test, AnalyzerBreakpointIsSilent)
 }
 ```
 
-### 18.4 Auto-Feature Orchestration
+### 18.4 No debug features needed
 
-When an analyzer requests its first breakpoint, `AnalyzerManager` automatically enables required debug features:
+Analyzer breakpoints are taps ([breakpoint-taps §8](../../inprogress/2026-10-26-breakpoint-taps/README.md)): the
+`AnalyzerManager` registers itself as a tap sink, and each requested breakpoint carries that sink. A hit is told to
+the analyzer that asked for it and never stops. The breakpoint manager turns on what the taps need by itself: the
+instruction start's check for exec taps (`Z80::execTapHold`), the fast write's hook for write taps. The `debugmode` and
+`breakpoints` features stay as the user set them (until 2026-10-26 the first request switched both on).
 
-```cpp
-void AnalyzerManager::ensureDebugFeaturesEnabled()
-{
-    if (!_featureManager)
-        return;
-    
-    if (!_featureManager->isEnabled(Features::kBreakpoints))
-    {
-        // Enable breakpoints feature - cascades to enable debugmode
-        _featureManager->setFeature(Features::kBreakpoints, true);
-    }
-}
-```
-
-This is verified by the `AutoEnablesFeaturesOnFirstBreakpointRequest` integration test.
+This is verified by the `AnalyzerTapsRunWithoutTheDebugMode` integration test and
+`TRDOSIntegration_test.ActivationNeedsNoDebugFeatures`.
 
 ---
 

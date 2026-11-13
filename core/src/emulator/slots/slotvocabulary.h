@@ -15,6 +15,8 @@
 #undef signals
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 namespace slots
 {
@@ -46,6 +48,9 @@ enum class Function : uint8_t
     Rtc,                ///< "rtc": real-time clock
     Palette,            ///< "palette": Profi v5 palette
     FdcUpd765,          ///< "fdc.upd765": +3 floppy controller
+    FullerAy,           ///< "fuller-ay": the Fuller Box / DK'tronics AY on #3F / #5F (not the AY socket's role)
+    FullerJoystick,     ///< "fuller-joystick": the Fuller stick on #7F
+    AmxMouse,           ///< "amx-mouse": the AMX mouse's Z80 PIO on #1F / #3F / #5F / #7F and its buttons on #DF
     Count
 };
 
@@ -182,7 +187,7 @@ enum class Opt : uint8_t
     Ram,        ///< card RAM size
     Rom,        ///< card ROM / firmware version
     Jp1,        ///< ZXM-MoonSound JP1 "PentEvo"
-    Decode,     ///< Covox port decode width
+    Decode,     ///< port decode width (Covox, Fuller Box)
     Count
 };
 constexpr int kOptCount = static_cast<int>(Opt::Count);
@@ -240,6 +245,10 @@ EnumInfo Describe(Opt value);
 EnumInfo Describe(OptionKind value);
 /// Outcome: id = the matrix code ("✓", "D", ...), description = its meaning
 EnumInfo Describe(Outcome value);
+
+/// A reference-data name as plain text: the names are markdown for the matrix tables and the docs ("Covox `#FB`");
+/// a surface that draws text (a menu, a list) shows "Covox #FB"
+std::string PlainLabel(std::string_view name);
 
 /// The BusSignal with bit index `index` (0 .. kBusSignalCount - 1)
 constexpr BusSignal SignalAt(int index)

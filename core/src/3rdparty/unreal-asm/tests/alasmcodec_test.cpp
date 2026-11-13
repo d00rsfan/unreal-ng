@@ -24,20 +24,21 @@ struct Sample
     size_t canonicalMisses;              ///< lines the canonical tokenizer writes differently (older editors, text imports)
 };
 
-const std::vector<std::string> kAll = {"3.8", "4.2", "4.42", "4.5", "4.44", "5.07"};
+const std::vector<std::string> kAll = {"3.8", "4.2", "4.42", "4.5", "4.44", "5.0", "5.05", "5.07"};
 
-// research-alasm.md §5 explains each range and each miss
+// research-alasm.md §5 explains each range and each miss; 5.05 differs from 5.07 only in spelling #D2 (UNTIL), so
+// every file valid for 5.07 is valid for 5.05 too; 5.0 also spells #D3 IF and has no RUN (BUILD+ uses RUN)
 const Sample kSamples[] = {
     {"ZADACHA", kAll, 0},                                  // from the ALASM 3.8 disk; nothing version-specific
     {"SCR4MAKE", kAll, 1},                                 // a text import: trailing blank run kept
-    {"128KDRV", {"4.2", "4.42", "4.5", "4.44", "5.07"}, 0},  // uses ELSE / DB-family codes 3.8 lacks
-    {"fibo", {"4.42", "4.5", "4.44", "5.07"}, 0},
-    {"SNAKE", {"4.5", "4.44", "5.07"}, 0},
-    {"2Kolonki", {"4.44", "5.07"}, 0},
-    {"RECPIC", {"5.07"}, 0},
-    {"BUILD+", {"5.07"}, 2},                               // DISPLAY /D: an older editor tokenized the switch letter
-    {"AL442nfo", {"4.2", "4.42", "4.5"}, 1},               // DEFM "string"
-    {"AL444nfo", {"4.5"}, 1},                              // DD left as text: typed in a version without DD
+    {"128KDRV", {"4.2", "4.42", "4.5", "4.44", "5.0", "5.05", "5.07"}, 0},  // uses ELSE / DB-family codes 3.8 lacks
+    {"fibo", {"4.42", "4.5", "4.44", "5.0", "5.05", "5.07"}, 0},
+    {"SNAKE", {"4.5", "4.44", "5.0", "5.05", "5.07"}, 0},
+    {"2Kolonki", {"4.44", "5.0", "5.05", "5.07"}, 0},
+    {"RECPIC", {"5.0", "5.05", "5.07"}, 0},
+    {"BUILD+", {"5.05", "5.07"}, 0},                       // DISPLAY /D: the switch letter a register keyword
+    {"AL442nfo", {"4.42", "4.5"}, 0},                      // DEFM "string"; its DISPLAY /L line has keywords 4.2 lacks
+    {"AL444nfo", {"4.5"}, 0},                              // DD left as text: typed in a version without DD
 };
 
 containers::TrdosFile Unwrap(const std::string& name)
@@ -106,7 +107,13 @@ TEST(AlasmCodec_Test, LineEncodingRules)
     EXPECT_EQ(encode("        ld a ;тест"), (std::vector<uint8_t>{12, 8, 'l', 'd', 1, 'a', 1, ';', 0xE2, 0xA5, 0xE1, 0xE2}));
     // DD: its hex operand is not split into register keywords
     EXPECT_EQ(encode("        DD BC"), (std::vector<uint8_t>{4, 0x96, 'B', 'C'}));
-    for (const std::string text : {"        LD A,1", "LOOP    DJNZ LOOP", "LD A,1", "        ld a ;тест", "        DD BC"})
+    // After another character below '?' a register is a keyword, as ALASM 5.09's editor stored these when typed in it:
+    // DISPLAY's switches /D /H /A /L need them (#F1 #F3 #F5 #F4); /T is no register
+    EXPECT_EQ(encode("        DISPLAY \"d\",/D,1"), (std::vector<uint8_t>{10, 0xA0, '"', 'd', '"', ',', '/', 0xF1, ',', '1'}));
+    EXPECT_EQ(encode("        DISPLAY /L,/T,X"), (std::vector<uint8_t>{9, 0xA0, '/', 0xF4, ',', '/', 'T', ',', 'X'}));
+    EXPECT_EQ(encode("        DW 1-D,%D,1/HL"), (std::vector<uint8_t>{12, 0xA3, '1', '-', 0xF1, ',', '%', 0xF1, ',', '1', '/', 0xE2}));
+    for (const std::string text : {"        LD A,1", "LOOP    DJNZ LOOP", "LD A,1", "        ld a ;тест", "        DD BC",
+                                   "        DISPLAY \"d\",/D,1", "        DW 1-D,%D,1/HL"})
     {
         encode(text);
         EXPECT_EQ(codecs::AlasmCodec::DecodeLine(record, v5), text);
@@ -145,6 +152,31 @@ TEST(AlasmCodec_Test, ConversionToAnotherVersionWarnsAboutLostKeywords)
     DecodeOptions as5;
     as5.subversion = "5.07";
     EXPECT_EQ(codec.Decode(encoded.bytes, as5).document.Text(), decoded.document.Text()) << "the text is unchanged";
+}
+
+TEST(AlasmCodec_Test, Version505SpellsUntilWithoutTheZero)
+{
+    // ALASM 5.05 (alasm_64.C, its alTOKENS.H) has 5.07's table except #D2: UNTIL, renamed UNTIL0 in 5.07. SNAKE (also
+    // on the 5.05 disk) reads with either spelling and goes back to the same bytes
+    const codecs::AlasmCodec codec;
+    const auto data = Unwrap("SNAKE").data;
+    DecodeOptions as505;
+    as505.subversion = "5.05";
+    const DecodeResult decoded = codec.Decode(data, as505);
+    ASSERT_TRUE(decoded.ok);
+    EXPECT_NE(decoded.document.Text().find("        UNTIL GAMEOVER\n"), std::string::npos);
+    EXPECT_EQ(decoded.document.Text().find("UNTIL0"), std::string::npos);
+    EncodeOptions to505;
+    to505.subversion = "5.05";
+    EXPECT_EQ(codec.Encode(decoded.document, to505).bytes, data);
+    // Typed in 5.05, "UNTIL0" is not a keyword: a mnemonic needs a blank, ';' or the end after it
+    const codecs::alasm::Version& v505 = *codecs::alasm::FindVersion("5.05");
+    std::vector<uint8_t> record;
+    std::string error;
+    ASSERT_TRUE(codecs::AlasmCodec::EncodeLine("        UNTIL0 1", v505, record, error)) << error;
+    EXPECT_EQ(record[1], 8) << "a blank run, then text";
+    ASSERT_TRUE(codecs::AlasmCodec::EncodeLine("        UNTIL 1", v505, record, error)) << error;
+    EXPECT_EQ(record, (std::vector<uint8_t>{3, 0xD2, '1'}));
 }
 
 TEST(AlasmCodec_Test, FreshFileFromText)

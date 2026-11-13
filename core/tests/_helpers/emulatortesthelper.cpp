@@ -8,8 +8,11 @@
 #include "debugger/debugmanager.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/emulatormanager.h"
+#include "emulator/io/fdc/fdd.h"
+#include "emulator/io/rtc/ds12887.h"
 #include "emulator/memory/memory.h"
 #include "emulator/platform.h"
+#include "emulator/ports/portdecoder.h"
 #include "_helpers/soundcardscope.h"
 #include "_helpers/testpathhelper.h"
 
@@ -69,20 +72,31 @@ namespace
 std::unordered_map<uint32_t, BreakpointCallback> EmulatorTestHelper::_breakpointCallbacks;
 
 Emulator* EmulatorTestHelper::CreateStandardEmulator(const std::string& modelName, LoggerLevel logLevel,
-                                                     RamPowerOn ramPowerOn)
+                                                     RamPowerOn ramPowerOn,
+                                                     const std::function<void(CONFIG&)>& configOverride)
 {
     EmulatorManager* manager = EmulatorManager::GetInstance();
+
+    // The bare NEXT personality (the boot ROM and the card off), then the caller's override
+    const std::function<void(CONFIG&)> overrides =
+        [ram = Config::RamPowerOnOverride(ramPowerOn), configOverride](CONFIG& config)
+    {
+        ram(config);
+        config.next_boot_rom_path[0] = '\0';
+        config.next_sd_path[0] = '\0';
+        if (configOverride)
+            configOverride(config);
+    };
 
     // Create emulator with model name if specified
     std::shared_ptr<Emulator> emulator;
     if (!modelName.empty())
     {
-        emulator = manager->CreateEmulatorWithModel("test-emulator", modelName, logLevel, nullptr,
-                                                    Config::RamPowerOnOverride(ramPowerOn));
+        emulator = manager->CreateEmulatorWithModel("test-emulator", modelName, logLevel, nullptr, overrides);
     }
     else
     {
-        emulator = manager->CreateEmulator("test-emulator", logLevel, Config::RamPowerOnOverride(ramPowerOn));
+        emulator = manager->CreateEmulator("test-emulator", logLevel, overrides);
     }
 
     if (!emulator)
@@ -93,8 +107,18 @@ Emulator* EmulatorTestHelper::CreateStandardEmulator(const std::string& modelNam
     // EmulatorManager already calls Init() during creation
     // Force deterministic boot: 48K BASIC (RESET=BASIC) regardless of the
     // staged unreal.ini, which CMake re-copies on every build (RESET=128)
+    // An instance starts muted (the GUI or an automation plane unmutes it); the audio tests expect the host to hear it
+    if (emulator->GetContext()->pSoundManager)
+        emulator->GetContext()->pSoundManager->unmute();
     emulator->GetContext()->config.reset_rom = RM_SOS;
-    emulator->Reset();
+    // A power cycle, not the reset button: the machine starts as created (the ZX Next's soft reset keeps the machine type and
+    // NR #02 reads it as a soft reset)
+    emulator->Reset(true);
+
+    // The CMOS clock in its test mode: emulated time from one fixed instant instead of the host's live clock, so two
+    // runs read the same time to the microsecond (an ATM3 boot polls it) however fast the host runs them
+    if (PortDecoder* ports = emulator->GetContext()->pPortDecoder; ports && ports->RtcChip())
+        ports->RtcChip()->AnchorEmulatedTime(Ds12887::ToMicros({2026, 1, 1, 12, 0, 0}));
 
     // Test-speed defaults (2026-09-13): the two per-frame "HQ" features are
     // OFF for tests. Per-t-state screen rendering (screenhq) and the FIR
@@ -258,6 +282,32 @@ void EmulatorTestHelper::RemoveBreakpoint(Emulator* emulator, uint32_t breakpoin
 
     // Remove stored callback
     _breakpointCallbacks.erase(breakpointId);
+}
+
+void EmulatorTestHelper::ReleaseBareCore(Core*& core, EmulatorContext*& context)
+{
+    // The order of Emulator::Release: the drives first (WD1793's destructor skips the null ones), then the core
+    ReleaseDiskDrives(context);
+    delete core;
+    core = nullptr;
+    delete context;
+    context = nullptr;
+}
+
+void EmulatorTestHelper::ReleaseDiskDrives(EmulatorContext* context)
+{
+    if (context == nullptr)
+        return;
+
+    for (FDD*& drive : context->coreState.diskDrives)
+    {
+        if (drive != nullptr)
+        {
+            drive->ejectDisk();
+            delete drive;
+            drive = nullptr;
+        }
+    }
 }
 
 void EmulatorTestHelper::CleanupEmulator(Emulator* emulator)

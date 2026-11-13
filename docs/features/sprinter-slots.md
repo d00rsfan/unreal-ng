@@ -31,7 +31,7 @@ Slot2=NE2000
 ## Two sections, two kinds of card
 
 - **`[ISA]`** says what physical ISA card sits in each slot: `Slot1=` and `Slot2=`, one of `NONE`, `ZXBUS`,
-  `NE2000`, `EL3C509B`, `SPRINTERESP`, `MODEM`, `DUAL16552`. The network and serial cards are complete here.
+  `NE2000`, `EL3C509B`, `SPRINTERESP`, `MODEM`, `DUAL16552`, `WILDSOUND`. The network, serial and Wild Sound cards are complete here.
 - **`[SLOTS]`** says which ZX Spectrum card goes **on** the ZX-bus adapter (`isa.1`), and what is in the AY socket.
 
 So a General Sound needs both: the adapter in `[ISA]` (`Slot1=ZXBUS`) and the card in `[SLOTS]` (`isa.1 = ...`).
@@ -121,7 +121,13 @@ ay-socket = ay
 ```
 
 Other ZX-bus cards (MoonSound, Covox, SounDrive, ZX-MultiSound, ZXNETUSB, ZX-WiFi) are **not** supported on the
-Sprinter: the adapter carries the General Sound family only.
+Sprinter: the adapter carries the General Sound family only. Such an entry is left out with the reason (`the ZX-bus
+adapter in isa.1 passes the General Sound's ports only ...`), and a slot change asking for one is refused.
+
+A General Sound card goes only where the ISA slot holds the adapter: `isa.2 = gs` needs `[ISA] Slot2=ZXBUS`, else it
+is left out (`isa.2 holds NE2000 Ethernet ([ISA] Slot2), not the ZX-bus adapter a ZX-bus card needs: [ISA]
+Slot2=ZXBUS`). With the adapter in both slots the card sits on the one its `[SLOTS]` line names; the other adapter's
+ZX-bus is empty.
 
 ## ISA cards (`[ISA]`)
 
@@ -137,6 +143,7 @@ Write I/O bases as `0x300` or `300h`: a `#` starts a comment in the INI file.
 | `SPRINTERESP` | SprinterESP Wi-Fi (I/O `#3E8`, IRQ 3 fixed by the board) | `SlotNPeer` = `AT` (its own ESP) \| `loopback` \| `tcp:host:port` \| `serial:/dev/tty...,115200` \| `none`; `SlotNMac` |
 | `MODEM` | ISA Hayes modem (16550A) | `SlotNBase` = `0x3F8` \| `0x2F8` \| `0x3E8` \| `0x2E8`; `SlotNIrq` = 2 \| 3 \| 4 \| 5 \| 7; `SlotNPeer` = `MODEM` |
 | `DUAL16552` | SprinterSerial: COM1 `#3F8` + COM2 `#2F8` | `SlotNPeer` / `SlotNPeerB` (COM1 / COM2 line); `SlotNIrq` = 3 \| 2 \| 0 (J5); `SlotNIrqB` = 4 \| 2 \| 0 (J6); `SlotNDecode` = `FULL` \| `PARTIAL` |
+| `WILDSOUND` | Robus's Wild Sound: two AY chips and an XM player (I/O `#000` / `#001`, no IRQ) | - |
 
 NE2000 in slot 2 (the shipped setting):
 
@@ -199,6 +206,23 @@ Slot1=NONE
 
 More on the network cards: [.recipe/machines/sprinter-network.md](../../.recipe/machines/sprinter-network.md).
 
+### Wild Sound
+
+Robus's ISA Wild Sound: an STM32 that answers like two AY-3-8910 at ISA I/O `#000` (register select) and `#001`
+(data), plus an XM player the program uploads a module to. The card plays either its AY chips or the module, as
+the real one does. The XM plays with FastTracker 2 behaviour (the card's 2021 firmware has playback bugs; the
+emulation follows what the modules mean). Its programs probe slot 1 first, then slot 2:
+
+```ini
+[ISA]
+Slot1=WILDSOUND
+```
+
+`DEMOS\WILDSND\PROSIAK.EXE` on the MAME pack's system disk plays its tune on it; more programs (XM, S3M, PT3) are in
+`testdata/sound/wildsound/`. The mixer shows three rows, `WS XM`, `WS AY 1`, `WS AY 2`. Design and protocol:
+[docs/inprogress/2026-10-09-wildsound/](../inprogress/2026-10-09-wildsound/README.md); the recipe:
+[.recipe/machines/sprinter-sound.md](../../.recipe/machines/sprinter-sound.md#wild-sound-isa-card-verified-2026-10-09).
+
 ## At creation, without editing the file
 
 WebAPI / MCP `create` takes the ISA kinds and the `[SLOTS]` set:
@@ -216,8 +240,18 @@ CLI: `create SPRINTER --isa-slot2 none`.
 B=http://localhost:8090/api/v1/emulator
 curl -s $B/$ID/state/isa | jq -r .summary
 # slot 1: zxbus I/O #033-#0BB -> NeoGS on the ZX-bus: #B3 / #BB / #33, RESET from ISA RESET DRV; slot 2: ne2000 I/O #300-#31F IRQ 3
-curl -s $B/$ID/slots | jq '.slots[] | {slot, card, fit, state}'
+curl -s $B/$ID/slots | jq '.slots[] | {slot, card, bus, host, fit, state}'
+# {"slot":"isa.1","card":"neogs","bus":"isa.1.zxbus","host":"isa.1","fit":"unrealistic","state":"active"}
+curl -s $B/$ID/slots | jq -c '.machineSlots[] | {slot, card, name, details, source, hostsBus, hostedCard}'
+# {"slot":"isa.1","card":"zxbus","name":"ISA to ZX-bus adapter","details":"","source":"[ISA] Slot1","hostsBus":"isa.1.zxbus","hostedCard":"neogs"}
+# {"slot":"isa.2","card":"ne2000","name":"NE2000 Ethernet","details":"RTL8019AS, #300, IRQ 3","source":"[ISA] Slot2","hostsBus":null,"hostedCard":null}
 ```
 
-CLI: `slots`, `isa` (or `state isa`). A card that was not fitted shows the reason (`not_fitted` in `state/isa`, the `state` of
+The slot report lists the ISA slots as the machine's own slots (`machineSlots`: the cards come from `[ISA]`, not from
+`[SLOTS]`), the adapter's ZX-bus as a bus hosted by its slot (`buses[]`: `isa.1.zxbus`, `host` `isa.1`) and the
+General Sound on that bus. The Qt Machine > Slots window lists the ISA slots under "Board Slots" (read-only: `isa.1`
+ISA to ZX-bus adapter, hosts `isa.1.zxbus: neogs`; `isa.2` NE2000 Ethernet) and the card among the expansion slots as
+`isa.1: NeoGS (on isa.1.zxbus)`.
+
+CLI: `slots` (with a "machine slots" part), `isa` (or `state isa`). A card that was not fitted shows the reason (`not_fitted` in `state/isa`, the `state` of
 the slot in `slots`).

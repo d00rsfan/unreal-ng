@@ -13,9 +13,15 @@
 #include "emulator/io/fdc/trdoscatalog.h"
 #include "emulator/io/fdc/wd1793.h"
 #include "emulator/memory/memory.h"
+#include "emulator/ports/models/portdecoder_atm710.h"
+#include "emulator/ports/models/portdecoder_tsconf.h"
+#include "emulator/video/screen.h"
 #include "loaders/disk/loader_trd.h"
+#include "base/featuremanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -73,8 +79,8 @@ protected:
         LoaderTRD loader(_context, TrdPath(name));
         if (!loader.loadImage())
             return nullptr;
-        // The loader owns the image: take a private copy of its content into a fresh image
-        DiskImage* src = loader.getImage();
+        // The loader hands its image over (it does not free it): take a private copy of its content into a fresh image
+        const std::unique_ptr<DiskImage> src(loader.getImage());
         auto copy = std::make_unique<DiskImage>(src->getCylinders(), src->getSides());
         for (uint8_t t = 0; t < src->getCylinders() * src->getSides(); t++)
             for (uint8_t s = 0; s < 16; s++)
@@ -148,10 +154,11 @@ TEST_F(DiskAutostart_Test, Catalog_AcceptsWhatTrdosAccepts)
         ASSERT_FALSE(path.empty());
         LoaderTRD loader(_context, path);
         ASSERT_TRUE(loader.loadImage()) << int(diskType);
+        const std::unique_ptr<DiskImage> image(loader.getImage());  // the loader hands its image over
         TrdosCatalog catalog;
-        EXPECT_TRUE(catalog.Parse(*loader.getImage())) << "disk type #" << std::hex << int(diskType);
+        EXPECT_TRUE(catalog.Parse(*image)) << "disk type #" << std::hex << int(diskType);
         EXPECT_NE(catalog.FindBoot(), nullptr) << int(diskType);
-        EXPECT_EQ(_context->pDiskAutostart->MakePlan(*loader.getImage()).action, DiskAutostart::Action::Boot)
+        EXPECT_EQ(_context->pDiskAutostart->MakePlan(*image).action, DiskAutostart::Action::Boot)
             << int(diskType);
         std::remove(path.c_str());
     }
@@ -263,6 +270,71 @@ TEST_F(DiskAutostart_Test, Plan_PerDiskContent)
     EXPECT_EQ(autostart->MakePlan(blank).action, DiskAutostart::Action::MountOnly);
 }
 
+namespace
+{
+/// Track 0 of an iS-DOS disk as iS-DOS formats it: sectors 1, 2, 3, 4, 9 of 1024 bytes (four 256-byte blocks each),
+/// the descriptor in block 0, the root catalogue in block 4 and boot.sys at block 16, which is sector 9: the sector
+/// TR-DOS RUN loads, so its code takes over (ISDOS50.FDI, TASiS 5.40 and the other images of the iS-DOS collection)
+void FormatIsdosTrack0(DiskImage& image, bool chic)
+{
+    DiskImage::TrackFormatSpec spec = DiskImage::TrackFormatSpec::ibm(5, DiskImage::SectorSizeEnum::SECTOR_SIZE_1024);
+    spec.sectorNumbers = {1, 2, 3, 4, 9};
+    spec.dataFill = 0x00;  // ibm() fills with #E5: the high bytes of block numbers must be 0
+    image.getTrack(0)->formatTrack(0, 0, spec);
+
+    uint8_t* desc = image.getTrack(0)->findSector(1)->data;
+    std::memcpy(desc + (chic ? 13 : 10), "DSK", 3);
+    desc[20] = 4;  // root catalogue block
+    desc[24] = 4;  // blocks per sector
+    desc[25] = 5;  // sectors per track
+    const uint8_t sectorTable[5] = {0, 1, 2, 3, 8};
+    std::memcpy(desc + 64, sectorTable, sizeof(sectorTable));
+
+    uint8_t* bootSys = image.getTrack(0)->findSector(2)->data + 32;  // root catalogue entry 1
+    std::memcpy(bootSys, "boot    sys", 11);
+    bootSys[11] = 0x01;  // live
+    bootSys[17] = 16;    // first block
+    bootSys[19] = 0xFF;
+}
+}  // namespace
+
+/// Owner test 2026-10-25: iS-DOS / TASiS floppies (no TR-DOS catalogue) were "not TR-DOS formatted - mounted only",
+/// while TR-DOS starts them with RUN
+TEST_F(DiskAutostart_Test, Plan_IsdosBootDisk)
+{
+    DiskAutostart* autostart = _context->pDiskAutostart;
+    ASSERT_NE(autostart, nullptr);
+
+    for (bool chic : {true, false})
+    {
+        DiskImage image(80, 2);
+        FormatIsdosTrack0(image, chic);
+        const DiskAutostart::Plan plan = autostart->MakePlan(image);
+        EXPECT_EQ(plan.action, DiskAutostart::Action::Boot) << (chic ? "Chic" : "Classic");
+        EXPECT_EQ(plan.message, "Autostart: iS-DOS boot.sys");
+    }
+
+    auto variant = [&](auto&& damage) {
+        DiskImage image(80, 2);
+        FormatIsdosTrack0(image, true);
+        damage(image.getTrack(0)->findSector(1)->data, image.getTrack(0)->findSector(2)->data + 32);
+        return autostart->MakePlan(image).action;
+    };
+    EXPECT_EQ(variant([](uint8_t* desc, uint8_t*) { desc[13] = 'X'; }), DiskAutostart::Action::MountOnly);
+    EXPECT_EQ(variant([](uint8_t*, uint8_t* bootSys) { bootSys[0] = 'B'; }), DiskAutostart::Action::MountOnly);
+    EXPECT_EQ(variant([](uint8_t*, uint8_t* bootSys) { bootSys[11] = 0x00; }), DiskAutostart::Action::MountOnly);
+    EXPECT_EQ(variant([](uint8_t*, uint8_t* bootSys) { bootSys[17] = 17; }), DiskAutostart::Action::MountOnly);
+    // boot.sys at block 16, but block 16 is not sector 9: RUN would load something else
+    EXPECT_EQ(variant([](uint8_t* desc, uint8_t*) { desc[68] = 3; }), DiskAutostart::Action::MountOnly);
+
+    // Same sectors, but 256 bytes: not iS-DOS
+    DiskImage small(80, 2);
+    DiskImage::TrackFormatSpec spec = DiskImage::TrackFormatSpec::ibm(5, DiskImage::SectorSizeEnum::SECTOR_SIZE_256);
+    spec.sectorNumbers = {1, 2, 3, 4, 9};
+    small.getTrack(0)->formatTrack(0, 0, spec);
+    EXPECT_EQ(autostart->MakePlan(small).action, DiskAutostart::Action::MountOnly);
+}
+
 TEST_F(DiskAutostart_Test, Plan_UnsupportedMachine)
 {
     EmulatorTestHelper::CleanupEmulator(_emulator);
@@ -273,7 +345,9 @@ TEST_F(DiskAutostart_Test, Plan_UnsupportedMachine)
     std::string reason;
     EXPECT_EQ(_context->pMemory->base_dos_rom == nullptr, !_context->pDiskAutostart->IsTrdosCapable(&reason));
     if (_context->pMemory->base_dos_rom == nullptr)
+    {
         EXPECT_FALSE(reason.empty());
+    }
 }
 
 /// End-to-end: real TR-DOS ROM boots the disk after AutostartDisk()
@@ -329,6 +403,8 @@ TEST_F(DiskAutostart_Boot_Test, ExistingBoot_RunsThroughRom)
     auto result = _emulator->AutostartDisk(TrdPath("atarin.trd"));
     ASSERT_TRUE(result.mounted);
     ASSERT_TRUE(result.started) << result.message;
+    EXPECT_FALSE(result.ttdSessionEnded) << "no session ran";
+    EXPECT_EQ(result.message.find("TTD"), std::string::npos) << result.message;
 
     DiskImage* image = _context->coreState.diskDrives[0]->getDiskImage();
     TrdosCatalog catalog;
@@ -523,4 +599,257 @@ TEST(DiskAutostart_Unsupported, NoTrdosRomMachinesOnlyMount)
         }
         EmulatorTestHelper::CleanupEmulator(emulator);
     }
+}
+
+/// State-registry gap 16 (2026-10-07): the name hook rewrites the cold-start line from the host side. In a
+/// black box (the autostart's reset ended the session, the next one starts at the next frame) the rewrite is a
+/// recorded edit with its bytes, so a replay across it lands on the live machine; a replay never runs the hook
+TEST_F(DiskAutostart_Boot_Test, TheNameHookIsARecordedEditOfTheBlackBox)
+{
+    ttd::TimeTravelController* ttd = _context->pTimeTravelController;
+    ASSERT_NE(ttd, nullptr);
+    _emulator->GetFeatureManager()->setFeature(Features::kDebugMode, true);
+    _emulator->GetFeatureManager()->setFeature(Features::kTimeTravel, true);
+    _context->pMemory->UpdateFeatureCache();
+    ttd->SetBlackBox(true, 1);
+    ASSERT_TRUE(ttd->StartRecording());   // the black box runs, as unreal-qt starts it
+
+    auto result = _emulator->AutostartDisk(TrdPath("across_the_edge_by_demarche.trd"));
+    ASSERT_TRUE(result.started) << result.message;
+    EXPECT_TRUE(result.ttdSessionEnded) << "the boot ended the session: the answer says so";
+    EXPECT_NE(result.message.find("the TTD session ended"), std::string::npos) << result.message;
+    ASSERT_TRUE(_context->pDiskAutostart->IsArmed());
+    _emulator->RunNFrames(1, true);
+    ASSERT_TRUE(ttd->IsRecording()) << "the black box records again after the autostart's reset";
+    const size_t events = ttd->GetSessionInfo().externalEventCount;
+
+    ASSERT_GT(RunUntilTrue([&] { return !_context->pDiskAutostart->IsArmed(); }, 300), 0) << "the hook did not fire";
+    EXPECT_EQ(ttd->GetSessionInfo().externalEventCount, events + 1) << "the rewrite is one recorded edit";
+    _emulator->RunNFrames(1, true);
+    const uint64_t after = _context->emulatorState.frame_counter;
+    std::vector<uint8_t> live(0xC000);
+    for (uint32_t a = 0x4000; a < 0x10000; a++)
+        live[a - 0x4000] = _context->pMemory->DirectReadFromZ80Memory(static_cast<uint16_t>(a));
+    ttd->StopRecording();
+    ttd->SetBlackBox(false);
+
+    ASSERT_TRUE(ttd->SeekTo({ttd->GetCheckpoint(0)->time.frame, 0}));
+    ASSERT_TRUE(ttd->SeekTo({after, 0}));
+    size_t first = 0;
+    while (first < live.size() &&
+           _context->pMemory->DirectReadFromZ80Memory(static_cast<uint16_t>(0x4000 + first)) == live[first])
+        first++;
+    EXPECT_EQ(first, live.size()) << "the replay differs from #" << std::hex << (0x4000 + first);
+}
+
+/// Owner report 2026-10-11 (Ball Quest, BQ ATM on BALLQ_GR.SCL: half of the EGA planes missing on the ATM710). The
+/// TR-DOS cold start probes RAM page 31 for a resident and leaves window 3 of the #7FFD.4 = 1 set over RAM 24-31 (the
+/// ATM710's #FFF7 = #E7, the ATM450's #FDFD = 3), so a program's #7FFD pages never reach the RAM the picture comes
+/// from. The autostart boots the 128K way instead: once the cold start reaches the command loop, every #7FFD page n
+/// is RAM n in window 3, with #7FFD bit 4 either way. Boot-bound: the cold start runs to the TR-DOS command loop (a
+/// few frames, in turbo)
+class DiskAutostart_Atm_Test : public ::testing::TestWithParam<const char*>
+{
+};
+
+TEST_P(DiskAutostart_Atm_Test, ThePagesOfThe7FFDAreTheFirst128KAfterTheColdStart)
+{
+    MessageCenter::DisposeDefaultMessageCenter();
+    Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator(GetParam(), LoggerLevel::LogError);
+    ASSERT_NE(emulator, nullptr);
+    EmulatorContext* context = emulator->GetContext();
+    ASSERT_GT(context->config.ramsize, 128u) << "the cold start's window 3 needs RAM above 128 KB to differ";
+    emulator->EnableTurboMode();
+
+    auto result = emulator->AutostartDisk(TestPathHelper::GetTestDataPath("loaders/trd/atarin.trd"));
+    ASSERT_TRUE(result.started) << result.message;
+    ASSERT_TRUE(context->pDiskAutostart->IsColdStartFinishPending());
+    for (int frames = 0; frames < 200 && context->pDiskAutostart->IsColdStartFinishPending(); frames++)
+        emulator->RunNFrames(1, true);
+    ASSERT_FALSE(context->pDiskAutostart->IsColdStartFinishPending()) << "the cold start never reached the command loop";
+
+    Memory* memory = context->pMemory;
+    for (uint8_t page = 0; page < 8; page++)
+    {
+        for (uint8_t rom48 : {uint8_t(0x10), uint8_t(0x00)})
+        {
+            context->pPortDecoder->DecodePortOut(0x7FFD, static_cast<uint8_t>(rom48 | page), 0x8000);
+            EXPECT_EQ(memory->MapZ80AddressToPhysicalAddress(0xC000), memory->RAMPageAddress(page))
+                << GetParam() << ": #7FFD = #" << std::hex << int(rom48 | page);
+        }
+    }
+    EmulatorTestHelper::CleanupEmulator(emulator);
+}
+
+INSTANTIATE_TEST_SUITE_P(Models, DiskAutostart_Atm_Test, ::testing::Values("ATM710", "ATM450"));
+
+/// Owner report 2026-10-18 (thebrd2.trd on the ATM710 at 7 MHz loaded slowly): the autostart's quick reset skips the
+/// BIOS, which on a real reset sets the clock again, so the disk ran at the reset's 3.5 MHz. The clock the machine ran
+/// at is kept (Xpeccy keeps it too) through the cold start and its 128K paging; a real reset still clears #FF77.
+/// Boot-bound: the cold start runs to the TR-DOS command loop (a few frames, in turbo)
+TEST(DiskAutostart_Atm710, TheClockTheMachineRanAtIsKept)
+{
+    MessageCenter::DisposeDefaultMessageCenter();
+    Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator("ATM710", LoggerLevel::LogError);
+    ASSERT_NE(emulator, nullptr);
+    EmulatorContext* context = emulator->GetContext();
+    EmulatorState& state = context->emulatorState;
+    emulator->EnableTurboMode();
+    context->pPortDecoder->DecodePortOut(0xFF77, static_cast<uint8_t>(state.pFF77 | 0x08), 0x8000);
+    ASSERT_EQ(state.hw_turbo_ratio, 2) << "#FF77 bit 3: 7 MHz";
+
+    auto result = emulator->AutostartDisk(TestPathHelper::GetTestDataPath("loaders/trd/atarin.trd"));
+    ASSERT_TRUE(result.started) << result.message;
+    EXPECT_EQ(state.hw_turbo_ratio, 2) << "after the quick reset";
+    for (int frames = 0; frames < 200 && context->pDiskAutostart->IsColdStartFinishPending(); frames++)
+        emulator->RunNFrames(1, true);
+    ASSERT_FALSE(context->pDiskAutostart->IsColdStartFinishPending()) << "the cold start never reached the command loop";
+    EXPECT_EQ(state.hw_turbo_ratio, 2) << "after the 128K paging";
+    EXPECT_EQ(state.hw_turbo_ratio_applied, 2);
+
+    context->pCore->Reset();
+    EXPECT_EQ(state.hw_turbo_ratio, 1) << "a real reset clears #FF77";
+    EmulatorTestHelper::CleanupEmulator(emulator);
+}
+
+/// Owner report 2026-11-02: the autostart from the ATM710's BIOS menu ran at 3.5 MHz. The menu's TURBO ON (the default
+/// after every reset) takes effect only when an entry is chosen, which the autostart's quick reset skips: the autostart
+/// stands in for that choice and starts at 7 MHz; with TURBO OFF at 3.5 MHz. Boot-bound: the BIOS runs to its menu and
+/// the cold start to the TR-DOS command loop (in turbo)
+TEST(DiskAutostart_Atm710, TheBiosMenuTurboItemSetsTheClock)
+{
+    for (const bool turboOn : {true, false})
+    {
+        MessageCenter::DisposeDefaultMessageCenter();
+        Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator("ATM710", LoggerLevel::LogError);
+        ASSERT_NE(emulator, nullptr);
+        EmulatorContext* context = emulator->GetContext();
+        EmulatorState& state = context->emulatorState;
+        auto* decoder = dynamic_cast<PortDecoder_ATM710*>(context->pPortDecoder);
+        ASSERT_NE(decoder, nullptr);
+        emulator->EnableTurboMode();
+        for (int frames = 0; frames < 300 && !decoder->BiosMenuTurbo(); frames++)
+            emulator->RunNFrames(1, true);
+        ASSERT_TRUE(decoder->BiosMenuTurbo()) << "the BIOS menu never came up with TURBO ON";
+        ASSERT_EQ(state.hw_turbo_ratio, 1) << "the menu itself runs at 3.5 MHz";
+        if (!turboOn)
+            context->pMemory->RAMPageAddress(2)[PortDecoder_ATM710::BIOS_MENU_TURBO_FLAG] = 0;  // the item set to OFF
+
+        auto result = emulator->AutostartDisk(TestPathHelper::GetTestDataPath("loaders/trd/atarin.trd"));
+        ASSERT_TRUE(result.started) << result.message;
+        for (int frames = 0; frames < 200 && context->pDiskAutostart->IsColdStartFinishPending(); frames++)
+            emulator->RunNFrames(1, true);
+        ASSERT_FALSE(context->pDiskAutostart->IsColdStartFinishPending()) << "the cold start never reached the command loop";
+        EXPECT_EQ(state.hw_turbo_ratio_applied, turboOn ? 2 : 1) << (turboOn ? "TURBO ON" : "TURBO OFF");
+        EmulatorTestHelper::CleanupEmulator(emulator);
+    }
+}
+
+/// Owner request 2026-11-02: the Scorpion ZS-256 Turbo+ at 7 MHz (IN #7FFD strobed the flip-flop) keeps that clock
+/// through the autostart's quick reset and its TR-DOS cold start, as the ATM710 does; a real reset still clears the
+/// flip-flop. Boot-bound: the cold start runs to the TR-DOS command loop (a few frames, in turbo)
+class DiskAutostart_ScorpionClock_Test : public ::testing::TestWithParam<const char*> {};
+
+TEST_P(DiskAutostart_ScorpionClock_Test, TheClockTheMachineRanAtIsKept)
+{
+    MessageCenter::DisposeDefaultMessageCenter();
+    Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator(GetParam(), LoggerLevel::LogError);
+    ASSERT_NE(emulator, nullptr);
+    EmulatorContext* context = emulator->GetContext();
+    EmulatorState& state = context->emulatorState;
+    emulator->EnableTurboMode();
+    context->pPortDecoder->DecodePortIn(0x7FFD, 0x8000);
+    ASSERT_EQ(state.hw_turbo_ratio, 2) << GetParam() << ": IN #7FFD sets the Turbo+ flip-flop";
+
+    auto result = emulator->AutostartDisk(TestPathHelper::GetTestDataPath("loaders/trd/atarin.trd"));
+    ASSERT_TRUE(result.started) << result.message;
+    EXPECT_EQ(state.scorpion.turbo, 1) << GetParam() << ": after the quick reset";
+    EXPECT_EQ(state.hw_turbo_ratio_applied, 2) << GetParam() << ": applied at once";
+    for (int frames = 0; frames < 200 && context->pDiskAutostart->IsColdStartFinishPending(); frames++)
+        emulator->RunNFrames(1, true);
+    ASSERT_FALSE(context->pDiskAutostart->IsColdStartFinishPending()) << "the cold start never reached the command loop";
+    EXPECT_EQ(state.scorpion.turbo, 1) << GetParam() << ": after the cold start";
+
+    context->pCore->Reset();
+    EXPECT_EQ(state.scorpion.turbo, 0) << GetParam() << ": a real reset clears the flip-flop";
+    EXPECT_EQ(state.hw_turbo_ratio, 1);
+    EmulatorTestHelper::CleanupEmulator(emulator);
+}
+
+INSTANTIATE_TEST_SUITE_P(Models, DiskAutostart_ScorpionClock_Test, ::testing::Values("Scorpion", "ProfScorp"));
+
+/// Owner request 2026-11-03: the TS-Conf autostart answered "boot" but every reset went through TS-BIOS, which booted
+/// Wild Commander from the SD card: the disk never ran. The quick reset now enters TR-DOS 5.04T (ROM page 1) at once and
+/// keeps the clock TS-BIOS or the program set (SYS_CONFIG[1:0]: 3.5 / 7 / 14 MHz). Boot-bound: the TR-DOS cold start
+/// runs to its command loop (a few frames, in turbo)
+TEST(DiskAutostart_TsConf, TheDiskBootsInTrdosAtTheClockTheMachineRan)
+{
+    for (const uint8_t clock : {uint8_t{0}, uint8_t{1}, uint8_t{2}})
+    {
+        MessageCenter::DisposeDefaultMessageCenter();
+        Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator("TSL", LoggerLevel::LogError);
+        ASSERT_NE(emulator, nullptr);
+        EmulatorContext* context = emulator->GetContext();
+        EmulatorState& state = context->emulatorState;
+        auto* decoder = dynamic_cast<PortDecoder_TSConf*>(context->pPortDecoder);
+        ASSERT_NE(decoder, nullptr);
+        emulator->EnableTurboMode();
+        context->pPortDecoder->DecodePortOut(0x20AF, clock, 0x0000);  // SYS_CONFIG, as TS-BIOS sets the clock
+        const uint8_t ratio = static_cast<uint8_t>(1u << clock);
+        ASSERT_EQ(state.hw_turbo_ratio, ratio);
+
+        auto result = emulator->AutostartDisk(TestPathHelper::GetTestDataPath("loaders/trd/atarin.trd"));
+        ASSERT_TRUE(result.started) << result.message;
+        EXPECT_EQ(decoder->GetState().dos, 1) << "the quick reset enters TR-DOS, not TS-BIOS";
+        EXPECT_EQ(context->pMemory->GetROMPageForBank(0), 1) << "window 0: TR-DOS 5.04T, ROM page 1";
+        EXPECT_EQ(state.hw_turbo_ratio, ratio) << "SYS_CONFIG clock " << int(clock) << " after the quick reset";
+        for (int frames = 0; frames < 200 && context->pDiskAutostart->IsColdStartFinishPending(); frames++)
+            emulator->RunNFrames(1, true);
+        ASSERT_FALSE(context->pDiskAutostart->IsColdStartFinishPending()) << "the cold start never reached the command loop";
+        EXPECT_EQ(state.hw_turbo_ratio_applied, ratio) << "SYS_CONFIG clock " << int(clock) << " after the cold start";
+
+        context->pCore->Reset();
+        EXPECT_EQ(decoder->GetState().dos, 0) << "a real reset runs TS-BIOS again";
+        EXPECT_EQ(state.hw_turbo_ratio, 1) << "a real reset clears SYS_CONFIG";
+        EmulatorTestHelper::CleanupEmulator(emulator);
+    }
+}
+
+/// The owner's disk end to end: BQ ATM from testdata/machines/atm/ballq_gr.scl runs through the autostart on the
+/// ATM710 and its title is in the EGA mode with all four planes in the video pages: RAM 1 / 3 carry its planes, RAM
+/// 25 / 27 (where the cold start's #7FFD pages were) stay empty. Boot-bound: TR-DOS loads the game (about 13 s of
+/// machine time, in turbo)
+TEST(DiskAutostart_Atm710, BallQuestShowsAllFourEgaPlanes)
+{
+    MessageCenter::DisposeDefaultMessageCenter();
+    Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator("ATM710", LoggerLevel::LogError);
+    ASSERT_NE(emulator, nullptr);
+    EmulatorContext* context = emulator->GetContext();
+    emulator->EnableTurboMode();
+    ASSERT_TRUE(emulator->LoadDisk(TestPathHelper::GetTestDataPath("machines/atm/ballq_gr.scl")));
+
+    // What the autostart does for a disk with one BASIC program, with the ATM program of the two
+    DiskAutostart* autostart = context->pDiskAutostart;
+    autostart->Disarm();
+    context->pCore->Reset(RM_DOS);
+    autostart->ArmColdStartFinish();
+    autostart->Arm("BQ   ATM");  // the catalog name, its three spaces included
+
+    auto nonZero = [&](uint16_t page) {
+        const uint8_t* p = context->pMemory->RAMPageAddress(page);
+        size_t n = 0;
+        for (uint32_t i = 0; i < 0x4000; i++)
+            n += p[i] != 0;
+        return n;
+    };
+    bool shown = false;
+    for (int frames = 0; frames < 1500 && !shown; frames += 10)
+    {
+        emulator->RunNFrames(10, true);
+        shown = context->pScreen->GetVideoMode() == M_ATM16 && nonZero(1) > 4000 && nonZero(3) > 4000;
+    }
+    EXPECT_TRUE(shown) << "mode=" << int(context->pScreen->GetVideoMode()) << " RAM 1: " << nonZero(1)
+                       << " RAM 3: " << nonZero(3) << " RAM 25: " << nonZero(25);
+    EXPECT_EQ(nonZero(25), 0u) << "a #7FFD page went past 128 KB";
+    EmulatorTestHelper::CleanupEmulator(emulator);
 }

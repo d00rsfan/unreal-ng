@@ -21,6 +21,8 @@
 
 #include "cli-processor.h"
 #include "automation.h"
+#include "../../../operationsstatus.h"
+#include "cli-ops.h"
 
 #include <functional>
 #include <optional>
@@ -236,42 +238,6 @@ void CLIProcessor::HandleStatus(const ClientSession& session, const std::vector<
     }
 
     session.SendResponse(status);
-}
-
-void CLIProcessor::HandleVideowall(const ClientSession& session, const std::vector<std::string>& args)
-{
-    if (args.empty())
-    {
-        session.SendResponse(std::string("Usage: videowall singlesync <on|off> [emulator_id]") + NEWLINE);
-        return;
-    }
-
-    std::string subcmd = args[0];
-    if (subcmd == "singlesync")
-    {
-        if (args.size() < 2)
-        {
-            session.SendResponse(std::string("Usage: videowall singlesync <on|off> [emulator_id]") + NEWLINE);
-            return;
-        }
-
-        std::string mode = args[1];
-        bool enable = (mode == "on" || mode == "1" || mode == "true");
-        std::string targetId = args.size() > 2 ? args[2] : "";
-
-        if (Automation::GetInstance().SetVideowallSingleSyncMode(enable, targetId))
-        {
-            session.SendResponse(std::string("Videowall single sync mode ") + (enable ? "enabled" : "disabled") + NEWLINE);
-        }
-        else
-        {
-            session.SendResponse(std::string("Failed to set videowall single sync mode.") + NEWLINE);
-        }
-    }
-    else
-    {
-        session.SendResponse(std::string("Unknown videowall command: ") + subcmd + NEWLINE);
-    }
 }
 
 // HandleList - lines 545-613
@@ -527,11 +493,24 @@ void CLIProcessor::InitializeProcessor()
     }
 }
 
-// HandleReset - lines 784-804
+// HandleReset - reset [hard|soft|--hard] [id|index]: soft by default (the reset button), hard = power cycle
 void CLIProcessor::HandleReset(const ClientSession& session, const std::vector<std::string>& args)
 {
+    // The mode word may come before or after the id; what is left selects the emulator
+    bool hard = false;
+    std::vector<std::string> idArgs;
+    for (const std::string& arg : args)
+    {
+        if (arg == "hard" || arg == "--hard")
+            hard = true;
+        else if (arg == "soft" || arg == "--soft")
+            hard = false;
+        else
+            idArgs.push_back(arg);
+    }
+
     std::string errorMessage;
-    auto emulator = ResolveEmulator(session, args, errorMessage);
+    auto emulator = ResolveEmulator(session, idArgs, errorMessage);
 
     if (!emulator)
     {
@@ -546,8 +525,8 @@ void CLIProcessor::HandleReset(const ClientSession& session, const std::vector<s
         return;
     }
 
-    emulator->Reset();
-    session.SendResponse("Emulator reset\n");
+    emulator->Reset(hard);
+    session.SendResponse(hard ? "Emulator reset (hard)\n" : "Emulator reset (soft)\n");
 }
 
 // HandleNmi - pulse the Z80 NMI line (accepted at the next instruction boundary)
@@ -571,6 +550,27 @@ void CLIProcessor::HandleNmi(const ClientSession& session, const std::vector<std
 
     emulator->RequestNMI();
     session.SendResponse("NMI requested\n");
+}
+
+// HandleOps - `ops [n|all]`, `ops since <seq> [n]`: the operation log of the selected emulator (the machine state
+// coordinator's: reset, autostart, snapshot load, media changes, refusals included). Mirrors GET
+// /api/v1/emulator/{id}/operations (the same OperationsStatus report)
+void CLIProcessor::HandleOps(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse("No emulator selected. Use 'select <id>' or 'list' to see available emulators.");
+        return;
+    }
+    uint64_t since = 0;
+    uint64_t limit = 0;
+    if (!CliOps::ParseArgs(args, since, limit))
+    {
+        session.SendResponse(CliOps::kUsage);
+        return;
+    }
+    session.SendResponse(OperationsStatus::Text(emulator.get(), since, static_cast<size_t>(limit)) + NEWLINE);
 }
 
 // HandleMni - the Scorpion "magic button": page the Shadow Monitor, then NMI
@@ -687,10 +687,15 @@ void CLIProcessor::HandlePause(const ClientSession& session, const std::vector<s
 
     // Pause the emulator - this will trigger MessageCenter notifications
     // that the GUI will respond to (enabling/disabling buttons)
-    emulator->Pause();
+    const execution::Result result = emulator->Pause(CliRequester(emulator->GetContext()), "cli");
 
-    // Confirm to the user
-    session.SendResponse("Emulation paused. Use 'resume' to continue execution.");
+    // Say what happened: behind a running command the pause is queued (it applies when that ends)
+    if (result.outcome == execution::Outcome::Pending)
+        session.SendResponse("Pause " + result.detail + ".");
+    else if (result.outcome == execution::Outcome::Refused)
+        session.SendResponse("Error: pause refused - " + result.detail);
+    else
+        session.SendResponse("Emulation paused. Use 'resume' to continue execution.");
 }
 
 // HandleResume - lines 846-877
@@ -721,7 +726,7 @@ void CLIProcessor::HandleResume(const ClientSession& session, const std::vector<
 
     // Check run-control claim (GDB TDD §3.3 / 1A.7.2)
     auto* ctx = emulator->GetContext();
-    if (ctx && ctx->IsRunControlClaimed())
+    if (ctx && ctx->IsRunControlClaimed() && !HoldsControl(ctx))
     {
         auto state = ctx->GetRunControlState();
         std::stringstream ss;
@@ -732,7 +737,7 @@ void CLIProcessor::HandleResume(const ClientSession& session, const std::vector<
 
     // Resume the emulator - this will trigger MessageCenter notifications
     // that the GUI will respond to (enabling/disabling buttons)
-    emulator->Resume();
+    emulator->Resume(CliRequester(emulator->GetContext()));
 
     // Confirm to the user
     session.SendResponse("Emulation resumed. Use 'pause' to suspend execution.");
@@ -943,10 +948,6 @@ void CLIProcessor::HandleStart(const ClientSession& session, const std::vector<s
         {
             // Start the emulator
             bool startSuccess = emulatorManager->StartEmulatorAsync(emulator->GetId());
-
-            // Auto-select only if this is the first emulator, otherwise keep current selection
-            emulatorIds = emulatorManager->GetEmulatorIds();
-            bool shouldAutoSelect = (emulatorIds.size() == 1);  // Only auto-select if this is the only emulator
 
             // Echo the RESOLVED machine, not the requested string (identity
             // comes from EmulatorManager::GetMachineIdentity - the same single
@@ -1505,7 +1506,7 @@ void CLIProcessor::HandleModel(const ClientSession& session, const std::vector<s
     }
 
     // Nothing here may keep the old machine alive
-    const bool wasRunning = emulator->IsRunning() && !emulator->IsPaused();
+    const ModelSwitch::RunStateBefore before = ModelSwitch::RunStateBefore::Of(*emulator);
     emulator.reset();
     _emulator.reset();
 
@@ -1520,8 +1521,10 @@ void CLIProcessor::HandleModel(const ClientSession& session, const std::vector<s
         return;
     }
 
-    if (wasRunning)
-        EmulatorManager::GetInstance()->StartEmulatorAsync(switched.emulator->GetId());
+    // The run state the user had: a paused machine comes back started and paused, not "initialized"
+    const std::string newId = switched.emulator->GetId();
+    ModelSwitch::StartAsBefore(*switched.emulator, before,
+                               [&newId]() { EmulatorManager::GetInstance()->StartEmulatorAsync(newId); });
     const MachineIdentity identity = EmulatorManager::GetMachineIdentity(*switched.emulator);
     ss << "Switched to " << identity.Model << " - " << identity.ModelFullName << " (" << identity.RamKb
        << "KB, power-on RAM: " << identity.RamPowerOn << ")" << NEWLINE

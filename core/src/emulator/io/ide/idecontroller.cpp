@@ -4,6 +4,7 @@
 
 #include "common/modulelogger.h"
 #include "emulator/config.h"
+#include "emulator/coordinator/ports.h"
 #include "emulator/cpu/core.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/emulatorcontext.h"
@@ -12,7 +13,7 @@
 #include "emulator/media/mediamanager.h"
 #include "emulator/ports/models/profiboard.h"
 #include "emulator/ports/portdecoder.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 
 IdeController::IdeController(EmulatorContext* context) : _context(context)
 {
@@ -35,6 +36,15 @@ IdeController::IdeController(EmulatorContext* context) : _context(context)
     // The other boards keep the floating #FF (IDE design §6.2)
     for (AtaChannel& channel : _channels)
         channel.SetEmptyBus(_scheme == IDE_SPRINTER ? AtaChannel::kEmptyBusDd7PullDown : AtaChannel::kEmptyBusFloating);
+
+    // Bus analyzer: a tap per channel the board has
+    for (int i = 0; i < ChannelCount(); i++)
+    {
+        _taps[i].SetDevice(0, "master");
+        _taps[i].SetDevice(1, "slave");
+        _taps[i].Attach(_context);
+        _channels[i].SetTap(&_taps[i]);
+    }
 
     const int units = ChannelCount() * AtaChannel::kUnits;
     for (int unit = 0; unit < units; unit++)
@@ -86,7 +96,7 @@ void IdeController::BuildUnit(int unit)
     else
         device = std::make_unique<AtaDisk>();
     AtaDevice& unitDevice = *device;
-    unitDevice.SetActivityCounter(&_activity);
+    unitDevice.SetActivityCounter(&_activity, _context ? &_context->ttdReplayActive : nullptr);
     _channels[channel].SetUnit(position, std::move(device));
 
     auto slot = std::make_unique<IdeUnitSlot>(_context, IdeUnitSlot::IdFor(channel, position), unitDevice, config);
@@ -104,6 +114,11 @@ void IdeController::BuildUnit(int unit)
         d.tags.push_back(channelName);
     if (FirstOfKind(unit))
         d.aliases.push_back(ide.cd ? "cd" : "hd");
+    // Estex DSS reads FAT12 / FAT16 only (the Sprinter hardware reference §9.3), and so does PQ-DOS 2023-09 on the
+    // Profi (ACC-C4, ProfiPlusComposed_Test: it boots from a FAT16 partition and ignores a FAT32 one): a FAT32
+    // folder volume or composite on such a disk is refused, never built
+    if ((_scheme == IDE_SPRINTER || _scheme == IDE_PROFI) && !ide.cd)
+        d.fsCompatibility = {FatType::Fat16};
     _slots[unit] = std::move(slot);
 }
 
@@ -203,28 +218,36 @@ bool IdeController::SetUnitKind(int unit, UnitKind kind, std::string* error)
         if (info && (info->present || info->pending))
             return fail("slot '" + id + "' holds a medium: eject it before changing the drive");
     }
-    if (_context->pTimeTravelHooks && _context->pTimeTravelHooks->IsRecording())
-        return fail("a TTD recording runs: the machine's hardware is fixed until it stops");
-
-    if (manager && _registered)
-        manager->UnregisterSlot(id);
-    ide.cd = kind == UnitKind::Cdrom ? 1 : 0;
-    ide.cf = kind == UnitKind::CompactFlash ? 1 : 0;
-    BuildUnit(unit);
-    // The other units keep their drives and media; only their aliases may move
-    // ("hd" / "cd" name the first unit of each kind)
-    for (int other = 0; other < kMaxUnits; other++)
-    {
-        if (other == unit || !_slots[other])
-            continue;
-        std::vector<std::string>& aliases = _slots[other]->MutableDescriptor().aliases;
-        aliases.clear();
-        if (FirstOfKind(other))
-            aliases.push_back(_context->config.ide[other].cd ? "cd" : "hd");
-    }
-    if (manager && _registered)
-        manager->RegisterSlot(*_slots[unit]);
-    return true;
+    // Another drive on the bus is a machine operation (the coordinator's rules, D43): refused while a recording the
+    // user started runs and in the recorded past; the black box's session ends at the change
+    coordinator::MachineOp op;
+    op.kind = coordinator::OpKind::IdeDriveKind;
+    op.summary = id + " " + UnitKindName(kind);
+    op.sessionReason = "ide-drive-kind";
+    auto change = [&](coordinator::OpStage& stage) {
+        stage.CommitPoint();
+        if (manager && _registered)
+            manager->UnregisterSlot(id);
+        ide.cd = kind == UnitKind::Cdrom ? 1 : 0;
+        ide.cf = kind == UnitKind::CompactFlash ? 1 : 0;
+        BuildUnit(unit);
+        // The other units keep their drives and media; only their aliases may move
+        // ("hd" / "cd" name the first unit of each kind)
+        for (int other = 0; other < kMaxUnits; other++)
+        {
+            if (other == unit || !_slots[other])
+                continue;
+            std::vector<std::string>& aliases = _slots[other]->MutableDescriptor().aliases;
+            aliases.clear();
+            if (FirstOfKind(other))
+                aliases.push_back(_context->config.ide[other].cd ? "cd" : "hd");
+        }
+        if (manager && _registered)
+            manager->RegisterSlot(*_slots[unit]);
+        return true;
+    };
+    const coordinator::OpResult result = coordinator::RunCommit(_context->pMachineOps, std::move(op), change);
+    return result.Ok() || fail(result.reason);
 }
 
 IdeController::~IdeController()
@@ -259,7 +282,7 @@ bool IdeController::SchemeFits(IDE_SCHEME scheme, MEM_MODEL model)
     // Only the v5 board decodes the Profi IDE (its extended port map); the v3 board has none (ProfiBoard)
     const bool profi = IsProfiModel(model);
     const bool profiIde = ProfiBoard::For(model).extendedPorts;
-    const bool scorpion = model == MM_SCORP || model == MM_PROFSCORP;
+    const bool scorpion = IsScorpionModel(model);
     const bool atm = model == MM_ATM710 || model == MM_ATM450 || model == MM_ATM3;
     const bool sprinter = model == MM_SPRINTER;
     switch (scheme)

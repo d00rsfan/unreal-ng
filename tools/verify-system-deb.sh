@@ -16,8 +16,17 @@ test -f /usr/lib/unreal-ng/rom/README-ROMS.md
 test -f /usr/lib/unreal-ng/midi/generaluser-gs.sf2
 test -s /usr/lib/unreal-ng/configs/ts-conf/wc-zifi.img
 test ! -e /usr/lib/unreal-ng/configs/ts-conf/wc-zifi.img.7z
+test -f /usr/share/unreal-ng/examples/01-section-timing/demo.sna
+test -f /usr/share/unreal-ng/examples/lib/unreal_webapi.py
+test -f /usr/lib/udev/rules.d/70-unreal-streamdeck.rules
+test -f /usr/lib/unreal-ng/streamdeck/themes/unrealng/theme.json
+test -f /usr/lib/unreal-ng/testsnapshots/z80/newbench.z80
+test -f /usr/lib/unreal-ng/symbols/manifest.json
+test -f /usr/lib/unreal-ng/controllers/profiles/play/steam-deck.yaml
+test -f /usr/lib/unreal-ng/software/next/torvin.yaml
 
-for app in unreal-qt unreal-screen-viewer unreal-videowall unreal-mcp-bridge; do
+for app in unreal-qt unreal-screen-viewer unreal-videowall unreal-mcp-bridge \
+    unreal-streamdeck unreal-streamdeck-studio unreal-debugger unreal-tui-debugger unreal-tui-debugger-tsconf; do
     binary=/usr/lib/unreal-ng/$app
     test -x "$binary"
     test "$(readlink -f "/usr/bin/$app")" = "$binary"
@@ -49,4 +58,9 @@ grep -F 'libpulse.so.0' <<< "$audioLibraries" >/dev/null
 env -u LD_LIBRARY_PATH -u QT_PLUGIN_PATH -u QTDIR -u QT_ROOT_DIR \
     QT_QPA_PLATFORM=offscreen unreal-qt --help
 unreal-mcp-bridge </dev/null
+unreal-streamdeck --help
+QT_QPA_PLATFORM=offscreen unreal-streamdeck-studio --help
+QT_QPA_PLATFORM=offscreen unreal-debugger --help
+unreal-tui-debugger --help | grep -E '^pixel window: SDL 3\..* x11' | grep -E ' wayland'
+unreal-tui-debugger-tsconf --help | grep -E '^pixel window: SDL 3\..* x11' | grep -E ' wayland'
 echo "Native DEB verification passed."

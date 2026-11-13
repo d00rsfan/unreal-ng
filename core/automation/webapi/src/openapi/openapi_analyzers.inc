@@ -229,6 +229,32 @@
     paths["/api/v1/emulator/{id}/coverage/gaps"]["get"]["responses"]["200"]["description"] =
         "Gap ranges within the requested window (gaps[]/total_gap_bytes)";
 
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["summary"] = "Export coverage as a code execution map";
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["tags"].append("Analyzers");
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["description"] =
+        "The executed instruction starts as a file another tool reads. format skoolkit-map: SkoolKit's code "
+        "execution map (sna2ctl.py -m / sna2skool.py -m), one $HHHH line per instruction start, ascending. Body: "
+        "format (default skoolkit-map), start / end (integer or \"0x...\" string, default 0x0000-0xFFFF), path (write the "
+        "file; without it the map comes back in map), merge (true: add the addresses of the file at path).";
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["parameters"][0]["name"] = "id";
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["parameters"][0]["in"] = "path";
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["parameters"][0]["required"] = true;
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["parameters"][0]["schema"]["type"] = "string";
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["requestBody"]["required"] = false;
+    {
+        Json::Value& schema = paths["/api/v1/emulator/{id}/coverage/export"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+        schema["type"] = "object";
+        schema["properties"]["format"]["type"] = "string";
+        schema["properties"]["format"]["enum"].append("skoolkit-map");
+        schema["properties"]["start"]["type"] = "string";
+        schema["properties"]["end"]["type"] = "string";
+        schema["properties"]["path"]["type"] = "string";
+        schema["properties"]["merge"]["type"] = "boolean";
+    }
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["responses"]["200"]["description"] =
+        "format, start, end, count; map (no path) or path + merged";
+    paths["/api/v1/emulator/{id}/coverage/export"]["post"]["responses"]["400"]["description"] = "Unknown format or option, bad address, file not writable";
+
     // AY register-write log endpoints (TurboSound tap)
     paths["/api/v1/emulator/{id}/ay/log"]["post"]["summary"] = "Control AY register-write log";
     paths["/api/v1/emulator/{id}/ay/log"]["post"]["tags"].append("Analyzers");
@@ -276,3 +302,62 @@
     paths["/api/v1/emulator/{id}/ay/log"]["get"]["responses"]["200"]["description"] =
         "Entries (index/frame/tacts/pc/port/chip/type/reg/value) + per-register stats";
 
+
+    // Section timer (SectionTimerAnalyzer: entry / exit markers as exec taps, interrupts from int_accept / int_return)
+    {
+        Json::Value& op = paths["/api/v1/emulator/{id}/section-timer"]["post"];
+        op["summary"] = "Start, stop or clear the section timer";
+        op["tags"].append("Analyzer Management");
+        op["description"] =
+            "The time of code sections between marker addresses while the machine runs at full speed (no stop per "
+            "marker). start: `sections` = NAME (the labels NAME and NAME.End) or name=ENTRY:EXIT[,EXIT] (labels or "
+            "numbers #8000, $8000, 0x8000, 32768); none = every label X that has an X.End. `break_if` = "
+            "[net:]NAME<op>T (op > < >= <= == !=) pauses at the exit of the pass that meets it. `extra` = taps with no "
+            "action; `recursive` nests an entry of an open section instead of dropping the open pass; `frame_t` = "
+            "T-states a frame for the global clock (0: the machine's); `capacity` = passes kept one by one (default "
+            "100000; the statistics count them all). A pass's gross time is exit minus entry in global T-states "
+            "(frame * frame_t + t); net = gross minus the interrupts that ran inside it (acknowledge to the return's "
+            "end). stop disarms the taps, the results stay; clear drops them. Answers the results without the "
+            "passes, and `text`. 400 with the reason for an unknown label, no section or a bad condition.";
+        op["parameters"][0]["name"] = "id";
+        op["parameters"][0]["in"] = "path";
+        op["parameters"][0]["required"] = true;
+        op["parameters"][0]["schema"]["type"] = "string";
+        Json::Value& props = op["requestBody"]["content"]["application/json"]["schema"]["properties"];
+        for (const char* action : {"start", "stop", "clear"})
+            props["action"]["enum"].append(action);
+        for (const char* list : {"sections", "extra", "break_if"})
+        {
+            props[list]["type"] = "array";
+            props[list]["items"]["type"] = "string";
+        }
+        props["recursive"]["type"] = "boolean";
+        props["frame_t"]["type"] = "integer";
+        props["capacity"]["type"] = "integer";
+        op["responses"]["200"]["description"] = "The results (as GET, without the passes)";
+        op["responses"]["400"]["description"] = "The spec does not resolve";
+    }
+    {
+        Json::Value& op = paths["/api/v1/emulator/{id}/section-timer"]["get"];
+        op["summary"] = "The section timer's results";
+        op["tags"].append("Analyzer Management");
+        op["description"] =
+            "Read at any time, running or paused. active, frame_t, sections[] {name, entry, exits, count, min, max, "
+            "avg, net_min, net_max, net_avg, interrupted, last, max_frame, max_t}, passes[] [name, frame, t, elapsed, "
+            "net, interrupts] from `offset` (at most `limit`, default 1000), passes_total, passes_kept, hits (marker "
+            "hits), orphan (exits with no entry), dropped (passes left without their exit), open, stopped (the pass a "
+            "break condition paused at: condition, section, frame, t, elapsed, net, interrupts; or null); `text=true` "
+            "adds a table.";
+        op["parameters"][0]["name"] = "id";
+        op["parameters"][0]["in"] = "path";
+        op["parameters"][0]["required"] = true;
+        op["parameters"][0]["schema"]["type"] = "string";
+        const char* query[] = {"offset", "limit", "text"};
+        for (int i = 0; i < 3; i++)
+        {
+            op["parameters"][i + 1]["name"] = query[i];
+            op["parameters"][i + 1]["in"] = "query";
+            op["parameters"][i + 1]["schema"]["type"] = i < 2 ? "integer" : "boolean";
+        }
+        op["responses"]["200"]["description"] = "The results";
+    }

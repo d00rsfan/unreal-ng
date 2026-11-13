@@ -9,8 +9,13 @@
 ///     recorded live reproduce the recorded ones - seeking to each new
 ///     checkpoint shows the CPU, chipset, every device and all of RAM that
 ///     seeking to the recorded one showed.
-/// Over the 50 ms budget (~4 s): seven sessions, each loaded, seeked 55 times
-/// and replayed; this is the engine corpus's only C++ gate.
+/// The ZX-MultiSound sessions (multisound-pentagon, multisound-zxevo) are not
+/// stored: the test records them with the engine in its own process first
+/// (ttdmultisoundsessions.h) and loads them like the stored ones, on a machine
+/// with the card in ZX-bus slot 1 (ttdslotcards.h).
+/// Over the 50 ms budget (~8 s): nine sessions (two of them recorded here
+/// first), each loaded, seeked 55 times and replayed; this is the engine
+/// corpus's only C++ gate.
 
 #include <gtest/gtest.h>
 
@@ -22,15 +27,18 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "_helpers/emulatortesthelper.h"
 #include "_helpers/gsslot.h"
 #include "_helpers/soundcardscope.h"
 #include "_helpers/testpathhelper.h"
+#include "_helpers/testtier.h"
+#include "_helpers/ttdmultisoundsessions.h"
+#include "_helpers/ttdslotcards.h"
 #include "base/featuremanager.h"
 #include "debugger/ttd/timetravelcontroller.h"
-#include "debugger/ttd/timetravelmanager.h"
 #include "debugger/ttd/ttdfileinfo.h"
 #include "debugger/ttd/ttdperipheralregistry.h"
 #include "emulator/cpu/core.h"
@@ -53,6 +61,9 @@ std::vector<fs::path> EngineCorpus()
             if (entry.path().extension() == ".ttd")
                 files.push_back(entry.path());
     std::sort(files.begin(), files.end());
+    // The ZX-MultiSound sessions, recorded by the engine in this process
+    for (const fs::path& recorded : ttdtest::MultiSoundSessions())
+        files.push_back(recorded);
     return files;
 }
 
@@ -81,13 +92,23 @@ protected:
     SoundCardScope _soundCards;
     Emulator* _emulator = nullptr;
     EmulatorContext* _context = nullptr;
-    std::unique_ptr<ttd::TimeTravelController> _controller;
+    ttd::TimeTravelController* _controller = nullptr;
 
-    void StartMachine(const std::string& model, GSTypeKind generalSound)
+    /// A fresh machine of the fixture's recorded machine: its General Sound card and its slot-built cards
+    /// (ttdslotcards.h)
+    void StartMachine(const ttd::TTDRecordedMachine& machine)
     {
         StopMachine();
-        _emulator = EmulatorTestHelper::CreateStandardEmulator(model, LoggerLevel::LogError);
-        ASSERT_NE(_emulator, nullptr);
+        std::string why;
+        _emulator = ttdtest::CreateRecordedMachine(machine, why, /*fitGeneralSound=*/false);
+        ASSERT_NE(_emulator, nullptr) << why;
+        ASSERT_NO_FATAL_FAILURE(AttachController());
+        ASSERT_TRUE(FitGeneralSoundCard(_context->pSoundManager, machine.generalSound));
+    }
+
+    /// The machine's own controller as its recorder, in the recorder's modes
+    void AttachController()
+    {
         _context = _emulator->GetContext();
         FeatureManager* features = _emulator->GetFeatureManager();
         features->setFeature(Features::kDebugMode, true);
@@ -97,11 +118,8 @@ protected:
         features->setFeature(Features::kScreenHQ, true);
         _context->pMemory->UpdateFeatureCache();
         _context->pSoundManager->UpdateFeatureCache();
-        ASSERT_TRUE(FitGeneralSoundCard(_context->pSoundManager, generalSound));
-        _controller = std::make_unique<ttd::TimeTravelController>(_context);
-        _context->pTimeTravelHooks = _controller.get();
-        _context->ttdWriteSink = _controller.get();
-        _context->pTimeTravelController = _controller.get();
+        _controller = _context->pTimeTravelController;
+        ASSERT_NE(_controller, nullptr);
     }
 
     void StopMachine()
@@ -110,10 +128,7 @@ protected:
             return;
         if (_controller)
             _controller->StopRecording();
-        _context->pTimeTravelHooks = _context->pTimeTravelManager;
-        _context->ttdWriteSink = _context->pTimeTravelManager;
-        _context->pTimeTravelController = nullptr;
-        _controller.reset();
+        _controller = nullptr;
         EmulatorTestHelper::CleanupEmulator(_emulator);
         _emulator = nullptr;
     }
@@ -161,7 +176,11 @@ protected:
             size_t first = 0;
             while (first < state.size() && first < it->second.size() && it->second[first] == state[first])
                 ++first;
-            EXPECT_TRUE(it->second == state) << where << ": device " << int(id) << " differs from byte " << first;
+            std::string diff;   // " @byte:actual/expected" of the first differing bytes
+            for (size_t b = first; b < state.size() && b < it->second.size() && diff.size() < 400; ++b)
+                if (it->second[b] != state[b])
+                    diff += " @" + std::to_string(b) + ":" + std::to_string(it->second[b]) + "/" + std::to_string(state[b]);
+            EXPECT_TRUE(it->second == state) << where << ": device " << int(id) << " differs from byte " << first << diff;
         }
         ASSERT_EQ(actual.ram.size(), expected.ram.size()) << where;
         for (size_t page = 0; page < expected.ram.size(); ++page)
@@ -182,8 +201,12 @@ protected:
 
 TEST_F(TimeTravelControllerCorpus_Test, EveryFixtureLoadsRestoresAndContinuesExactly)
 {
-    const std::vector<fs::path> files = EngineCorpus();
-    ASSERT_GE(files.size(), 7u) << "testdata/ttd/engine/ should hold the engine-recorded corpus";
+    const std::vector<fs::path> corpus = EngineCorpus();
+    ASSERT_GE(corpus.size(), 9u) << "testdata/ttd/engine/ should hold the engine-recorded corpus";
+    // A 48K demo, a quiet 128K session, the TurboSound FM; every fixture in the long tier (about 0.4 s each)
+    const std::vector<fs::path> files =
+        TestTier::Sample(corpus, {"active_demo.ttd", "idle_session.ttd", "tsfm_tech_support.ttd"});
+    ASSERT_EQ(files.size(), TestTier::Long() ? corpus.size() : 3u);
 
     for (const fs::path& file : files)
     {
@@ -192,7 +215,7 @@ TEST_F(TimeTravelControllerCorpus_Test, EveryFixtureLoadsRestoresAndContinuesExa
         std::string err;
         ASSERT_TRUE(ttd::ReadTTDFileInfo(file.string(), info, err)) << err;
         ASSERT_EQ(info.schemaVersion, 2u) << "the engine's format";
-        ASSERT_NO_FATAL_FAILURE(StartMachine(info.machine.model, info.machine.generalSound));
+        ASSERT_NO_FATAL_FAILURE(StartMachine(info.machine));
 
         std::ifstream in(file, std::ios::binary);
         ASSERT_TRUE(_controller->DeserializeSession(in, err)) << err;
@@ -203,12 +226,12 @@ TEST_F(TimeTravelControllerCorpus_Test, EveryFixtureLoadsRestoresAndContinuesExa
         for (const size_t index : {size_t(0), size_t(50), size_t(51), count - 1})
             ASSERT_NO_FATAL_FAILURE(SeekToCheckpoint(index));
 
-        // What the recording shows at checkpoints 38..62, then the same frames run live
+        // What the recording shows at checkpoints 38..45 (..62 in the long tier), then the same frames run live
         // from checkpoint 37 of the loaded session
         constexpr size_t kFrom = 37;
-        constexpr size_t kReplay = 25;
+        const size_t replay = TestTier::Pick<size_t>(8, 25);
         std::vector<LiveMachine> recorded;
-        for (size_t step = 1; step <= kReplay; ++step)
+        for (size_t step = 1; step <= replay; ++step)
         {
             ASSERT_NO_FATAL_FAILURE(SeekToCheckpoint(kFrom + step));
             recorded.push_back(Live());
@@ -217,14 +240,63 @@ TEST_F(TimeTravelControllerCorpus_Test, EveryFixtureLoadsRestoresAndContinuesExa
         ttd::TTDSeekResult seek;
         ASSERT_TRUE(_controller->SeekTo(start, &seek));
         ASSERT_TRUE(_controller->ResumeRecordingFrom(start)) << "a loaded session continues";
-        _emulator->RunNFrames(kReplay, /*skipBreakpoints=*/true);
+        _emulator->RunNFrames(replay, /*skipBreakpoints=*/true);
         _controller->StopRecording();
-        ASSERT_GE(_controller->GetCheckpointCount(), kFrom + 1 + kReplay);
+        ASSERT_GE(_controller->GetCheckpointCount(), kFrom + 1 + replay);
         // The checkpoints captured live restore what the recorded ones did
-        for (size_t step = 1; step <= kReplay; ++step)
+        for (size_t step = 1; step <= replay; ++step)
         {
             ASSERT_NO_FATAL_FAILURE(SeekToCheckpoint(kFrom + step));
             ExpectSame(Live(), recorded[step - 1], "replay " + std::to_string(kFrom) + " + " + std::to_string(step));
+            if (HasFailure())
+                return;   // the first divergence is the useful one
+        }
+    }
+}
+
+/// POC 038 step 1: the baseline interval on every model. The baseline checkpoint is taken inside a frame, right
+/// after the machine came up (its sound chips may not have adopted the CPU's clock yet, F1): a replay from it
+/// reaches the next checkpoint's CPU, chipset, devices and RAM exactly, and so does the next interval. A TurboSound
+/// FM where the model's config stages one. About 50 ms a model; three in the quick tier, all in the long one
+TEST_F(TimeTravelControllerCorpus_Test, TheBaselineIntervalReplaysExactlyOnEveryModel)
+{
+    const std::vector<const char*> all = {"48K",   "128k",   "PLUS2", "PLUS2A", "PLUS3", "PENTAGON", "SCORPION",
+                                          "PROFSCORP", "GMX", "ATM710", "ATM450", "ATM3", "PROFI", "PROFI3", "TSL",
+                                          "TSL-VDAC2", "SPRINTER"};
+    const std::vector<const char*> models =
+        TestTier::Long() ? all : std::vector<const char*>{"48K", "PENTAGON", "SPRINTER"};
+    for (const char* model : models)
+    {
+        SCOPED_TRACE(model);
+        StopMachine();
+        _emulator = EmulatorTestHelper::CreateEmulatorWithTurboSoundKind(model, TurboSoundKind::FM);
+        if (!_emulator)
+            _emulator = EmulatorTestHelper::CreateStandardEmulator(model, LoggerLevel::LogError);
+        ASSERT_NE(_emulator, nullptr) << "cannot create " << model;
+        ASSERT_NO_FATAL_FAILURE(AttachController());
+
+        // Inside the first frame, the machine just reset
+        _emulator->RunNCPUCycles(12345, /*skipBreakpoints=*/true);
+        ASSERT_TRUE(_controller->StartRecording());
+        _emulator->RunNFrames(3, /*skipBreakpoints=*/true);
+        _controller->StopRecording();
+        ASSERT_GE(_controller->GetCheckpointCount(), 3u);
+
+        // A checkpoint is named by its frame; the baseline's CPU stands inside it. The interval runs to the
+        // frame boundary itself, not a T-state count: a Profi's ROM leaves hi-res inside the frame, and the clock
+        // change rescales the frame length the restore started with
+        for (size_t index = 0; index < 2; ++index)
+        {
+            ASSERT_NO_FATAL_FAILURE(SeekToCheckpoint(index));
+            if (index == 0)
+                ASSERT_GT(_context->pCore->GetZ80()->t, 0u) << "the baseline is inside a frame";
+            const uint64_t frame = _context->emulatorState.frame_counter;
+            _emulator->RunUntilCondition([&](const Z80State&) { return _context->emulatorState.frame_counter != frame; },
+                                         /*maxTStates=*/10'000'000, /*notifyDebugger=*/false);
+            ASSERT_EQ(_context->emulatorState.frame_counter, frame + 1);
+            const LiveMachine replayed = Live();
+            ASSERT_NO_FATAL_FAILURE(SeekToCheckpoint(index + 1));
+            ExpectSame(replayed, Live(), "interval " + std::to_string(index));
             if (HasFailure())
                 return;   // the first divergence is the useful one
         }

@@ -17,6 +17,23 @@ using unrealasm::testing::ReadTestText;
 
 namespace
 {
+/// ORG and n lines, the text the editor's room was measured with (LOAD in the emulator, 2026-10-19)
+SourceDocument MeasuredText(size_t n, const std::string& dialect)
+{
+    std::string text = "        ORG 40000\n";
+    for (size_t i = 0; i < n; ++i)
+        text += i % 3 ? "        LD A,(IX+" + std::to_string(i % 100) + ")\n" : "        ADD A,"  + std::to_string(i % 200) + "\n";
+    return SourceDocument::FromText(text, dialect);
+}
+
+bool Longer(const EncodeResult& r)
+{
+    return std::any_of(r.diagnostics.begin(), r.diagnostics.end(), [](const Diagnostic& d) { return d.message.find("longer than") != std::string::npos; });
+}
+}  // namespace
+
+namespace
+{
 struct Sample
 {
     const char* file;
@@ -61,6 +78,31 @@ TEST(StormCodec_Test, RealSourcesDecodeAndRoundTrip)
     }
 }
 
+TEST(StormCodec_Test, Storm10BetaFileStartsAtC003)
+{
+    // Typed into STORM 1.0beta in unreal-ng and saved there (BREAK S): type C, start #C003; decoded as version 1.0,
+    // written back byte for byte, every line in the form STORM's rules give
+    const codecs::StormCodec codec;
+    const containers::TrdosFile file = Unwrap("typed-storm10b__ST1BETA");
+    EXPECT_EQ(file.type, 'C');
+    EXPECT_EQ(file.start, 0xC003);
+    DecodeOptions options;
+    options.catalog = file.Hints();
+    const DecodeResult decoded = codec.Decode(file.data, options);
+    ASSERT_TRUE(decoded.ok);
+    EXPECT_EQ(decoded.document.subversion, "1.0");
+    EXPECT_EQ(decoded.document.Text() + "\n", ReadTestText("storm/typed-storm10b__ST1BETA.txt"));
+    EXPECT_EQ(codec.Encode(decoded.document, {}).bytes, file.data);
+    for (const SourceLine& line : decoded.document.lines)
+    {
+        std::vector<uint8_t> body;
+        std::string error;
+        ASSERT_TRUE(codecs::StormCodec::EncodeLine(line.text, body, error)) << line.text << ": " << error;
+        body.push_back(static_cast<uint8_t>(body.size()));
+        EXPECT_EQ(body, line.attrs.bytes) << line.text;
+    }
+}
+
 TEST(StormCodec_Test, StormsRulesReproduceTheStoredLines)
 {
     const codecs::StormCodec codec;
@@ -96,10 +138,13 @@ TEST(StormCodec_Test, LineRules)
     EXPECT_EQ(encode("        JR NZ,$-3:JR C,$+2:CP C"), (std::vector<uint8_t>{0x78, 0xF0, 0x2A, 0x4E, 0x7B, 0xF5, 0x2A, 0x5C, 0x31}));
     // (IX+d) short form, a single digit, unary minus
     EXPECT_EQ(encode("        LD A,(IX+13),B,5,DE,-33"), (std::vector<uint8_t>{0x37, 0xB2, 0x0D, 0x30, 0xE2, 0x3D, 0x9A, 0x21}));
+    // PO PE P M imply JP (STORM 1.3's binary has JP where its source shows them; its editor shows JP); CALL with one of
+    // them keeps its command byte (#51)
+    EXPECT_EQ(encode("        JP P,$:CALL M,$"), (std::vector<uint8_t>{0x7E, 0xF3, 0x2A, 0x51, 0x7F, 0xF3}));
     // A comment: every blank run is one byte
     EXPECT_EQ(encode(";in: a - x"), (std::vector<uint8_t>{0x2F, 'i', 'n', ':', 0x01, 'a', 0x01, '-', 0x01, 'x', 0x00}));
     for (const std::string text : {"        LD HL,#5FFF:LD (#5CB2),HL", "DLNA    CALL DLN:RET NZ", "        JR NZ,$-3:JR C,$+2:CP C",
-                                   "        LD A,(IX+13),B,5,DE,-33", ";in: a - x", "TBABUF  DS (HGT+1)*2"})
+                                   "        LD A,(IX+13),B,5,DE,-33", ";in: a - x", "TBABUF  DS (HGT+1)*2", "        JP P,$:CALL M,$"})
     {
         encode(text);
         EXPECT_EQ(codecs::StormCodec::DecodeLine(body), text);
@@ -136,4 +181,22 @@ TEST(StormCodec_Test, Detection)
     }
     EXPECT_LT(codec.Detect(ReadTestData("tasm/000LOAD.$A"), {}), 60);
     EXPECT_LT(codec.Detect(ReadTestData("text/source-cp866-cr.asm"), {}), 60);
+    // Zeros walk back as empty STORM lines: a screen (type C at #4000) is no STORM text
+    CatalogHints screen;
+    screen.type = 'C';
+    screen.start = 0x4000;
+    screen.length = 6912;
+    const std::vector<uint8_t> zeros(6912, 0);
+    EXPECT_LT(codec.Detect(zeros, screen), 50);
+    EXPECT_EQ(CodecRegistry::Builtin().Detect(zeros, screen).chosen, nullptr);
+}
+
+TEST(StormCodec_Test, ALongerTextThanTheEditorHoldsIsReported)
+{
+    // STORM 1.3 loads 16369 bytes into RAM page 6 and answers "File too big" from 16373: a project's longer file is cut into INCLUDEd parts (zxasm convert --project)
+    const codecs::StormCodec codec;
+    const EncodeResult fits = codec.Encode(MeasuredText(3791, "storm"), {});
+    EXPECT_EQ(fits.bytes.size(), 16369u);
+    EXPECT_FALSE(Longer(fits));
+    EXPECT_TRUE(Longer(codec.Encode(MeasuredText(3792, "storm"), {})));
 }

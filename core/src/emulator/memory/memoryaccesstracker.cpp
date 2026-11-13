@@ -1,7 +1,11 @@
 #include "memoryaccesstracker.h"
+#include "emulator/readoutschanged.h"
 
 #include "base/featuremanager.h"
 #include "common/filehelper.h"
+#include "common/stringhelper.h"
+#include "emulator/cpu/core.h"
+#include "emulator/cpu/z80.h"
 #include "calltrace.h"
 #include "filesystem"
 #include "memory.h"
@@ -35,6 +39,11 @@ void MemoryAccessTracker::Initialize(TrackingMode mode)
 // Reset all counters and statistics
 void MemoryAccessTracker::ResetCounters()
 {
+    // Under the allocation mutex: a feature change on another thread (UpdateFeatureCache) must not free the buffers
+    // while they are zeroed (a snapshot load's Core::Reset on a WebAPI thread beside the GUI's or another request's
+    // feature change: memset on a freed buffer of the old size)
+    std::lock_guard<std::shared_mutex> lock(_allocationMutex);
+
     // Skip if counters haven't been allocated yet (lazy allocation)
     if (!_isAllocated.load(std::memory_order_acquire))
     {
@@ -68,9 +77,9 @@ void MemoryAccessTracker::ResetCounters()
     _z80BankWriteMarks = 0;
     _z80BankExecuteMarks = 0;
 
-    _pageReadMarks.zero();
-    _pageWriteMarks.zero();
-    _pageExecuteMarks.zero();
+    _pageReadMarks.reset();
+    _pageWriteMarks.reset();
+    _pageExecuteMarks.reset();
 
     // Reset monitored regions and ports statistics
     for (auto& region : _monitoredRegions)
@@ -90,6 +99,9 @@ void MemoryAccessTracker::ResetCounters()
         _currentSegment = nullptr;
     }
 
+    // The L0 facts go with the counters
+    _facts.Clear();
+
     // Reset HALT detection
     _lastExecutedAddress = 0xFFFF;
     _haltExecutionCount = 0;
@@ -98,7 +110,19 @@ void MemoryAccessTracker::ResetCounters()
 // Set the current tracking mode
 void MemoryAccessTracker::SetTrackingMode(TrackingMode mode)
 {
+    // The facts' Z80 view (1 MB) exists only in the Z80 address space mode: allocated before the mode needs it, freed
+    // after it no longer does
+    if (mode == TrackingMode::Z80AddressSpace)
+    {
+        std::lock_guard<std::shared_mutex> lock(_allocationMutex);
+        _facts.SetZ80View(true);
+    }
     _currentMode = mode;
+    if (mode != TrackingMode::Z80AddressSpace)
+    {
+        std::lock_guard<std::shared_mutex> lock(_allocationMutex);
+        _facts.SetZ80View(false);
+    }
 }
 
 // Get the current tracking mode
@@ -107,59 +131,172 @@ TrackingMode MemoryAccessTracker::GetTrackingMode() const
     return _currentMode;
 }
 
+/// region <Level (L0 access facts)>
+
+const char* MemoryAccessTracker::LevelName(TrackerLevel level)
+{
+    return level == TrackerLevel::Facts ? "facts" : "counters";
+}
+
+void MemoryAccessTracker::SetLevel(TrackerLevel level)
+{
+    {
+        std::lock_guard<std::shared_mutex> lock(_allocationMutex);
+        if (level == TrackerLevel::Facts && _isAllocated.load(std::memory_order_relaxed))
+            _facts.Allocate(MAX_PAGES, _currentMode == TrackingMode::Z80AddressSpace);
+        else if (level == TrackerLevel::Counters)
+            _facts.Free();
+        _level = level;
+    }
+    AttachAccessContext(level == TrackerLevel::Facts);
+}
+
+void MemoryAccessTracker::AttachAccessContext(bool attach)
+{
+    // The Z80 stores the class of every instruction here while the level is Facts; nowhere (one null test per
+    // instruction) otherwise. A bare tracker in a unit test has no CPU: the test drives _accessContext itself
+    _accessContext = static_cast<uint8_t>(AccessContext::Plain);
+    if (_context != nullptr && _context->pCore != nullptr && _context->pCore->GetZ80() != nullptr)
+        _context->pCore->GetZ80()->SetAccessContextSink(attach ? &_accessContext : nullptr);
+}
+
+bool MemoryAccessTracker::ReadZ80Facts(uint16_t address, ByteFacts& out) const
+{
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return _level == TrackerLevel::Facts && _facts.ReadZ80(address, out);
+}
+
+bool MemoryAccessTracker::ReadPhysicalFacts(uint16_t page, uint16_t offset, ByteFacts& out) const
+{
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return _level == TrackerLevel::Facts && _facts.ReadPhysical(page, offset, out);
+}
+
+bool MemoryAccessTracker::ReadZ80FactKinds(uint16_t address, size_t count, uint8_t* out) const
+{
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return _level == TrackerLevel::Facts && _facts.ReadZ80Kinds(address, count, out);
+}
+
+bool MemoryAccessTracker::ReadPhysicalFactKinds(uint16_t page, uint16_t offset, size_t count, uint8_t* out) const
+{
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return _level == TrackerLevel::Facts && _facts.ReadPhysicalKinds(page, offset, count, out);
+}
+
+MemoryAccessTracker::FactsSummary MemoryAccessTracker::SummarizeFacts() const
+{
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    FactsSummary summary;
+    summary.allocated = _facts.IsAllocated();
+    summary.bytes = _facts.BytesAllocated();
+    summary.z80Touched = _facts.TouchedZ80Bytes();
+    summary.pages = _facts.TouchedPages();
+    return summary;
+}
+
+namespace
+{
+// The kind of a data access by the instruction's class (AccessContext): stack accesses replace the data kinds, block
+// accesses add BlockAccess to them. Index: the context byte (HaltFetch reads as a plain one: the CPU makes none)
+constexpr uint8_t kReadKindByContext[4] = {static_cast<uint8_t>(AccessKind::DataRead),
+                                           static_cast<uint8_t>(AccessKind::StackRead),
+                                           AccessKind::DataRead | AccessKind::BlockAccess,
+                                           static_cast<uint8_t>(AccessKind::DataRead)};
+constexpr uint8_t kWriteKindByContext[4] = {static_cast<uint8_t>(AccessKind::DataWrite),
+                                            static_cast<uint8_t>(AccessKind::StackWrite),
+                                            AccessKind::DataWrite | AccessKind::BlockAccess,
+                                            static_cast<uint8_t>(AccessKind::DataWrite)};
+}  // namespace
+
+void MemoryAccessTracker::TrackFactsRead(uint16_t address, size_t physOffset, uint8_t value, uint16_t callerAddress)
+{
+    (void)value;
+    const uint32_t frame = static_cast<uint32_t>(_context->emulatorState.frame_counter);
+    const uint8_t kind = kReadKindByContext[_accessContext & 0x03];
+    if (_currentMode == TrackingMode::Z80AddressSpace)
+        MemoryAccessFacts::OnRead(_facts.Z80At(address), kind, callerAddress, frame);
+    else if (ByteFacts* facts = _facts.PhysicalAt(physOffset))
+        MemoryAccessFacts::OnRead(*facts, kind, callerAddress, frame);
+}
+
+void MemoryAccessTracker::TrackFactsWrite(uint16_t address, size_t physOffset, uint8_t value, uint16_t callerAddress)
+{
+    const uint32_t frame = static_cast<uint32_t>(_context->emulatorState.frame_counter);
+    const uint8_t kind = kWriteKindByContext[_accessContext & 0x03];
+    if (_currentMode == TrackingMode::Z80AddressSpace)
+        MemoryAccessFacts::OnWrite(_facts.Z80At(address), kind, value, callerAddress, frame);
+    else if (ByteFacts* facts = _facts.PhysicalAt(physOffset))
+        MemoryAccessFacts::OnWrite(*facts, kind, value, callerAddress, frame);
+}
+
+void MemoryAccessTracker::TrackFactsExecute(uint16_t address, size_t physOffset, uint16_t callerAddress)
+{
+    // The instruction's first byte is fetched at its own PC (m1_pc); every other fetch is an operand. The halted CPU's
+    // idle fetch of the byte after the HALT is neither
+    const bool opcode = address == callerAddress;
+    if (!opcode && _accessContext == static_cast<uint8_t>(AccessContext::HaltFetch))
+        return;
+    const AccessKind kind = opcode ? AccessKind::OpcodeFetch : AccessKind::OperandFetch;
+    const uint32_t frame = static_cast<uint32_t>(_context->emulatorState.frame_counter);
+    if (_currentMode == TrackingMode::Z80AddressSpace)
+        MemoryAccessFacts::OnExecute(_facts.Z80At(address), kind, frame);
+    else if (ByteFacts* facts = _facts.PhysicalAt(physOffset))
+        MemoryAccessFacts::OnExecute(*facts, kind, frame);
+}
+
+/// endregion </Level (L0 access facts)>
+
 // Update feature cache (call when features change at runtime)
 void MemoryAccessTracker::UpdateFeatureCache()
 {
+    // Several threads change features (the GUI, WebAPI requests, the loop thread). The buffers follow the feature
+    // state, applied under the allocation mutex, never a flag another thread wrote meanwhile (a decision on a stale
+    // "was enabled" freed the buffers of an enabled tracker). The FeatureManager is read outside the mutex (its own
+    // lock may be held by a caller of this, a TTD recording start), so the state is applied until a read after the
+    // apply finds it unchanged: the last change wins whatever order the threads take the mutex in
     FeatureManager* fm = _context->pFeatureManager;
-    if (fm)
+    const auto wanted = [fm](bool& tracking, bool& calltrace) {
+        const bool debugMode = fm != nullptr && fm->isEnabled(Features::kDebugMode);
+        tracking = debugMode && fm->isEnabled(Features::kMemoryTracking);
+        calltrace = debugMode && fm->isEnabled(Features::kCallTrace);
+    };
+    bool tracking = false, calltrace = false;
+    wanted(tracking, calltrace);
+    for (;;)
     {
-        bool debugMode = fm->isEnabled(Features::kDebugMode);
-        bool wasTrackingEnabled = _feature_memorytracking_enabled;
-        bool wasCalltraceEnabled = _feature_calltrace_enabled;
-        _feature_memorytracking_enabled = debugMode && fm->isEnabled(Features::kMemoryTracking);
-        _feature_calltrace_enabled = debugMode && fm->isEnabled(Features::kCallTrace);
-
-        if (wasTrackingEnabled != _feature_memorytracking_enabled || wasCalltraceEnabled != _feature_calltrace_enabled)
         {
-            LOGDEBUG("MemoryAccessTracker::UpdateFeatureCache - memoryTracking: %s (was %s), callTrace: %s (was %s)",
-                    _feature_memorytracking_enabled ? "ON" : "OFF", wasTrackingEnabled ? "ON" : "OFF",
-                    _feature_calltrace_enabled ? "ON" : "OFF", wasCalltraceEnabled ? "ON" : "OFF");
-        }
-
-        // Lazy allocation: allocate counters only when tracking is first enabled
-        if (_feature_memorytracking_enabled && !_isAllocated.load(std::memory_order_acquire))
-        {
-            std::lock_guard<std::mutex> lock(_allocationMutex);
-            if (!_isAllocated.load(std::memory_order_relaxed))
+            std::lock_guard<std::shared_mutex> lock(_allocationMutex);
+            const bool wasTrackingEnabled = _feature_memorytracking_enabled;
+            const bool wasCalltraceEnabled = _feature_calltrace_enabled;
+            _feature_memorytracking_enabled = tracking;
+            _feature_calltrace_enabled = calltrace;
+            if (wasTrackingEnabled != tracking || wasCalltraceEnabled != calltrace)
             {
+                LOGDEBUG("MemoryAccessTracker::UpdateFeatureCache - memoryTracking: %s (was %s), callTrace: %s (was %s)",
+                         tracking ? "ON" : "OFF", wasTrackingEnabled ? "ON" : "OFF", calltrace ? "ON" : "OFF",
+                         wasCalltraceEnabled ? "ON" : "OFF");
+            }
+
+            // Lazy allocation: the counters exist exactly while tracking is enabled (freed when it is off)
+            const bool allocated = _isAllocated.load(std::memory_order_relaxed);
+            if (tracking && !allocated)
                 AllocateCounters();
-            }
-        }
-        // Deallocation: free counters when tracking is disabled to reclaim memory
-        else if (!_feature_memorytracking_enabled && wasTrackingEnabled && _isAllocated.load(std::memory_order_acquire))
-        {
-            std::lock_guard<std::mutex> lock(_allocationMutex);
-            if (_isAllocated.load(std::memory_order_relaxed))
-            {
+            else if (!tracking && allocated)
                 DeallocateCounters();
-            }
-        }
 
-        // Create call trace buffer if needed
-        if (_feature_calltrace_enabled && !_callTraceBuffer)
-        {
-            _callTraceBuffer = std::make_unique<CallTraceBuffer>();
+            // The call trace buffer the same way
+            if (calltrace && !_callTraceBuffer)
+                _callTraceBuffer = std::make_unique<CallTraceBuffer>();
+            else if (!calltrace && _callTraceBuffer)
+                _callTraceBuffer.reset();
         }
-        // Free call trace buffer when disabled
-        else if (!_feature_calltrace_enabled && _callTraceBuffer)
-        {
-            _callTraceBuffer.reset();
-        }
-    }
-    else
-    {
-        _feature_memorytracking_enabled = false;
-        _feature_calltrace_enabled = false;
+        bool trackingNow = false, calltraceNow = false;
+        wanted(trackingNow, calltraceNow);
+        if (trackingNow == tracking && calltraceNow == calltrace)
+            break;
+        tracking = trackingNow;
+        calltrace = calltraceNow;
     }
 }
 
@@ -195,10 +332,9 @@ void MemoryAccessTracker::AllocateCounters()
     _pageWriteCounters.resize(MAX_PAGES);
     _pageExecuteCounters.resize(MAX_PAGES);
 
-    // Allocate page access flags
-    _pageReadMarks.resize(MAX_PAGES / 8);
-    _pageWriteMarks.resize(MAX_PAGES / 8);
-    _pageExecuteMarks.resize(MAX_PAGES / 8);
+    // The L0 facts with the counters, at their level
+    if (_level == TrackerLevel::Facts)
+        _facts.Allocate(MAX_PAGES, _currentMode == TrackingMode::Z80AddressSpace);
 
     _isAllocated.store(true, std::memory_order_release);
 }
@@ -227,6 +363,8 @@ void MemoryAccessTracker::DeallocateCounters()
     _pageWriteCounters.reset();
     _pageExecuteCounters.reset();
 
+    _facts.Free();
+
     _pageReadMarks.reset();
     _pageWriteMarks.reset();
     _pageExecuteMarks.reset();
@@ -240,9 +378,14 @@ void MemoryAccessTracker::DeallocateCounters()
 }
 
 // Add a monitored memory region with the specified options
-bool MemoryAccessTracker::AddMonitoredRegion(const std::string& name, uint16_t startAddress, uint16_t length,
+bool MemoryAccessTracker::AddMonitoredRegion(const std::string& name, uint16_t startAddress, uint32_t length,
                                              const MonitoringOptions& options)
 {
+    if (length == 0 || startAddress + length > 0x10000)
+    {
+        return false;
+    }
+
     // Check if a region with this name already exists
     for (const auto& region : _monitoredRegions)
     {
@@ -270,7 +413,8 @@ bool MemoryAccessTracker::AddMonitoredRegion(const std::string& name, uint16_t s
 }
 
 // Add a monitored I/O port with the specified options
-bool MemoryAccessTracker::AddMonitoredPort(const std::string& name, uint16_t port, const MonitoringOptions& options)
+bool MemoryAccessTracker::AddMonitoredPort(const std::string& name, uint16_t port, const MonitoringOptions& options,
+                                           uint16_t mask)
 {
     // Check if a port with this name already exists
     for (const auto& monitoredPort : _monitoredPorts)
@@ -285,13 +429,11 @@ bool MemoryAccessTracker::AddMonitoredPort(const std::string& name, uint16_t por
     MonitoredPort monitoredPort;
     monitoredPort.name = name;
     monitoredPort.port = port;
+    monitoredPort.mask = mask;
     monitoredPort.options = options;
 
     // Add the port to the list
     _monitoredPorts.push_back(monitoredPort);
-
-    // Update the port to index map
-    _portToIndexMap[port] = _monitoredPorts.size() - 1;
 
     return true;
 }
@@ -319,21 +461,77 @@ bool MemoryAccessTracker::RemoveMonitoredPort(const std::string& name)
     {
         if (it->name == name)
         {
-            uint16_t port = it->port;
             _monitoredPorts.erase(it);
-            _portToIndexMap.erase(port);
-
-            // Rebuild the port to index map
-            for (size_t i = 0; i < _monitoredPorts.size(); ++i)
-            {
-                _portToIndexMap[_monitoredPorts[i].port] = i;
-            }
-
             return true;
         }
     }
 
     return false;  // Port not found
+}
+
+// Remove every monitored region and port
+void MemoryAccessTracker::ClearMonitored()
+{
+    _monitoredRegions.clear();
+    _monitoredPorts.clear();
+    _addressToRegionMap.clear();
+}
+
+// Copy every watch's totals for readers on other threads
+void MemoryAccessTracker::PublishWatches()
+{
+    // Only the writers (the emulation thread, or a tool at a coherent moment: never both) change the published list,
+    // so the writer reads it without the lock; readers take the lock
+    if (_monitoredRegions.empty() && _monitoredPorts.empty())
+    {
+        if (_publishedWatches.empty())
+        {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(_publishedMutex);
+        _publishedWatches.clear();
+        _publishedRevision++;
+        return;
+    }
+
+    std::vector<PublishedWatch> watches;
+    watches.reserve(_monitoredRegions.size() + _monitoredPorts.size());
+    for (const MonitoredRegion& region : _monitoredRegions)
+    {
+        PublishedWatch watch;
+        watch.name = region.name;
+        watch.start = region.startAddress;
+        watch.length = region.length;
+        watch.readCount = region.stats.readCount;
+        watch.writeCount = region.stats.writeCount;
+        watch.executeCount = region.stats.executeCount;
+        watches.push_back(std::move(watch));
+    }
+    for (const MonitoredPort& port : _monitoredPorts)
+    {
+        PublishedWatch watch;
+        watch.name = port.name;
+        watch.port = true;
+        watch.start = port.port;
+        watch.mask = port.mask;
+        watch.readCount = port.stats.readCount;
+        watch.writeCount = port.stats.writeCount;
+        watches.push_back(std::move(watch));
+    }
+
+    std::lock_guard<std::mutex> lock(_publishedMutex);
+    _publishedWatches.swap(watches);
+    _publishedRevision++;
+}
+
+std::vector<PublishedWatch> MemoryAccessTracker::PublishedWatches(uint64_t* revision) const
+{
+    std::lock_guard<std::mutex> lock(_publishedMutex);
+    if (revision)
+    {
+        *revision = _publishedRevision;
+    }
+    return _publishedWatches;
 }
 
 // Get statistics for a monitored memory region
@@ -374,9 +572,10 @@ void MemoryAccessTracker::UpdateAddressToRegionMap()
     for (size_t i = 0; i < _monitoredRegions.size(); ++i)
     {
         const auto& region = _monitoredRegions[i];
-        for (uint16_t addr = region.startAddress; addr < region.startAddress + region.length; ++addr)
+        // uint32_t: a region ending at 0xFFFF would wrap a 16-bit counter and never end
+        for (uint32_t addr = region.startAddress; addr < region.startAddress + region.length; ++addr)
         {
-            _addressToRegionMap[addr].push_back(i);
+            _addressToRegionMap[static_cast<uint16_t>(addr)].push_back(i);
         }
     }
 }
@@ -507,9 +706,13 @@ void MemoryAccessTracker::TrackMemoryRead(uint16_t address, uint8_t value, uint1
             }
 
             // Set the page mark
-            _pageReadMarks[page / 8] |= (1 << (page % 8));
+            _pageReadMarks.set(page);
         }
     }
+
+    // L0 access facts (level Facts)
+    if (_level == TrackerLevel::Facts) [[unlikely]]
+        TrackFactsRead(address, physOffset, value, callerAddress);
 
     // Update region statistics
     UpdateRegionStats(address, value, callerAddress, AccessType::Read);
@@ -558,9 +761,13 @@ void MemoryAccessTracker::TrackMemoryWrite(uint16_t address, uint8_t value, uint
             }
 
             // Set the page mark
-            _pageWriteMarks[page / 8] |= (1 << (page % 8));
+            _pageWriteMarks.set(page);
         }
     }
+
+    // L0 access facts (level Facts)
+    if (_level == TrackerLevel::Facts) [[unlikely]]
+        TrackFactsWrite(address, physOffset, value, callerAddress);
 
     // Update region statistics
     UpdateRegionStats(address, value, callerAddress, AccessType::Write);
@@ -641,9 +848,13 @@ void MemoryAccessTracker::TrackMemoryExecute(uint16_t address, uint16_t callerAd
             }
 
             // Set the page mark
-            _pageExecuteMarks[page / 8] |= (1 << (page % 8));
+            _pageExecuteMarks.set(page);
         }
     }
+
+    // L0 access facts (level Facts)
+    if (_level == TrackerLevel::Facts) [[unlikely]]
+        TrackFactsExecute(address, physOffset, callerAddress);
 
     // Update region statistics (no value for execute)
     UpdateRegionStats(address, 0, callerAddress, AccessType::Execute);
@@ -659,85 +870,13 @@ void MemoryAccessTracker::TrackMemoryExecute(uint16_t address, uint16_t callerAd
 // Track port read access
 void MemoryAccessTracker::TrackPortRead(uint16_t port, uint8_t value, uint16_t callerAddress)
 {
-    // THREAD SAFETY: Don't call UpdateFeatureCache() here - causes race with UI thread
-    if (!_feature_memorytracking_enabled)
-    {
-        return;
-    }
-
-    // Check if this port is monitored
-    auto it = _portToIndexMap.find(port);
-    if (it != _portToIndexMap.end())
-    {
-        size_t index = it->second;
-        MonitoredPort& monitoredPort = _monitoredPorts[index];
-
-        // Update read count, capping at max value
-        if (monitoredPort.stats.readCount < UINT32_MAX)
-        {
-            monitoredPort.stats.readCount++;
-        }
-
-        // Track caller addresses if enabled
-        if (monitoredPort.options.trackCallers)
-        {
-            AddToCallerMap(monitoredPort.stats.callerAddresses, callerAddress, monitoredPort.options.maxCallers);
-        }
-
-        // Track data values if enabled
-        if (monitoredPort.options.trackDataFlow)
-        {
-            AddToDataFlowMap(monitoredPort.stats.dataValues, value, monitoredPort.options.maxDataValues);
-        }
-
-        // Update segment statistics if segment tracking is enabled
-        if (_segmentTrackingEnabled && _currentSegment != nullptr)
-        {
-            UpdateSegmentStats(monitoredPort.name, monitoredPort.stats, true);
-        }
-    }
+    UpdatePortStats(port, value, callerAddress, AccessType::Read);
 }
 
 // Track port write access
 void MemoryAccessTracker::TrackPortWrite(uint16_t port, uint8_t value, uint16_t callerAddress)
 {
-    // Early return if memory tracking is disabled
-    if (!_feature_memorytracking_enabled)
-    {
-        return;
-    }
-
-    // Check if this port is monitored
-    auto it = _portToIndexMap.find(port);
-    if (it != _portToIndexMap.end())
-    {
-        size_t index = it->second;
-        MonitoredPort& monitoredPort = _monitoredPorts[index];
-
-        // Update write count, capping at max value
-        if (monitoredPort.stats.writeCount < UINT32_MAX)
-        {
-            monitoredPort.stats.writeCount++;
-        }
-
-        // Track caller addresses if enabled
-        if (monitoredPort.options.trackCallers)
-        {
-            AddToCallerMap(monitoredPort.stats.callerAddresses, callerAddress, monitoredPort.options.maxCallers);
-        }
-
-        // Track data values if enabled
-        if (monitoredPort.options.trackDataFlow)
-        {
-            AddToDataFlowMap(monitoredPort.stats.dataValues, value, monitoredPort.options.maxDataValues);
-        }
-
-        // Update segment statistics if segment tracking is enabled
-        if (_segmentTrackingEnabled && _currentSegment != nullptr)
-        {
-            UpdateSegmentStats(monitoredPort.name, monitoredPort.stats, true);
-        }
-    }
+    UpdatePortStats(port, value, callerAddress, AccessType::Write);
 }
 
 // Get the physical memory offset for a Z80 address
@@ -757,6 +896,12 @@ uint16_t MemoryAccessTracker::GetPageForPhysicalOffset(size_t offset) const
 void MemoryAccessTracker::UpdateRegionStats(uint16_t address, uint8_t value, uint16_t callerAddress,
                                             AccessType accessType)
 {
+    // Most sessions watch no region: skip the hash lookup on every access
+    if (_addressToRegionMap.empty())
+    {
+        return;
+    }
+
     // Check if this address is part of any monitored regions
     auto it = _addressToRegionMap.find(address);
     if (it != _addressToRegionMap.end())
@@ -814,6 +959,49 @@ void MemoryAccessTracker::UpdateRegionStats(uint16_t address, uint8_t value, uin
                     UpdateSegmentStats(region.name, region.stats, false);
                 }
             }
+        }
+    }
+}
+
+// Update the stats of every monitored port the access matches
+void MemoryAccessTracker::UpdatePortStats(uint16_t port, uint8_t value, uint16_t callerAddress, AccessType accessType)
+{
+    // THREAD SAFETY: Don't call UpdateFeatureCache() here - causes race with UI thread
+    if (_monitoredPorts.empty() || !IsMemoryCapturing())
+    {
+        return;
+    }
+
+    for (MonitoredPort& monitoredPort : _monitoredPorts)
+    {
+        if ((port & monitoredPort.mask) != (monitoredPort.port & monitoredPort.mask))
+        {
+            continue;
+        }
+
+        // Update the counter, capping at max value
+        uint32_t& count = accessType == AccessType::Write ? monitoredPort.stats.writeCount : monitoredPort.stats.readCount;
+        if (count < UINT32_MAX)
+        {
+            count++;
+        }
+
+        // Track caller addresses if enabled
+        if (monitoredPort.options.trackCallers)
+        {
+            AddToCallerMap(monitoredPort.stats.callerAddresses, callerAddress, monitoredPort.options.maxCallers);
+        }
+
+        // Track data values if enabled
+        if (monitoredPort.options.trackDataFlow)
+        {
+            AddToDataFlowMap(monitoredPort.stats.dataValues, value, monitoredPort.options.maxDataValues);
+        }
+
+        // Update segment statistics if segment tracking is enabled
+        if (_segmentTrackingEnabled && _currentSegment != nullptr)
+        {
+            UpdateSegmentStats(monitoredPort.name, monitoredPort.stats, true);
         }
     }
 }
@@ -904,6 +1092,9 @@ void MemoryAccessTracker::AddToCallerMap(std::unordered_map<uint16_t, uint32_t>&
 // Get total access count for a Z80 bank
 uint32_t MemoryAccessTracker::GetZ80BankTotalAccessCount(uint8_t bank) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    if (!_isAllocated.load(std::memory_order_acquire) || _z80ReadCounters.empty() || bank >= 4)
+        return 0;
     uint32_t result = 0;
     uint8_t bankBit = 1 << bank;
     bool bankWasRead = _z80BankReadMarks & bankBit;
@@ -932,6 +1123,9 @@ uint32_t MemoryAccessTracker::GetZ80BankTotalAccessCount(uint8_t bank) const
 // Get read access count for a Z80 bank
 uint32_t MemoryAccessTracker::GetZ80BankReadAccessCount(uint8_t bank) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    if (!_isAllocated.load(std::memory_order_acquire) || _z80ReadCounters.empty() || bank >= 4)
+        return 0;
     uint32_t result = 0;
     uint8_t bankBit = 1 << bank;
 
@@ -952,6 +1146,9 @@ uint32_t MemoryAccessTracker::GetZ80BankReadAccessCount(uint8_t bank) const
 // Get write access count for a Z80 bank
 uint32_t MemoryAccessTracker::GetZ80BankWriteAccessCount(uint8_t bank) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    if (!_isAllocated.load(std::memory_order_acquire) || _z80ReadCounters.empty() || bank >= 4)
+        return 0;
     uint32_t result = 0;
     uint8_t bankBit = 1 << bank;
 
@@ -972,6 +1169,9 @@ uint32_t MemoryAccessTracker::GetZ80BankWriteAccessCount(uint8_t bank) const
 // Get execute access count for a Z80 bank
 uint32_t MemoryAccessTracker::GetZ80BankExecuteAccessCount(uint8_t bank) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    if (!_isAllocated.load(std::memory_order_acquire) || _z80ReadCounters.empty() || bank >= 4)
+        return 0;
     uint32_t result = 0;
     uint8_t bankBit = 1 << bank;
 
@@ -991,6 +1191,7 @@ uint32_t MemoryAccessTracker::GetZ80BankExecuteAccessCount(uint8_t bank) const
 
 uint32_t MemoryAccessTracker::GetZ80AddressReadCount(uint16_t address) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
     if (!_isAllocated.load(std::memory_order_acquire) || _z80ReadCounters.empty())
         return 0;
     return _z80ReadCounters[address];
@@ -998,6 +1199,7 @@ uint32_t MemoryAccessTracker::GetZ80AddressReadCount(uint16_t address) const
 
 uint32_t MemoryAccessTracker::GetZ80AddressWriteCount(uint16_t address) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
     if (!_isAllocated.load(std::memory_order_acquire) || _z80WriteCounters.empty())
         return 0;
     return _z80WriteCounters[address];
@@ -1005,15 +1207,50 @@ uint32_t MemoryAccessTracker::GetZ80AddressWriteCount(uint16_t address) const
 
 uint32_t MemoryAccessTracker::GetZ80AddressExecuteCount(uint16_t address) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
     if (!_isAllocated.load(std::memory_order_acquire) || _z80ExecuteCounters.empty())
         return 0;
     return _z80ExecuteCounters[address];
 }
 
+MemoryAccessTracker::CountersView MemoryAccessTracker::Z80CountersView() const
+{
+    CountersView view;
+    view._lock = std::shared_lock<std::shared_mutex>(_allocationMutex);
+    if (_isAllocated.load(std::memory_order_acquire) && !_z80ReadCounters.empty())
+    {
+        view.reads = _z80ReadCounters.data();
+        view.writes = _z80WriteCounters.data();
+        view.executes = _z80ExecuteCounters.data();
+        view.size = _z80ReadCounters.size();
+    }
+    return view;
+}
+
+MemoryAccessTracker::CountersView MemoryAccessTracker::PhysCountersView() const
+{
+    CountersView view;
+    view._lock = std::shared_lock<std::shared_mutex>(_allocationMutex);
+    if (_isAllocated.load(std::memory_order_acquire) && !_physReadCounters.empty())
+    {
+        view.reads = _physReadCounters.data();
+        view.writes = _physWriteCounters.data();
+        view.executes = _physExecuteCounters.data();
+        view.size = _physReadCounters.size();
+    }
+    return view;
+}
+
 // Get total access count for a physical memory page
 uint32_t MemoryAccessTracker::GetPageTotalAccessCount(uint16_t page) const
 {
-    if (page >= MAX_PAGES)
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return PageTotalCountUnlocked(page);
+}
+
+uint32_t MemoryAccessTracker::PageTotalCountUnlocked(uint16_t page) const
+{
+    if (page >= MAX_PAGES || page >= _pageReadCounters.size())
     {
         return 0;
     }
@@ -1023,6 +1260,12 @@ uint32_t MemoryAccessTracker::GetPageTotalAccessCount(uint16_t page) const
 
 // Get read access count for a physical memory page
 uint32_t MemoryAccessTracker::GetPageReadAccessCount(uint16_t page) const
+{
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return PageReadCountUnlocked(page);
+}
+
+uint32_t MemoryAccessTracker::PageReadCountUnlocked(uint16_t page) const
 {
     if (page >= MAX_PAGES || page >= _pageReadCounters.size())
     {
@@ -1035,6 +1278,12 @@ uint32_t MemoryAccessTracker::GetPageReadAccessCount(uint16_t page) const
 // Get write access count for a physical memory page
 uint32_t MemoryAccessTracker::GetPageWriteAccessCount(uint16_t page) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return PageWriteCountUnlocked(page);
+}
+
+uint32_t MemoryAccessTracker::PageWriteCountUnlocked(uint16_t page) const
+{
     if (page >= MAX_PAGES || page >= _pageWriteCounters.size())
     {
         return 0;
@@ -1046,6 +1295,12 @@ uint32_t MemoryAccessTracker::GetPageWriteAccessCount(uint16_t page) const
 // Get execute access count for a physical memory page
 uint32_t MemoryAccessTracker::GetPageExecuteAccessCount(uint16_t page) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    return PageExecuteCountUnlocked(page);
+}
+
+uint32_t MemoryAccessTracker::PageExecuteCountUnlocked(uint16_t page) const
+{
     if (page >= MAX_PAGES || page >= _pageExecuteCounters.size())
     {
         return 0;
@@ -1056,18 +1311,15 @@ uint32_t MemoryAccessTracker::GetPageExecuteAccessCount(uint16_t page) const
 
 bool MemoryAccessTracker::IsPageActive(uint16_t page, AccessType accessType) const
 {
-    if (page >= MAX_PAGES || _pageReadMarks.empty())
+    if (page >= MAX_PAGES || !_isAllocated.load(std::memory_order_acquire))
         return false;
 
-    uint8_t byteIdx = page / 8;
-    uint8_t bitMask = 1u << (page % 8);
-
     uint8_t typeFlags = static_cast<uint8_t>(accessType);
-    if ((typeFlags & static_cast<uint8_t>(AccessType::Read)) && (_pageReadMarks[byteIdx] & bitMask))
+    if ((typeFlags & static_cast<uint8_t>(AccessType::Read)) && _pageReadMarks.test(page))
         return true;
-    if ((typeFlags & static_cast<uint8_t>(AccessType::Write)) && (_pageWriteMarks[byteIdx] & bitMask))
+    if ((typeFlags & static_cast<uint8_t>(AccessType::Write)) && _pageWriteMarks.test(page))
         return true;
-    if ((typeFlags & static_cast<uint8_t>(AccessType::Execute)) && (_pageExecuteMarks[byteIdx] & bitMask))
+    if ((typeFlags & static_cast<uint8_t>(AccessType::Execute)) && _pageExecuteMarks.test(page))
         return true;
 
     return false;
@@ -1077,7 +1329,7 @@ std::vector<uint16_t> MemoryAccessTracker::GetActivePages(AccessType accessType)
 {
     std::vector<uint16_t> result;
 
-    if (_pageReadMarks.empty())
+    if (!_isAllocated.load(std::memory_order_acquire))
         return result;
 
     result.reserve(32);
@@ -1092,7 +1344,7 @@ std::vector<uint16_t> MemoryAccessTracker::GetActivePages(AccessType accessType)
 
 uint16_t MemoryAccessTracker::GetActivePageCount(AccessType accessType) const
 {
-    if (_pageReadMarks.empty())
+    if (!_isAllocated.load(std::memory_order_acquire))
         return 0;
 
     uint16_t count = 0;
@@ -1305,6 +1557,9 @@ std::string MemoryAccessTracker::GeneratePortReport() const
 // Check if there's any activity (read/write/execute) in the specified address range
 bool MemoryAccessTracker::HasActivity(uint16_t start, uint16_t end) const
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
+    if (!_isAllocated.load(std::memory_order_acquire) || _z80ReadCounters.empty())
+        return false;
     // Ensure start <= end
     if (start > end)
     {
@@ -1411,6 +1666,7 @@ std::string MemoryAccessTracker::GenerateSegmentReport() const
 std::string MemoryAccessTracker::SaveAccessData(const std::string& outputPath, const std::string& format,
                                                 bool singleFile, const std::vector<std::string>& filterPages)
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
     namespace fs = std::filesystem;
 
     try
@@ -1533,12 +1789,12 @@ void MemoryAccessTracker::SavePageSummaries(std::ostream& out, const std::vector
         std::string pageName = "RAM " + std::to_string(page);
         if (!filterPages.empty() && std::find(filterPages.begin(), filterPages.end(), pageName) == filterPages.end())
             continue;
-        if (GetPageTotalAccessCount(page) > 0)
+        if (PageTotalCountUnlocked(page) > 0)
         {
             out << "  \"" << pageName << "\":" << std::endl;
-            out << "    reads: " << GetPageReadAccessCount(page) << std::endl;
-            out << "    writes: " << GetPageWriteAccessCount(page) << std::endl;
-            out << "    executes: " << GetPageExecuteAccessCount(page) << std::endl;
+            out << "    reads: " << PageReadCountUnlocked(page) << std::endl;
+            out << "    writes: " << PageWriteCountUnlocked(page) << std::endl;
+            out << "    executes: " << PageExecuteCountUnlocked(page) << std::endl;
         }
     }
     // Save ROM pages (start after RAM, cache, and misc pages)
@@ -1551,7 +1807,7 @@ void MemoryAccessTracker::SavePageSummaries(std::ostream& out, const std::vector
         if (!filterPages.empty() && std::find(filterPages.begin(), filterPages.end(), pageName) == filterPages.end())
             continue;
         uint16_t physicalPage = FIRST_ROM_PAGE + page;
-        if (GetPageTotalAccessCount(physicalPage) > 0)
+        if (PageTotalCountUnlocked(physicalPage) > 0)
         {
             std::string hash, title;
             if (rom && romBase)
@@ -1561,9 +1817,9 @@ void MemoryAccessTracker::SavePageSummaries(std::ostream& out, const std::vector
             }
             out << "  \"" << pageName << "\": # " << (title.empty() ? "Unknown ROM" : title)
                 << " - hash: " << (hash.empty() ? "?" : hash) << std::endl;
-            out << "    reads: " << GetPageReadAccessCount(physicalPage) << std::endl;
+            out << "    reads: " << PageReadCountUnlocked(physicalPage) << std::endl;
             out << "    writes: 0" << std::endl;
-            out << "    executes: " << GetPageExecuteAccessCount(physicalPage) << std::endl;
+            out << "    executes: " << PageExecuteCountUnlocked(physicalPage) << std::endl;
         }
     }
 }
@@ -1583,7 +1839,7 @@ bool MemoryAccessTracker::SaveDetailedAccessData(const std::filesystem::path& di
         }
 
         // Skip pages with no activity
-        if (GetPageTotalAccessCount(page) == 0)
+        if (PageTotalCountUnlocked(page) == 0)
         {
             continue;
         }
@@ -1615,7 +1871,7 @@ bool MemoryAccessTracker::SaveDetailedAccessData(const std::filesystem::path& di
         uint16_t physicalPage = FIRST_ROM_PAGE + page;
 
         // Skip pages with no activity
-        if (GetPageTotalAccessCount(physicalPage) == 0)
+        if (PageTotalCountUnlocked(physicalPage) == 0)
         {
             continue;
         }
@@ -1649,7 +1905,7 @@ void MemoryAccessTracker::SaveDetailedAccessData(std::ostream& out, const std::v
         {
             continue;
         }
-        if (GetPageTotalAccessCount(page) > 0)
+        if (PageTotalCountUnlocked(page) > 0)
         {
             out << "  \"" << pageName << "\":" << std::endl;
             out << "    accessed_addresses:" << std::endl;
@@ -1670,7 +1926,7 @@ void MemoryAccessTracker::SaveDetailedAccessData(std::ostream& out, const std::v
         }
 
         uint16_t physicalPage = FIRST_ROM_PAGE + page;
-        if (GetPageTotalAccessCount(physicalPage) > 0)
+        if (PageTotalCountUnlocked(physicalPage) > 0)
         {
             std::string hash;
             std::string title;
@@ -1760,6 +2016,7 @@ std::string MemoryAccessTracker::GetBankPageName(uint8_t bank) const
 
 bool MemoryAccessTracker::DumpVisualizationData(const std::string& filename)
 {
+    std::shared_lock<std::shared_mutex> lock(_allocationMutex);
     std::ofstream out(FileHelper::ToFsPath(filename), std::ios::binary);
     if (!out)
         return false;
@@ -1910,7 +2167,7 @@ void MemoryAccessTracker::StartMemorySession()
     // Ensure counters are allocated
     if (!_isAllocated.load(std::memory_order_acquire))
     {
-        std::lock_guard<std::mutex> lock(_allocationMutex);
+        std::lock_guard<std::shared_mutex> lock(_allocationMutex);
         if (!_isAllocated.load(std::memory_order_relaxed))
         {
             AllocateCounters();
@@ -1922,6 +2179,7 @@ void MemoryAccessTracker::StartMemorySession()
 
     // Set state to capturing
     _memorySessionState = ProfilerSessionState::Capturing;
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::PauseMemorySession()
@@ -1930,6 +2188,7 @@ void MemoryAccessTracker::PauseMemorySession()
     {
         _memorySessionState = ProfilerSessionState::Paused;
     }
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::ResumeMemorySession()
@@ -1938,6 +2197,7 @@ void MemoryAccessTracker::ResumeMemorySession()
     {
         _memorySessionState = ProfilerSessionState::Capturing;
     }
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::StopMemorySession()
@@ -1947,12 +2207,14 @@ void MemoryAccessTracker::StopMemorySession()
         _memorySessionState = ProfilerSessionState::Stopped;
         // Data is retained until ClearMemoryData() is called
     }
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::ClearMemoryData()
 {
     ResetCounters();
     // State remains unchanged - can be called in any state
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 ProfilerSessionState MemoryAccessTracker::GetMemorySessionState() const
@@ -1988,6 +2250,7 @@ void MemoryAccessTracker::StartCalltraceSession()
 
     // Set state to capturing
     _calltraceSessionState = ProfilerSessionState::Capturing;
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::PauseCalltraceSession()
@@ -1996,6 +2259,7 @@ void MemoryAccessTracker::PauseCalltraceSession()
     {
         _calltraceSessionState = ProfilerSessionState::Paused;
     }
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::ResumeCalltraceSession()
@@ -2004,6 +2268,7 @@ void MemoryAccessTracker::ResumeCalltraceSession()
     {
         _calltraceSessionState = ProfilerSessionState::Capturing;
     }
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::StopCalltraceSession()
@@ -2014,6 +2279,7 @@ void MemoryAccessTracker::StopCalltraceSession()
         _calltraceSessionState = ProfilerSessionState::Stopped;
         // Data is retained until ClearCalltraceData() is called
     }
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 void MemoryAccessTracker::ClearCalltraceData()
@@ -2023,6 +2289,7 @@ void MemoryAccessTracker::ClearCalltraceData()
         _callTraceBuffer->Reset();
     }
     // State remains unchanged
+    NotifyReadoutsChanged(_context, "debug.tools");  // debug.analyzers / debug.buffers and the profiler toggles
 }
 
 ProfilerSessionState MemoryAccessTracker::GetCalltraceSessionState() const
@@ -2033,4 +2300,10 @@ ProfilerSessionState MemoryAccessTracker::GetCalltraceSessionState() const
 bool MemoryAccessTracker::IsCalltraceCapturing() const
 {
     return _feature_calltrace_enabled && _calltraceSessionState == ProfilerSessionState::Capturing;
+}
+
+bool MemoryAccessTracker::HasCapturingSession() const
+{
+    return _memorySessionState == ProfilerSessionState::Capturing ||
+           _calltraceSessionState == ProfilerSessionState::Capturing;
 }

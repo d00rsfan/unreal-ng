@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "debugger/breakpoints/breakpointmanager.h"
 #include "ianalyzer.h"
 #include "emulator/memory/memory.h"
 
@@ -30,19 +31,16 @@ struct CPUStepCallback
     void (*fn)(void* ctx, Z80* cpu, uint16_t pc);
     void* context;
     std::string ownerId;
-};
-
-/// Memory access callback structure
-struct MemoryCallback
-{
-    void (*fn)(void* ctx, uint16_t address, uint8_t value);
-    void* context;
-    std::string ownerId;
+    /// The subscriber books a halted idle stretch as one step (the CPU time profile: the T-states between two
+    /// instruction starts go to the HALT whatever their number), so the CPU may run the stretch in one go
+    bool idleTolerant = false;
 };
 
 /// Manages analyzer lifecycle, event dispatching, and breakpoint ownership.
 /// Uses hybrid dispatch: raw pointers for hot paths, std::function for warm paths, virtual for cold paths.
-class AnalyzerManager
+/// The analyzers' breakpoints are taps (docs/inprogress/2026-10-26-breakpoint-taps §8): this manager is their sink,
+/// a hit goes to the analyzer that asked for it and never stops, and they run without the debug mode
+class AnalyzerManager : public IBreakpointTapSink
 {
 public:
     /// Owner ID used for all analyzer-owned breakpoints
@@ -146,24 +144,9 @@ public:
     /// @param context User context pointer
     /// @param analyzerId Analyzer identifier (for ownership tracking)
     /// @return Subscription ID for cleanup
+    /// @param idleTolerant The subscriber needs no step per halted idle fetch (CPUStepCallback::idleTolerant)
     CallbackId subscribeCPUStep(void (*fn)(void* ctx, Z80* cpu, uint16_t pc), void* context,
-                                const std::string& analyzerId);
-
-    /// Subscribe to memory read events (~1-3M/sec)
-    /// @param fn Callback function pointer
-    /// @param context User context pointer
-    /// @param analyzerId Analyzer identifier (for ownership tracking)
-    /// @return Subscription ID for cleanup
-    CallbackId subscribeMemoryRead(void (*fn)(void* ctx, uint16_t addr, uint8_t val), void* context,
-                                   const std::string& analyzerId);
-
-    /// Subscribe to memory write events (~1-3M/sec)
-    /// @param fn Callback function pointer
-    /// @param context User context pointer
-    /// @param analyzerId Analyzer identifier (for ownership tracking)
-    /// @return Subscription ID for cleanup
-    CallbackId subscribeMemoryWrite(void (*fn)(void* ctx, uint16_t addr, uint8_t val), void* context,
-                                    const std::string& analyzerId);
+                                const std::string& analyzerId, bool idleTolerant = false);
 
     // Warm path subscriptions (std::function ~15-25ns per call)
 
@@ -232,6 +215,10 @@ public:
     /// so the no-subscriber path costs two branches.
     bool hasCPUStepSubscribers() const { return _enabled && !_cpuStepCallbacks.empty(); }
 
+    /// True when a subscriber needs a step per halted idle fetch (Z80::IdleStepsInert): an idle-tolerant one alone
+    /// lets the CPU run a halted stretch in one go
+    bool hasIdleStepSubscribers() const { return _enabled && _idleStepSubscribers != 0; }
+
     /// Guard for the per-sample audio dispatch loop in SoundManager::handleFrameEnd —
     /// true when at least one analyzer subscribes to audio samples
     bool hasAudioSampleSubscribers() const { return _enabled && !_audioCallbacks.empty(); }
@@ -240,16 +227,6 @@ public:
     /// asked for one device (AudioCaptureAnalyzer::startCapture; SoundManager reads deviceBuffer(source))
     void setAudioTapSource(int source) { _audioTapSource = source; }
     int audioTapSource() const { return _audioTapSource; }
-
-    /// Dispatch memory read event to all subscribers
-    /// @param addr Memory address
-    /// @param val Value read
-    void dispatchMemoryRead(uint16_t addr, uint8_t val);
-
-    /// Dispatch memory write event to all subscribers
-    /// @param addr Memory address
-    /// @param val Value written
-    void dispatchMemoryWrite(uint16_t addr, uint8_t val);
 
     /// Dispatch video line event to all subscribers
     /// @param line Scanline number
@@ -272,6 +249,9 @@ public:
     /// @param cpu CPU state at breakpoint
     void dispatchBreakpointHit(uint16_t addr, BreakpointId bpId, Z80* cpu);
 
+    /// A hit of an analyzer's tap (emulation thread): dispatchBreakpointHit with the CPU
+    void OnTap(const BreakpointTapHit& hit) override;
+
     // Feature toggle
 
     /// Enable/disable all analyzer dispatching (master toggle)
@@ -285,7 +265,6 @@ public:
 private:
     EmulatorContext* _context;
     BreakpointManager* _breakpointManager;
-    FeatureManager* _featureManager;
 
     // Analyzer storage
     std::unordered_map<std::string, std::unique_ptr<IAnalyzer>> _analyzers;
@@ -293,8 +272,7 @@ private:
 
     // Hot path callback storage
     std::vector<CPUStepCallback> _cpuStepCallbacks;
-    std::vector<MemoryCallback> _memoryReadCallbacks;
-    std::vector<MemoryCallback> _memoryWriteCallbacks;
+    size_t _idleStepSubscribers = 0;  ///< the callbacks above that are not idle tolerant
 
     // Warm path callback storage
     std::vector<std::pair<std::function<void(uint16_t)>, std::string>> _videoLineCallbacks;
@@ -319,6 +297,11 @@ private:
     std::unordered_map<CallbackId, std::string> _subscriptionOwners;                  // callbackId -> analyzerId
     std::unordered_map<std::string, std::vector<CallbackId>> _analyzerSubscriptions;  // analyzerId -> [callbackIds]
 
+    // This manager's tap sink id (init)
+    uint8_t _tapSink = BRK_NO_TAP;
+    /// Adds @p descriptor as a tap of this manager's sink (owner OWNER_ID) and notes @p analyzerId as its owner
+    BreakpointId addTap(BreakpointDescriptor* descriptor, const std::string& analyzerId, uint32_t key);
+
     // Master toggle
     bool _enabled = false;
 
@@ -335,7 +318,4 @@ private:
     /// @param analyzerId Analyzer identifier
     void removeAllSubscriptionsForAnalyzer(const std::string& analyzerId);
     
-    /// Auto-enable debug features (debugmode + breakpoints) on first breakpoint registration
-    /// Called automatically when an analyzer requests a breakpoint
-    void ensureDebugFeaturesEnabled();
 };

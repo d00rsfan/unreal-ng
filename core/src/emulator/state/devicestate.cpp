@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "emulator/emulator.h"
 
 #include "emulator/state/devicestate.h"
 
@@ -876,18 +877,26 @@ StateNode Covox(EmulatorContext* context)
     }
     ::Covox* covox = sm->getCovox();
     if (!covox)
-        return Unavailable("Covox not fitted (configure [SOUND] CovoxFB=1 for #FB or SD=1 for the SoundDrive)");
+        return Unavailable("Covox not fitted (configure [SOUND] CovoxFB=1 for #FB, SD=1 for the SoundDrive or, on a "
+                           "Scorpion, CovoxDD=1 for the Covox on the printer port #DD)");
 
     const ::Covox::Fitment fitment = covox->fitment();
     const bool mono = fitment == ::Covox::Fitment::Mono;
     StateNode ret = StateNode::Object();
     ret["available"] = true;
-    ret["device"] = mono ? "Covox (8-bit DAC on #FB)" : "SoundDrive (4 x 8-bit DAC)";
-    ret["fitment"] = fitment == ::Covox::Fitment::Quad    ? "quad"
-                     : fitment == ::Covox::Fitment::Mode1 ? "mode1"
-                     : fitment == ::Covox::Fitment::Mode2 ? "mode2"
+    const bool printerOnly = fitment == ::Covox::Fitment::None;
+    const bool dd = covox->answersPrinterPort();
+    ret["device"] = printerOnly ? "Covox (8-bit DAC on #DD)"
+                    : mono      ? (dd ? "Covox (8-bit DAC on #DD and #FB)" : "Covox (8-bit DAC on #FB)")
+                                : (dd ? "SoundDrive (4 x 8-bit DAC) + Scorpion Covox #DD" : "SoundDrive (4 x 8-bit DAC)");
+    ret["fitment"] = fitment == ::Covox::Fitment::Quad        ? "quad"
+                     : fitment == ::Covox::Fitment::Mode1     ? "mode1"
+                     : fitment == ::Covox::Fitment::Mode2     ? "mode2"
                      : fitment == ::Covox::Fitment::Mode1Mono ? "mode1+mono"
+                     : printerOnly                            ? "none"
                                                               : "mono";
+    // The Scorpion's Covox port #DD (CovoxDD=1): the same instance, the right_b (mono) latch
+    ret["printer_port"] = dd;
 
     // Ports: this model's decode, straight from its port map (the same rows
     // /ports and `ports` list), and the ones it shares with Beta-128
@@ -1368,6 +1377,10 @@ StateNode Fdc(EmulatorContext* context)
     ret["side"] = fdc->getSideUp() ? 1 : 0;
 
     ret["drives"] = DrivesNode(context, 4);
+
+    // The chip's state machine history (debugger/history/devicehistory.h): its mode and counts, the records kept
+    ret["history_state"] = history::StatsNode(fdc->CommandHistory());
+    ret["history"] = fdc->CommandHistory().Records(0);
     return ret;
 }
 
@@ -1553,6 +1566,11 @@ StateNode ScreenMode(EmulatorContext* context)
         case M_PMC: ret["eff7_hwmc"] = true; break;
         case M_PHR: ret["eff7_512"] = true; break;
         case M_P384: ret["overscan"] = true; break;
+        case M_GMX:
+            ret["gmx_640x200"] = true;
+            ret["framebuffer"] = "736x288";
+            ret["raster"] = "312 lines x 224 T (69888 T frame), 5 pixels per T in the paper window";
+            break;
         case M_PROFIHR:
             ret["profi_hires"] = true;
             ret["framebuffer"] = "608x288";
@@ -1701,7 +1719,7 @@ StateNode Contention(EmulatorContext* context)
     ret["io_rule"] = z80->ioContention ? ContentionRuleName(rule) : "none";
     // The Scorpion's waits outside the contention rule: Even M1 at 3.5 MHz, and the Turbo+ logic firmware
     ret["even_m1"] = context->config.even_M1 != 0;
-    if (context->config.mem_model == MM_SCORP || context->config.mem_model == MM_PROFSCORP)
+    if (context->config.mem_model == MM_SCORP || context->config.mem_model == MM_PROFSCORP)  // the GMX has no Turbo+ logic
         ret["scorpion_turbo_logic"] =
             context->config.scorpionTurboLogic == ScorpionTurboLogic::SC153 ? "SC15.3" : "SC15.1";
     // The ATM Turbo 2+ v7.10's RAM waits at 7 MHz (Atm710TurboOverlay): active, off (3.5 MHz) or contention_off
@@ -2072,6 +2090,8 @@ StateNode Network(EmulatorContext* context)
     StateNode& set = ret["settings"];
     set["card"] = st.settings.card;
     set["com_port"] = st.settings.comPort;
+    set["com_port2"] = st.settings.comPort2;
+    set["com_port_joy"] = st.settings.comPortJoy;
     set["zx_wifi"] = st.settings.zxWifi;
     set["esp_chip"] = st.settings.espChip;
     set["com_modem_lines"] = st.settings.comModemLines;
@@ -2376,6 +2396,93 @@ StateNode Network(EmulatorContext* context)
             e["bytes"] = a.bytes;
         activity.push(std::move(e));
     }
+    return ret;
+}
+
+StateNode Execution(EmulatorContext* context)
+{
+    Emulator* emulator = context ? context->pEmulator : nullptr;
+    if (!emulator)
+        return Unavailable("no emulator");
+    const execution::Snapshot snap = emulator->GetArbiter().GetSnapshot();
+    auto requester = [](const execution::Requester& r) {
+        StateNode n = StateNode::Object();
+        n["origin"] = execution::OriginName(r.origin);
+        if (!r.client.empty())
+            n["client"] = r.client;
+        return n;
+    };
+    auto entry = [&](const execution::SnapshotEntry& e) {
+        StateNode n = StateNode::Object();
+        n["seq"] = e.seq;
+        n["kind"] = e.command ? "command" : "intent";
+        if (e.command)
+            n["tag"] = e.tag;
+        else
+            n["intent"] = execution::IntentName(e.intent);
+        n["by"] = requester(e.requester);
+        n["age_ms"] = e.ageMs;
+        return n;
+    };
+
+    StateNode ret = StateNode::Object();
+    ret["available"] = true;
+    ret["phase"] = execution::PhaseName(snap.phase);
+    ret["intent"] = execution::IntentName(snap.intent);
+    ret["paused"] = emulator->IsPaused();
+    ret["intent_set_by"] = requester(snap.intentSetBy);
+    ret["intent_reason"] = snap.intentReason;
+    ret["intent_seq"] = snap.intentSeq;
+    ret["intent_age_ms"] = snap.intentAgeMs;
+    StateNode& loop = ret["main_loop"] = StateNode::Object();
+    loop["attached"] = snap.loopAttached;
+    loop["parked"] = snap.loopParked;
+    ret["may_run"] = snap.mayRun;
+    ret["parked"] = emulator->IsEmulationParked();
+    if (snap.serving)
+    {
+        StateNode serving = entry(*snap.serving);
+        serving["drives_z80"] = snap.servingDrivesZ80;
+        ret["serving"] = serving;
+    }
+    else
+        ret["serving"] = StateNode();
+    StateNode& queue = ret["queue"] = StateNode::Array();
+    for (const execution::SnapshotEntry& e : snap.queue)
+        queue.push(entry(e));
+    ret["claim"] = snap.claim ? requester(*snap.claim) : StateNode();
+    // The automation session behind the claim (design §6a): who, since when, its idle lease, the clients the user took
+    // control back from and how long until they may take it again
+    const EmulatorContext::RunControlState rc = context->GetRunControlState();
+    if (rc.claimed)
+    {
+        StateNode session = StateNode::Object();
+        session["surface"] = rc.surfaceLabel;
+        session["client"] = rc.client;
+        session["peer"] = rc.peer;
+        session["owner"] = rc.ownerUuid;
+        session["since_ms"] = rc.sinceMs;
+        session["lease_ms"] = rc.leaseMs;
+        ret["session"] = session;
+    }
+    else
+        ret["session"] = StateNode();
+    StateNode& cooldowns = ret["retake_cooldowns"] = StateNode::Array();
+    for (const auto& [key, secondsLeft] : rc.cooldowns)
+    {
+        StateNode c = StateNode::Object();
+        c["client"] = key;
+        c["seconds_left"] = secondsLeft;
+        cooldowns.push(c);
+    }
+    StateNode& counters = ret["counters"] = StateNode::Object();
+    counters["applied"] = snap.applied;
+    counters["coalesced"] = snap.coalesced;
+    counters["refused"] = snap.refused;
+    counters["busy"] = snap.busy;
+    counters["aborted"] = snap.aborted;
+    counters["edges"] = snap.edges;
+    ret["driver_violations"] = emulator->DriverViolations();
     return ret;
 }
 

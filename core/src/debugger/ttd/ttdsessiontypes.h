@@ -3,14 +3,16 @@
 /// @file ttdsessiontypes.h
 /// @brief The types a time-travel session reports and takes - status
 /// (TTDSessionInfo), seek / reverse / coverage / journal-build results, clip
-/// export options and frames, performance and heap counters. Shared by v1's
-/// TimeTravelManager and the engine's controller (Phase 5), so neither depends
-/// on the other's header; TTDControl and the surfaces use them by these names.
+/// export options and frames, performance and heap counters, kept apart from
+/// the controller's header; TTDControl and the surfaces use them by these names.
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,7 @@
 #include "ttdphyspage.h"
 #include "ttdprobe.h"
 #include "ttdwritejournal.h"
+#include "engine/ttdbranchtable.h"
 #include "engine/ttdrestoreresult.h"
 #include "engine/ttdwriteindex.h"
 
@@ -123,13 +126,65 @@ struct TTDJournalBuildResult
     bool cancelled = false;       ///< the progress callback asked to stop; the frames built so far are kept
     uint64_t framesBuilt = 0;     ///< replayed, their writes added to the journal
     uint64_t framesCovered = 0;   ///< already inside a journal segment, left as they were
-    uint64_t framesRefused = 0;   ///< hold a v1 marker without its data: cannot be replayed
+    uint64_t framesRefused = 0;   ///< hold a marker without its data (a barrier): cannot be replayed
     uint64_t records = 0;         ///< writes added
 };
 
 /// Called after each frame of a build: (frames done, frames to build). Return
 /// false to stop; what is built so far is kept
 using TTDJournalBuildProgress = std::function<bool(uint64_t done, uint64_t total)>;
+
+/// The session's branches as an observer sees them (TTD branches, surfaces.md §1): the live branches by id, the
+/// active branch's lineage. Published with the session info and shared by its copies until the table changes
+struct TTDBranchesView
+{
+    std::vector<TTDBranchInfo> branches;   ///< live ones, the trunk first, by id
+    std::vector<TTDLineageSpan> lineage;   ///< the active branch's, trunk first
+    uint64_t revision = 0;                 ///< TTDBranchTable::Revision() it was taken at
+
+    const TTDBranchInfo* Find(uint32_t id) const
+    {
+        for (const TTDBranchInfo& b : branches)
+            if (b.id == id)
+                return &b;
+        return nullptr;
+    }
+};
+
+/// A branch that leaves the shown timeline at a frame (TTDForkPoints)
+struct TTDForkLeave
+{
+    uint32_t branch = kTTDTrunk;
+    std::string name;
+    uint64_t frames = 0;   ///< its length past the fork
+};
+
+/// Every frame of the lineage where another future goes on (the TTD panel's slider marks, the debuggers' "fork here",
+/// TTD branches debuggers.md §4.2): a branch off the lineage forks from the part its parent holds (the part's last
+/// frame included: siblings forking where the lineage's branch forks), or the lineage leaves a parent that has frames
+/// past the fork (the future a resume kept on the parent). end: the timeline's last frame
+inline std::map<uint64_t, std::vector<TTDForkLeave>> TTDForkPoints(const TTDBranchesView& view, uint64_t end)
+{
+    std::map<uint64_t, std::vector<TTDForkLeave>> points;
+    auto onLineage = [&view](uint32_t id) {
+        for (const TTDLineageSpan& span : view.lineage)
+            if (span.branch == id)
+                return true;
+        return false;
+    };
+    for (size_t i = 0; i < view.lineage.size(); ++i)
+    {
+        const uint64_t from = view.lineage[i].from.frame;
+        const uint64_t to = i + 1 < view.lineage.size() ? view.lineage[i + 1].from.frame : end;
+        for (const TTDBranchInfo& b : view.branches)
+            if (!onLineage(b.id) && b.parent == view.lineage[i].branch && b.fork.frame >= from && b.fork.frame <= to)
+                points[b.fork.frame].push_back({b.id, b.meta.name, b.Length()});
+        if (i + 1 < view.lineage.size())
+            if (const TTDBranchInfo* parent = view.Find(view.lineage[i].branch); parent && parent->end.frame > to)
+                points[to].push_back({parent->id, parent->meta.name, parent->end.frame - to});
+    }
+    return points;
+}
 
 struct TTDSessionInfo
 {
@@ -142,7 +197,7 @@ struct TTDSessionInfo
     uint64_t historyLimitFrames = 0;  ///< Oldest frames released beyond this many checkpoints (0 = no limit)
     uint64_t historyLimitBytes  = 0;  ///< ... or beyond this many bytes of checkpoint data (0 = no limit)
     uint64_t evictedCheckpoints = 0;  ///< Checkpoints the history limit released since the session started
-    uint64_t historyBytes       = 0;  ///< What the byte limit measures (TimeTravelManager::HistoryBytes)
+    uint64_t historyBytes       = 0;  ///< What the byte limit measures (TimeTravelController::HistoryBytes)
     uint64_t baselineFramesCaptured = 0;  ///< Live page slots (distinct RAM snapshots in store)
 
     /// @brief Total heap footprint of the recorded session, in bytes.
@@ -268,12 +323,36 @@ struct TTDSessionInfo
 
     /// D8 (the engine's controller): a navigation while recording paused the
     /// recording; state is detached, and resuming at the paused end, or running
-    /// into it, continues the same recording. Always false on v1
+    /// into it, continues the same recording
     bool recordingPaused = false;
+
+    /// A start was asked while the machine stood inside another CPU's run (a General Sound breakpoint): the
+    /// recording begins at the next frame boundary; state stays idle until then
+    bool startPending = false;
 
     /// Why time travel is not available for this instance at all (for example
     /// a member of a ZX-Poly machine); empty when it is available.
     std::string unavailableReason;
+
+    /// How exactly the last position the machine was moved to came back (the
+    /// engine's settings and media check, LastEngineCheck): published with the
+    /// rest so an observer on another thread reads a copy, not the live result
+    TTDRestoreResult lastCheck;
+
+    /// check_seeks (SetCheckSeeks): every seek also checks the replay of the frame it landed in
+    bool checkSeeks = false;
+    uint64_t seekChecks = 0;            ///< seeks whose frame was checked
+    uint64_t seekCheckDivergences = 0;  ///< ... and diverged
+    std::string lastSeekDivergence;     ///< the last diverged check's text; empty when none diverged
+
+    // --- Branches (TTD branches) -------------------------------------------
+
+    /// Null while the session has the trunk alone: nothing about branches shows then (surfaces.md, the rule).
+    /// The active branch's end in it is where its recording stood at the last change of the table; it goes on
+    /// to currentEndFrame
+    std::shared_ptr<const TTDBranchesView> branches;
+    uint32_t activeBranch = kTTDTrunk;   ///< continued at its end; the lineage shown ends with it
+    uint32_t viewedBranch = kTTDTrunk;   ///< the one the current moment belongs to (on the active lineage)
 };
 
 /// @brief String conversion for TTDCoverageKind.
@@ -330,11 +409,45 @@ struct TTDCoverageScanResult
     std::optional<PhysPage> physPage;  ///< 0..255, or kPhysPageNone for the ROM/no-page bucket
     uint64_t scannedFrames = 0;
     uint64_t matchingFrames = 0;
-    std::vector<uint64_t> frames;
-    uint64_t firstMatch = 0;
-    uint64_t lastMatch = 0;
+    std::vector<uint64_t> frames;            ///< Matching frames in scan order (asRanges: empty)
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;   ///< asRanges: runs of consecutive matches [from, to]
+    uint64_t firstMatch = 0;                 ///< Oldest matching frame in the window (valid iff matchingFrames)
+    uint64_t lastMatch = 0;                  ///< Newest matching frame in the window, also when truncated
     uint64_t coveredFrom = 0;                ///< First frame the index covers; the query window is clamped to it
     uint64_t coveredTo = 0;                  ///< Last frame the index covers
+    /// Truncated: the window the next call scans to go on (from/to frame), the list's last item excluded
+    uint64_t nextFrom = 0;
+    uint64_t nextTo = 0;
+    bool truncated = false;
+    bool indexAvailable = false;
+};
+
+/// @brief One block of a rare-coverage query: neighbouring keys of one page touched in the same few frames.
+struct TTDCoverageRareBlock
+{
+    uint32_t pageField = 0;      ///< The keys' page field: RAM page 0..255, kCoverageNoPageField, or a space's page
+    uint16_t offsetFrom = 0;     ///< First key's offset in the 16 KB page
+    uint16_t offsetTo = 0;       ///< Last key's offset in the page
+    uint32_t keys = 0;           ///< Keys in the block (addresses touched, instruction starts for executed)
+    std::vector<uint64_t> frames;  ///< The frames that touched them, oldest first
+    /// Where the page sat in the CPU's address space at the start of the first frame, when exactly one window
+    /// showed it (a RAM page, or the one ROM window for the ROM bucket)
+    std::optional<uint16_t> z80From;
+};
+
+/// @brief Result of a rare-coverage query: the keys of a window touched in at most `maxFrames` frames.
+struct TTDCoverageRareResult
+{
+    TTDCoverageKind kind = TTDCoverageKind::Executed;
+    uint32_t maxFrames = 1;
+    uint64_t scannedFrames = 0;
+    uint64_t unindexedFrames = 0;  ///< Frames of the window the index holds no set for (their keys are not counted)
+    uint64_t distinctKeys = 0;     ///< Keys of the range touched anywhere in the window
+    uint64_t rareKeys = 0;         ///< Of them, touched in at most maxFrames frames
+    uint64_t rareBlocks = 0;       ///< Blocks they form, also when the list is cut
+    std::vector<TTDCoverageRareBlock> blocks;  ///< Rarest first, then by page and offset
+    uint64_t coveredFrom = 0;
+    uint64_t coveredTo = 0;
     bool truncated = false;
     bool indexAvailable = false;
 };
@@ -389,6 +502,11 @@ struct TTDSeekResult
     /// "jump to start" goes. Frame 0 when not set
     TTDTimePoint      earliest      {};
     bool              beforeEarliest = false;
+    /// check_seeks on (SetCheckSeeks): the replay check of the frame the seek landed in. checked is false when the
+    /// frame cannot be checked (no next checkpoint, a barrier inside, a cut at its end)
+    bool              checked       = false;
+    bool              checkDiverged = false;
+    std::string       checkText;    ///< TTDReplayCheckText of the check
 };
 
 struct TTDClipExportOptions
@@ -437,13 +555,122 @@ struct TTDJournalBuildState
     uint64_t total = 0;   ///< frames to build
 };
 
+/// @brief Memory as the CPU saw it at a point of the history (memory-at space cpu).
+struct TTDCpuView
+{
+    struct Window
+    {
+        uint8_t kind = 0xFF;    ///< MemoryBankModeEnum: 0 ROM, 1 RAM, 2 cache; 0xFF unknown
+        uint16_t page = 0xFF;   ///< The ROM, RAM or cache page mapped there
+        std::string name;       ///< The bank's name as the debugger shows it
+    };
+    bool ok = false;
+    std::string error;          ///< !ok: why
+    TTDTimePoint at{};          ///< Where the replay stood when it read
+    std::vector<uint8_t> bytes;
+    Window windows[4];          ///< The four 16 KB windows' mapping
+};
+
+/// @brief How FindAccesses walks: one hit or a list, every access or only the writes that changed the byte.
+struct TTDFindOptions
+{
+    bool all = false;           ///< Up to `limit` hits (false: the newest one)
+    bool changesOnly = false;   ///< Memory writes only: skip a write that stores the byte already there
+    size_t limit = 100;         ///< all: most hits returned
+    uint64_t fromFrame = 0;     ///< Not older than this frame's start
+};
+
+/// @brief One access FindAccesses found.
+struct TTDFoundAccess
+{
+    TTDSearchResult access;
+    uint64_t globalT = 0;
+    bool hasOldValue = false;   ///< changesOnly: the byte the write replaced is known
+    uint8_t oldValue = 0;
+};
+
+/// @brief FindAccesses' answer: the hits newest first, and where the walk ended.
+struct TTDFindResult
+{
+    std::vector<TTDFoundAccess> hits;
+    bool truncated = false;               ///< Stopped at the limit: older hits exist
+    TTDExternalEvent blockingMarker{};    ///< Set iff a barrier ended the walk
+    TTDSearchWindow window{};
+};
+
+/// @brief One probe's answer of a probe-frames query (TimeTravelController::ProbeFrames)
+struct TTDProbeFrames
+{
+    std::string error;                ///< Its condition does not compile on this machine: never armed, no frames
+    std::vector<uint64_t> frames;     ///< The frames it fired in, oldest first, the first `limit`
+    std::vector<uint32_t> hits;       ///< Per listed frame, its hits there (65535 at most)
+    uint64_t frameCount = 0;          ///< Frames it fired in over the searched window, also past the list
+    uint64_t hitCount = 0;            ///< Its hits over the searched window
+};
+
+/// @brief ProbeFrames' answer: per probe the frames it fired in, and the window the replay covered.
+struct TTDProbeFramesResult
+{
+    std::string error;                ///< Set when nothing was searched (no history, no probe, an empty window)
+    uint64_t fromFrame = 0;           ///< The searched window, inclusive: every frame of it replayed, pruned or
+    uint64_t toFrame = 0;             ///< behind a barrier (barrierFrames)
+    uint64_t replayedFrames = 0;
+    uint64_t prunedFrames = 0;        ///< Proven by the coverage index to hold no hit: not replayed
+    std::vector<uint64_t> barrierFrames;  ///< Frames a replay barrier cut: not searched (their hits are unknown)
+    TTDExternalEvent firstBarrier{};  ///< The first of them, when any
+    std::vector<TTDProbeFrames> probes;   ///< In the order asked
+    bool truncated = false;           ///< Every probe's list is full and the window goes on: ask again from nextFromFrame
+    uint64_t nextFromFrame = 0;
+};
+
+/// @brief What ReverseContinue looks for and how far.
+struct TTDReverseContinueQuery
+{
+    std::vector<uint16_t> pcs;            ///< Z80 addresses an instruction starts at (any of them)
+    std::optional<PhysPage> physPage;     ///< Only runs on this page (kPhysPageNone: ROM / no RAM page)
+    uint64_t beforeGlobalT = UINT64_MAX;  ///< At or before this machine time; UINT64_MAX: strictly before now
+    uint64_t fromFrame = 0;               ///< Not older than this frame's start
+    bool all = false;                     ///< Collect up to `limit` hits and leave the machine where it is
+    size_t limit = 100;                   ///< all: most hits returned
+    /// The list as `all`, one hit per PC (its newest); the walk ends once every PC has one
+    bool firstPerPc = false;
+};
+
+/// @brief One instruction start a reverse search found.
+struct TTDReverseHit
+{
+    TTDTimePoint time{};
+    uint64_t globalT = 0;
+    uint16_t pc = 0;
+    PhysPage physPage = kPhysPageNone;   ///< RAM page behind pc, or kPhysPageNone (ROM)
+};
+
 /// @brief Result struct returned by ReverseContinue.
 struct TTDReverseContinueResult
 {
     bool           matched   = false;
     uint16_t       pc        = 0xFFFF;   ///< Valid iff matched.
-    TTDTimePoint   arrivedAt{};          ///< Where the emulator landed.
+    TTDTimePoint   arrivedAt{};          ///< Where the emulator landed (single mode).
     TTDExternalEvent blockingMarker{};   ///< Set iff a barrier halted the scan.
     TTDSearchWindow  window{};           ///< Part of history the scan examined (TD-8).
+    std::vector<TTDReverseHit> hits;     ///< Newest first; single mode: the one hit
+    bool truncated = false;              ///< all: the walk stopped at the limit, older hits may exist
+};
+
+/// @brief What a reverse step over did (TimeTravelController::ReverseStepOver).
+struct TTDReverseStepOverResult
+{
+    bool moved = false;               ///< The machine went back (false: no earlier instruction, nothing changed)
+    /// The instruction stepped back over was the return of a routine (or of an interrupt handler): the machine went
+    /// back past the whole routine, to the instruction at this stack level before it (the CALL / RST, or the one an
+    /// interrupt came after)
+    bool overCall = false;
+    /// overCall wanted but the routine's start is out of reach (older than the history, or behind a barrier): the
+    /// machine stays one instruction back, on the return
+    bool callOutOfReach = false;
+    uint32_t skipped = 0;             ///< overCall: the instructions of the routine passed over
+    uint16_t pc = 0;                  ///< moved: PC where the machine stands now
+    TTDTimePoint arrivedAt{};         ///< moved: the moment it stands at
+    TTDExternalEvent blockingMarker{};   ///< callOutOfReach because of a barrier: the marker
 };
 }  // namespace ttd

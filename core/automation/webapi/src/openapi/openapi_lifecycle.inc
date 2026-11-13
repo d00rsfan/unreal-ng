@@ -121,6 +121,10 @@
         "ZXPOLY-PENTAGON) starts the bare ZX-Poly machine; combine it with `zxpoly` to load a file";
     paths["/api/v1/emulator/start"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
          ["ram_size"]["type"] = "integer";
+    paths["/api/v1/emulator/start"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+         ["ram_size"]["description"] =
+        "Optional RAM size in KB (a size of available_ram_sizes_kb of the model). ZX Next also takes 4096 (MAME's KS3 size): this core "
+        "addresses 2048, the machine is created with 2048 and the reply carries a `note`";
     {
         Json::Value& ramPowerOn = paths["/api/v1/emulator/start"]["post"]["requestBody"]["content"]["application/json"]
                                        ["schema"]["properties"]["ram_power_on"];
@@ -141,7 +145,7 @@
         sprinter["properties"]["isa_slot1"]["type"] = "string";
         sprinter["properties"]["isa_slot2"]["type"] = "string";
         sprinter["description"] =
-            "A SPRINTER's firmware and start options (core SprinterBios): bios = 3.04 | 3.06 | 3.07 or a file in rom/sprinter (or a path), fast_start (skip the PLD loader), accel_int_suspend (an INT acknowledge blocks accelerator operations), isa_slot1 / isa_slot2 (the card in ISA slot 1 / 2: none | ne2000 | zxbus | ram | el3c509b | sprinteresp | modem | dual16552, fixed for the instance; a kind not built yet is refused in /state/isa); default: [ROM] SPRINTER and [SPRINTER] of the model's unreal.ini (shipped: 3.07). 400 on an unknown image";
+            "A SPRINTER's firmware and start options (core SprinterBios): bios = 3.04 | 3.06 | 3.07 or a file in rom/sprinter (or a path), fast_start (skip the PLD loader), accel_int_suspend (an INT acknowledge blocks accelerator operations), isa_slot1 / isa_slot2 (the card in ISA slot 1 / 2: none | ne2000 | zxbus | ram | el3c509b | sprinteresp | modem | dual16552 | wildsound, fixed for the instance; a kind not built yet is refused in /state/isa); default: [ROM] SPRINTER and [SPRINTER] of the model's unreal.ini (shipped: 3.07). 400 on an unknown image";
     }
     paths["/api/v1/emulator/start"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
          ["slots"]["$ref"] = "#/components/schemas/CreateEmulatorRequest/properties/slots";
@@ -206,7 +210,23 @@
     paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][0]["in"] = "path";
     paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][0]["required"] = true;
     paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][0]["schema"]["type"] = "string";
-    paths["/api/v1/emulator/{id}/pause"]["post"]["responses"]["200"]["description"] = "Emulator paused";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["description"] =
+        "Behind a command another client runs (run_frames, a step) the pause is queued: 202 status 'queued', "
+        "waiting_for names the command, the pause applies when it ends (a pause never aborts a command). wait=true "
+        "(30 s) or wait=<ms> (up to 60 s) waits for it: 200 when it applied, 202 status 'busy' when the wait ran out "
+        "(still queued)";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][1]["name"] = "wait";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][1]["in"] = "query";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][1]["required"] = false;
+    paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][1]["schema"]["type"] = "string";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["parameters"][1]["description"] =
+        "true (30 s) or milliseconds (up to 60000): wait for a pause queued behind a running command";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["responses"]["200"]["description"] =
+        "Emulator paused (status 'success'): in force, the machine parked";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["responses"]["202"]["description"] =
+        "status 'queued' or 'busy': behind a running command (waiting_for), applies when it ends";
+    paths["/api/v1/emulator/{id}/pause"]["post"]["responses"]["409"]["description"] =
+        "Refused: another surface holds run control";
 
     paths["/api/v1/emulator/{id}/resume"]["post"]["summary"] = "Resume emulator";
     paths["/api/v1/emulator/{id}/resume"]["post"]["tags"].append("Emulator Control");
@@ -222,7 +242,23 @@
     paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][0]["in"] = "path";
     paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][0]["required"] = true;
     paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][0]["schema"]["type"] = "string";
-    paths["/api/v1/emulator/{id}/reset"]["post"]["responses"]["200"]["description"] = "Emulator reset";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["description"] =
+        "Soft reset by default: the reset button (the ZX Next restarts NextZXOS at once). With {\"hard\": true} "
+        "(or ?hard=true) a power cycle: the core reset plus the board's power-on state (the ZX Next runs its boot "
+        "ROM, the logo and the firmware again). The answer's \"reset\" says \"soft\" or \"hard\".";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][1]["name"] = "hard";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][1]["in"] = "query";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][1]["required"] = false;
+    paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][1]["schema"]["type"] = "boolean";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["parameters"][1]["description"] = "true = hard reset (power cycle)";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["requestBody"]["required"] = false;
+    paths["/api/v1/emulator/{id}/reset"]["post"]["requestBody"]["content"]["application/json"]["schema"]["type"] = "object";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+         ["hard"]["type"] = "boolean";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+         ["hard"]["description"] = "true = hard reset (power cycle); default false (soft, the reset button)";
+    paths["/api/v1/emulator/{id}/reset"]["post"]["responses"]["200"]["description"] =
+        "Emulator reset: {\"status\", \"message\", \"reset\": \"soft\" | \"hard\", \"emulator_id\", \"state\"}";
 
     // POST /api/v1/emulator/{id}/nmi - NMI pulse / Scorpion MNI magic button
     paths["/api/v1/emulator/{id}/nmi"]["post"]["summary"] = "Pulse the NMI line";
@@ -353,7 +389,9 @@
     paths["/api/v1/emulator/{id}/model"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
          ["ram_size"]["type"] = "integer";
     paths["/api/v1/emulator/{id}/model"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
-         ["ram_size"]["description"] = "Optional RAM size in KB";
+         ["ram_size"]["description"] =
+        "Optional RAM size in KB (a size of available_ram_sizes_kb). ZX Next also takes 4096 (MAME's KS3 size): this core addresses 2048, "
+        "the machine is created with 2048 and the reply carries a `note`";
     {
         Json::Value& ramPowerOn = paths["/api/v1/emulator/{id}/model"]["post"]["requestBody"]["content"]
                                        ["application/json"]["schema"]["properties"]["ram_power_on"];
@@ -395,26 +433,3 @@
         "Unknown model / unsupported RAM / not creatable on this build; the current instance is left untouched. "
         "Body carries message, requested_model and available_models_endpoint";
     paths["/api/v1/emulator/{id}/model"]["post"]["responses"]["404"]["description"] = "Emulator not found";
-
-    // POST /api/v1/videowall/singlesync - Videowall single-sync mode
-    paths["/api/v1/videowall/singlesync"]["post"]["summary"] = "Set videowall single-sync mode";
-    paths["/api/v1/videowall/singlesync"]["post"]["description"] =
-        "Enable or disable single-sync mode for the standalone videowall. "
-        "When enabled with an emulator_id, the videowall locks onto that "
-        "instance as its sole sync source; when disabled, the videowall "
-        "returns to cycling through all running instances.";
-    paths["/api/v1/videowall/singlesync"]["post"]["tags"].append("Emulator Control");
-    paths["/api/v1/videowall/singlesync"]["post"]["requestBody"]["required"] = true;
-    paths["/api/v1/videowall/singlesync"]["post"]["requestBody"]["content"]["application/json"]["schema"]["type"] = "object";
-    paths["/api/v1/videowall/singlesync"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
-         ["enable"]["type"] = "boolean";
-    paths["/api/v1/videowall/singlesync"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
-         ["enable"]["description"] = "true = lock videowall to a single emulator";
-    paths["/api/v1/videowall/singlesync"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
-         ["emulator_id"]["type"] = "string";
-    paths["/api/v1/videowall/singlesync"]["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
-         ["emulator_id"]["description"] = "Emulator instance to sync to (empty when disabling)";
-    paths["/api/v1/videowall/singlesync"]["post"]["responses"]["200"]["description"] = "Mode applied (success=true)";
-    paths["/api/v1/videowall/singlesync"]["post"]["responses"]["400"]["description"] = "Invalid JSON body";
-    paths["/api/v1/videowall/singlesync"]["post"]["responses"]["500"]["description"] =
-        "Could not apply the requested mode (success=false)";

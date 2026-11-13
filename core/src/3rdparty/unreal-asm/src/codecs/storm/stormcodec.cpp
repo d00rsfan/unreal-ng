@@ -27,6 +27,7 @@ constexpr std::array<std::string_view, 131> kTokens = {
     "ELSE", "EIF", "ENDM",
 };
 constexpr uint8_t kFirstCode = 0x09;
+constexpr size_t kTextRoom = 16369;   // STORM 1.3's text in RAM page 6 from #C00B: a longer file is "File too big" (measured)
 constexpr uint8_t kExtended = 0x49;   // #49 n: INCL .. ENDM (code n + #80)
 constexpr uint8_t kComment = 0x2F;
 constexpr uint8_t kColumnZero = 0x06;
@@ -259,7 +260,7 @@ struct Decoder
         else if (c > 0x77 && c < 0x7C)
             o += "JR";
         else if (c >= 0x7C && c < 0x80)
-            o += "CALL";
+            o += "JP";   // PO PE P M imply JP: STORM 1.3's binary has JP where its source shows these (reference decoders say CALL)
         else if (c >= 0x80 && c < kString)
             o += (c & 0x20) ? "LD" : "JR";
         else if (c == kString)
@@ -926,7 +927,7 @@ struct Encoder
             else if (command == "JR")
                 implicit = (first >= 0x78 && first < 0x7B) || (first >= 0xC0 && first < kString) || (first >= 0x80 && first < 0xC0 && !(first & 0x20)) ||
                            first > kString;
-            else if (command == "CALL")
+            else if (command == "JP")
                 implicit = first >= 0x7C && first < 0x80;
         }
         if (!implicit)
@@ -1089,6 +1090,10 @@ int StormCodec::Detect(std::span<const uint8_t> bytes, const CatalogHints& hints
     }
     if (catalog)
         return 95;
+    // A catalog entry with another start is no STORM text (every one found starts at #C00B): zeros and other data
+    // also walk back as STORM lines (a screen at #4000 reads as empty lines and CCF)
+    if (hints.type != 0)
+        return 20;
     return lines.size() >= 3 ? 70 : 40;
 }
 
@@ -1156,6 +1161,8 @@ EncodeResult StormCodec::Encode(const SourceDocument& document, const EncodeOpti
         result.bytes.insert(result.bytes.end(), body.begin(), body.end());
         result.bytes.push_back(static_cast<uint8_t>(body.size()));
     }
+    if (result.bytes.size() > kTextRoom)
+        result.diagnostics.push_back({Severity::Warning, 0, 0, "the source is longer than STORM's editor holds (" + std::to_string(kTextRoom) + " bytes)"});
     result.ok = !HasErrors(result.diagnostics);
     return result;
 }

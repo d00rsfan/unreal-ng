@@ -78,6 +78,29 @@ TEST_F(PortDecoder_TSConf_Test, RST2_WarmResetKeepsTheNotResetRegisters)
     EXPECT_EQ(ts.sfile[4], 0x0000);
 }
 
+/// A power cycle reloads the FPGA and leaves a runnable reset map, including
+/// the frame interrupt that wakes an IM 2 program from HALT.
+TEST_F(PortDecoder_TSConf_Test, RST3_PowerCycleRestoresResetMapAndFrameInterrupt)
+{
+    Reg(TsConfReg::Page1, 0x21);
+    Reg(TsConfReg::Page2, 0x22);
+    Reg(TsConfReg::Page3, 0x23);
+    Reg(TsConfReg::IntMask, 0x00);
+    Reg(TsConfReg::SysConfig, 0x02);
+
+    _decoder->PowerCycle();
+
+    EXPECT_FALSE(IsRam(0x0000));
+    EXPECT_EQ(Tag(0x0000), 0x00);
+    EXPECT_EQ(Tag(0x4000), 0x05);
+    EXPECT_EQ(Tag(0x8000), 0x02);
+    EXPECT_EQ(Tag(0xC000), 0x00);
+    EXPECT_EQ(_decoder->GetState().regs[TsConfReg::MemConfig], TsConfMemConfig::Reset);
+    EXPECT_EQ(_decoder->GetState().regs[TsConfReg::IntMask], 0x01);
+    EXPECT_EQ(_context->emulatorState.hw_turbo_ratio, 1);
+    EXPECT_TRUE(_decoder->GetInterrupts().IsIntAsserted(4));
+}
+
 /// REG-1 (hs §3.2): only 0x00, 0x12, 0x13, 0x27 are readable
 TEST_F(PortDecoder_TSConf_Test, REG1_OnlyFourRegistersAreReadable)
 {

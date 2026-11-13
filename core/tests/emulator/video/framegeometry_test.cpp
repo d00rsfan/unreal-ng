@@ -92,7 +92,6 @@ protected:
         for (uint16_t a = 0x5800; a < 0x5B00; a++)
             z80->DirectWrite(a, static_cast<uint8_t>(kPaperColor << 3));
         _context->pPortDecoder->DecodePortOut(0xFE, static_cast<uint8_t>(kBorderColor), 0);
-        _screen->SetPresentDelayFrames(0);
         _emulator->RunNFrames(3);
     }
 
@@ -136,7 +135,9 @@ TEST_F(FrameGeometry_Test, WorkingWindowIsWherePaperIsDrawn)
             _screen->UpdateFeatureCache();
             ASSERT_EQ(_screen->IsScreenHQEnabled(), perTState);
             if (c.overscan)
+            {
                 ASSERT_TRUE(_emulator->SetOverscanMode(true));
+            }
             PaintAndFreeze();
 
             FrameSnapshot snap;
@@ -230,7 +231,9 @@ TEST_F(FrameGeometry_Test, SnapshotStaysCoherentAcrossAModeSwitch)
     // and a stale 352x288 one is never served with a 384x304 geometry
     FrameSnapshot between;
     if (_screen->SnapshotPresented(between))
+    {
         EXPECT_EQ(between.pixels.size(), static_cast<size_t>(between.geometry.stride) * between.geometry.height);
+    }
     PaintAndFreeze();
     FrameSnapshot after;
     ASSERT_TRUE(_screen->SnapshotPresented(after));

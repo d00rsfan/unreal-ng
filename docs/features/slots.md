@@ -21,7 +21,7 @@ slots with it (the NeoGS brings `sd.ngs`).
 |---|---|
 | **Bus** | A connector family of the machine: `zxbus` (ZX-bus / NemoBus), `edge` (the Sinclair edge connector), `iobus` (ATM Turbo), `profi-bus`, `isa` (Sprinter), `cpu-socket` (a card on an adapter in the Z80 socket), and `ay-socket` (the AY chip's socket) |
 | **Slot** | One place on a bus: `zxbus.1`, `zxbus.2`, `edge.1`, `ay-socket`. `zxbus.next` means "the next free one" |
-| **Card** | What sits in a slot: `gs`, `gs-lw`, `neogs`, `tsfm`, `ts`, `ay`, `none` (an empty AY socket), `moonsound`, `covox-fb`, `soundrive`, `multisound`, `zxnetusb`, `zx-wifi` |
+| **Card** | What sits in a slot: `gs`, `gs-lw`, `neogs`, `tsfm`, `ts`, `ay`, `none` (an empty AY socket), `moonsound`, `covox-fb`, `soundrive`, `multisound`, `zxnetusb`, `zx-wifi`; on the Sinclair edge `kempston`, `fuller-box`, `amx-mouse` |
 | **Built-in device** | Something the board itself has: the AY, the Beta 128 disk interface, a Covox. A card can **shadow** it (the card answers its ports, the built-in stays silent) or switch it off |
 | **Function** | The job a card does: `gs`, `ay-socket`, `opl4`, `covox-fb`, `soundrive`, `midi`, ... Two cards with the same job do not fit together (rule D1) |
 | **Fit** | How a card fits the bus: `real` (as on real hardware), `adapter` (behind a bus adapter), `unrealistic` (it works in the emulator although the bus lacks a signal the card needs) |
@@ -45,14 +45,21 @@ slots:
   zxbus.2 = moonsound [jp1=open]  fit real, active
   zxbus.3 = soundrive [mode=both]  fit real, active
 built-in devices:
-  ay (YM2149 / AY-3-8910): replaced by tsfm
-  beta128 (Beta-128 (VG93)): active
-  kempston-joystick (Kempston joystick): active
+  ay (YM2149 / AY-3-8910): replaced by tsfm  ports #E002/#E000 #E002/#A000
+  beta128 (Beta-128 (VG93)): active  ports #1F #3F #5F #7F #FF
+  kempston-joystick (Kempston joystick): active  ports #21/#01
 ```
+
+The report is the machine's device registry: every card and every built-in device comes with its `functions` and
+its `ports`, the claims it answers (`range` as text, `mask` and `match` as numbers: port p is the device's when
+`(p & mask) == match`, `port` the documented port when the claim names one, `direction`, `iorqge`, `gate`). A
+debugger attributes a port access to the device by these claims.
 
 `slots catalog` lists every card with its options and how it would fit this machine now: where the planner would put
 it, the fit, and `fits`, `needs-replace` (it would remove a card; the list says which) or `refused` (the machine
-cannot take it at all, with the reason).
+cannot take it at all, with the reason). `slots catalog <slot>` plans every card into that one slot instead (a card
+of another bus is refused there, the card in it now is `inSlot`): what a picker for one slot offers. Every card and
+report entry has `label` too, its name as plain text (the names are markdown: "Covox `#FB`").
 
 ## Changing a card
 
@@ -92,11 +99,39 @@ lists them all.
 instance with a new id (the selection and the Qt window follow it), the machine state is lost, the media follow into
 the slots with the same id on the new machine with their unsaved writes. A removed card's medium with unsaved writes
 (the NeoGS SD card `sd.ngs`) refuses the change until the request says what to do with them: `--media save` or
-`--media discard`. The reply names the new id (`restart.emulatorId`) and where the media went.
+`--media discard`. The reply names the new id (`restart.emulatorId`) and where the media went. The new machine
+has the run state of the old one: it runs when the old one ran, it is started and paused when the old one was paused
+(`restart.wasRunning`, `restart.wasPaused`, `restart.started`), so resume, typing and `run_frames` work on it at once.
 
-**Refused** without changing anything: while a TTD recording runs (the recording's devices are fixed); when the
-machine cannot take the card (a fixed built-in uses its ports, the bus lacks a signal and no adapter connects it);
-when the new set would not create a machine (two cards in conflict).
+**Refused** without changing anything: when the machine cannot take the card (a fixed built-in uses its ports, the
+bus lacks a signal and no adapter connects it); when the new set would not create a machine (two cards in conflict).
+A TTD recording does not stop the change: changing the machine ends the recording (its history stays loadable when it
+was a black box) and the restarted machine records again only by its own settings.
+
+**What a restart keeps besides the cards:** the network settings and the firmware choices made through them - the
+ZX-Evo AVR (`avr_firmware`, `[EVO] Avr=`) and the ATM Turbo 2+ keyboard controller (`kbc_firmware`, `[ATM] Kbc=`) -
+as the machine runs with them.
+
+## The Kempston joystick interface
+
+The 48K, 128K, +2, +2A and +3 have no Kempston decode of their own: on the real machines a Kempston interface plugs
+into the edge connector. Here it is the card `kempston` on the `edge` bus (`slots plug edge.next kempston`, WebAPI
+`POST /emulator/{id}/slots/edge.next/plug {"card":"kempston"}`, MCP `emulator_manage` `slots_plug`); after the restart
+the guest reads `IN #1F` and every joystick input path reaches it (the `kempston` connector of the controllers, the
+keypad keys, `joystick` / `joystick_input` / `POST /joystick` on every surface, the TTD journal). The shipped
+configurations do not fit it: the machines came without one.
+
+| Option | Values | Meaning |
+|---|---|---|
+| `decode` | `a7a6a5` (default), `a5` | issue 4 (74LS138 on A7-A5 = 000: every port `#00`-`#1F`), or the early boards' A5 = 0 only |
+
+D5-D7 read 0 (the issue-4 board's sixth driver and diodes). Behind a Beta 128 the interface sees no I/O while the
+TR-DOS ROM is paged in (the Beta 128 passes /IORQ on only outside DOS): `#1F` is then the WD1793's register, as on the
+Pentagon. The ATM Turbo 2 / 2+ have no edge connector: the card fits there only `unrealistic` (`--replace`). Machines
+with a Kempston decode on the board (Pentagon, Scorpion, ZX-Evo, TS-Conf, Profi, Sprinter, Next) refuse it. Without
+the card a joystick input call is accepted with the warning `no Kempston joystick interface on this machine`, followed
+by the plug command for this machine. The Kempston mouse needs no card: its standard decode is on every model
+(`[INPUT] Mouse=`).
 
 ## The General Sound personality
 
@@ -185,11 +220,11 @@ A configuration with `[SLOTS]` ignores the old keys.
 
 | Surface | Read | Change |
 |---|---|---|
-| CLI | `slots`, `slots catalog`, `slots matrix [table]` | `slots plug / remove / set / gs` with `--replace`, `--dry-run`, `--media`, `--json` ([command-interface.md section 14](../emulator/design/control-interfaces/command-interface.md#14-zx-bus-slots)) |
-| WebAPI | `GET /emulator/{id}/slots`, `/slots/catalog`, `/slots/matrix` | `POST /slots/{slot}/plug`, `/remove`, `PUT /slots/{slot}/options`; refusal = 409 with the plan ([webapi-interface.md](../emulator/design/control-interfaces/webapi-interface.md#zx-bus-slots), OpenAPI tag `Slots`) |
+| CLI | `slots`, `slots catalog [slot]`, `slots matrix [table]` | `slots plug / remove / set / gs` with `--replace`, `--dry-run`, `--media`, `--json` ([command-interface.md section 14](../emulator/design/control-interfaces/command-interface.md#14-zx-bus-slots)) |
+| WebAPI | `GET /emulator/{id}/slots`, `/slots/catalog[?slot=]`, `/slots/matrix` | `POST /slots/{slot}/plug`, `/remove`, `PUT /slots/{slot}/options`; refusal = 409 with the plan ([webapi-interface.md](../emulator/design/control-interfaces/webapi-interface.md#zx-bus-slots), OpenAPI tag `Slots`) |
 | MCP | `inspect_state` aspect `slots`; `emulator_manage` `slots_catalog`, `slots_matrix` | `emulator_manage` `slots_plug`, `slots_remove`, `slots_set` ([mcp/README.md](mcp/README.md)) |
-| Lua | `slots_state()`, `slots_catalog()`, `slots_matrix()` | `slots_plug()`, `slots_remove()`, `slots_set()`, `slots_gs()` ([lua-interface.md](../emulator/design/control-interfaces/lua-interface.md#zx-bus-slots)) |
-| Python | `unreal.slots_state()`, `slots_catalog()`, `slots_matrix()` | `unreal.slots_plug()`, `slots_remove()`, `slots_set()`, `slots_gs()` ([python-interface.md](../emulator/design/control-interfaces/python-interface.md#zx-bus-slots)) |
+| Lua | `slots_state()`, `slots_catalog([slot])`, `slots_matrix()` | `slots_plug()`, `slots_remove()`, `slots_set()`, `slots_gs()` ([lua-interface.md](../emulator/design/control-interfaces/lua-interface.md#zx-bus-slots)) |
+| Python | `unreal.slots_state()`, `slots_catalog(slot=)`, `slots_matrix()` | `unreal.slots_plug()`, `slots_remove()`, `slots_set()`, `slots_gs()` ([python-interface.md](../emulator/design/control-interfaces/python-interface.md#zx-bus-slots)) |
 | Qt | Machine > Slots | the same window: plug, remove, options, the plan preview, Undo |
 | Network settings | `network`, `/state/network`, `network_state()` | `card=` of `network set`, `POST /network/config`, MCP `network_configure`, Lua / Python `network_configure`, the Network window's card boxes: a slot change (see [The network cards](#the-network-cards)) |
 

@@ -1,5 +1,9 @@
 #include "mainwindow.h"
 #include "crashhandler/crashhandler.h"
+#include "headless/headlessscriptrunner.h"
+#ifdef __linux__
+#include "platform/linux/steamdeckgamemode.h"
+#endif
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -7,12 +11,18 @@
 #include <QFontDatabase>
 #include <QIcon>
 
+#include <memory>
+#include <string_view>
+
 #include "common/macosplatform.h"
 #include <QDebug>
 #include <QDir>
 #include <common/filehelper.h>
 #include <common/threadhelper.h>
 #include <emulator/startupcleanup.h>
+#include "debugger/ttd/ttdrecordingfolders.h"
+#include "emulator/emulator.h"
+#include "emulator/coordinator/machineop.h"
 
 int fontID = -1;
 
@@ -96,6 +106,7 @@ void unregisterFonts()
 int main(int argc, char *argv[])
 {
     ThreadHelper::setThreadName("qt-main");
+    coordinator::SetThreadSource(coordinator::OpSource::Qt);   // the operation log names the UI's operations
     // Windows: no EcoQoS when another window has the foreground (the sound stuttered)
     ThreadHelper::disableProcessPowerThrottling();
 
@@ -105,10 +116,24 @@ int main(int argc, char *argv[])
 #ifdef Q_OS_MACOS
     MacOSPlatform::disableAutomaticFullScreenMenuItem();  // Before any menu bar exists
 #endif
+    // --headless: no windows (the offscreen platform), chosen before the application exists. An explicit
+    // QT_QPA_PLATFORM wins
+    bool headless = false;
+    for (int i = 1; i < argc; i++)
+        headless |= std::string_view(argv[i]) == "--headless";
+    if (headless && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
+        qputenv("QT_QPA_PLATFORM", "offscreen");
     QApplication app(argc, argv);
+#ifdef Q_OS_MACOS
+    // No windows to show (agents' automation instances): not a Dock app that looks hung
+    if (QGuiApplication::platformName() == QLatin1String("offscreen") || QGuiApplication::platformName() == QLatin1String("minimal"))
+        MacOSPlatform::runAsBackgroundProcess();
+#endif
 
     // Housekeeping (crashed TTD recordings, ...) in the background: start-up never waits for it
     StartStartupCleanup();
+    // The engine writes every recording as it records, a folder per session in ~/.unreal-ng/ttd (Phase 5, 3c)
+    Emulator::SetDefaultTtdRecordingRoot(ttd::RecordingsRoot());
 
     // Load non-system fonts before any GUI rendered
     registerFonts(app);
@@ -123,11 +148,40 @@ int main(int argc, char *argv[])
                                          QStringLiteral("Model of the four ZX-Poly modules (e.g. PENTAGON, 128k)"),
                                          QStringLiteral("model"));
     parser.addOption(zxpolyModelOption);
+    // The headless test runner (gs-debugger requirements X13)
+    QCommandLineOption headlessOption(QStringLiteral("headless"),
+                                      QStringLiteral("No windows (the offscreen platform); the emulator muted"));
+    QCommandLineOption scriptOption(QStringLiteral("script"),
+                                    QStringLiteral("Lua script to run once the emulator is up (its print on stdout)"),
+                                    QStringLiteral("file"));
+    QCommandLineOption exitOnScriptOption(QStringLiteral("exit-on-script"),
+                                          QStringLiteral("Quit when the script ends, with its exit code (the "
+                                                         "chunk's result: an integer, true 0, false 1; an error 1)"));
+    parser.addOption(headlessOption);
+    parser.addOption(scriptOption);
+    parser.addOption(exitOnScriptOption);
+    // The GUI control plane's TCP listener (docs/inprogress/2026-11-07-gui-control-plane §4.8); the local socket is
+    // always on
+    QCommandLineOption guiControlPortOption(QStringLiteral("gui-control-port"),
+                                            QStringLiteral("Serve the GUI control plane on this TCP port too (0: any "
+                                                           "free port), without authentication"),
+                                            QStringLiteral("port"));
+    QCommandLineOption guiControlBindOption(QStringLiteral("gui-control-bind"),
+                                            QStringLiteral("The address of that TCP port (default: all interfaces)"),
+                                            QStringLiteral("address"));
+    parser.addOption(guiControlPortOption);
+    parser.addOption(guiControlBindOption);
     parser.process(app);
 
     // Instantiate main application window
     MainWindow window;
     window.show();
+    {
+        bool portOk = false;
+        const int guiControlPort = parser.value(guiControlPortOption).toInt(&portOk);
+        window.startGuiControl(portOk && guiControlPort >= 0 && guiControlPort <= 65535 ? guiControlPort : -1,
+                               parser.value(guiControlBindOption));
+    }
 
     const QStringList files = parser.positionalArguments();
     if (!files.isEmpty())
@@ -137,8 +191,30 @@ int main(int argc, char *argv[])
         QTimer::singleShot(0, &window, [&window, file, zxpolyModel]() { window.openFromCommandLine(file, zxpolyModel); });
     }
 
+    // Steam Deck Game Mode: full screen without chrome, a Pentagon 128K running (platform/linux/steamdeckgamemode.h)
+#ifdef __linux__
+    if (!headless)
+        steamdeck::ApplyGameMode(window, files.isEmpty() && !parser.isSet(scriptOption));
+#endif
+
+    std::unique_ptr<HeadlessScriptRunner> scriptRunner;
+    if (parser.isSet(scriptOption))
+    {
+        // A file to open brings its machine; without one the runner starts the Machine menu's
+        std::function<void()> start;
+        if (files.isEmpty())
+            start = [&window]() { window.startEmulatorIfNone(); };
+        scriptRunner = std::make_unique<HeadlessScriptRunner>(parser.value(scriptOption),
+                                                              parser.isSet(exitOnScriptOption), headless, start,
+                                                              [&window]() { window.closeUnattended(); });
+        scriptRunner->Start();
+    }
+
     // Start application main loop
     int result =  app.exec();
+    if (scriptRunner && scriptRunner->Finished() && parser.isSet(exitOnScriptOption))
+        result = scriptRunner->ExitCode();
+    scriptRunner.reset();
     StopStartupCleanup();
 
     // Unload non-system fonts

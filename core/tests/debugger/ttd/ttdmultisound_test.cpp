@@ -24,9 +24,10 @@
 #include "_helpers/testpathhelper.h"
 #include "base/featuremanager.h"
 #include "debugger/ttd/engine/ttdconfigfingerprint.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "debugger/ttd/ttdcheckpoint.h"
 #include "debugger/ttd/ttdconfigcapture.h"
+#include "_helpers/ttdrecordedstate.h"
 #include "debugger/ttd/ttdmachineperipherals.h"
 #include "debugger/ttd/ttdperipheralregistry.h"
 #include "emulator/cpu/core.h"
@@ -104,7 +105,7 @@ public:
     bool Ok() const { return _ok; }
     Emulator& Machine() { return *_emulator; }
     EmulatorContext* Context() const { return _emulator->GetContext(); }
-    ttd::TimeTravelManager* Ttd() const { return _emulator->GetContext()->pTimeTravelManager; }
+    ttd::TimeTravelController* Ttd() const { return _emulator->GetContext()->pTimeTravelController; }
     MultiSoundSlotCard* Card(const std::string& slot = "zxbus.1") const
     {
         SlotManager* slots = Context()->pSlotManager;
@@ -365,7 +366,7 @@ TEST(TtdMultiSound_Test, DevicesRegisteredBySlot)
                                Expected{ PeripheralId::Sam2695, "zxbus.1.multisound.sam2695" },
                                Expected{ PeripheralId::MultiSoundGs, "zxbus.1.multisound.gs" } })
     {
-        EXPECT_TRUE(registry.IsRegistered(e.id)) << e.instance;
+        EXPECT_NE(registry.FindLegacy(e.id), nullptr) << e.instance;
         const auto entry = std::find_if(entries.begin(), entries.end(),
                                         [&](const ttd::TTDDeviceEntry& x) { return x.descriptor.legacyId == e.id; });
         ASSERT_NE(entry, entries.end()) << e.instance;
@@ -454,6 +455,56 @@ TEST(TtdMultiSound_Test, RoundTripMidTune)
                 EXPECT_EQ(replayed[i], original[static_cast<size_t>(f)][i]) << "frame " << f << " row " << i;
         }
         EXPECT_EQ(CardStateHash(*card), endHash);
+    }
+    std::remove(bank.c_str());
+}
+
+/// The mixer's sample count per frame (SoundManager's sample phase) is the authority the card renders its rows to,
+/// and the card's YM2203 decimator phase is TTD state: after a seek the mixer must count the frames as it did when
+/// they were recorded. The board AY's device restores that phase on a Pentagon; on a ZX-Evo the card takes the
+/// YM2149 out of its socket, so the card's own blob carries it. Found by the corpus fixture multisound-zxevo
+/// (2026-10-06): replayed from a checkpoint, the card's decimator phase left the recording at the first frame.
+/// ~60 ms: one ZX-Evo, eight frames recorded and five replayed, the card's GS in every checkpoint
+TEST(TtdMultiSound_Test, SeekRestoresTheMixerSampleCountWithoutABoardAy)
+{
+    const std::string bank = WriteBank("ttdms-bank.sf2", 0);
+    StagedMachine m("atm3", "zxbus.1 = multisound", "[MIDI]\nBank = " + bank);
+    ASSERT_TRUE(m.Ok());
+    MultiSoundSlotCard* card = m.Card();
+    ASSERT_NE(card, nullptr);
+    ASSERT_EQ(m.Context()->pSoundManager->getTurboSound(), nullptr) << "no board AY device to restore the phase";
+
+    Park(m);
+    m.Machine().RunNFrames(4);
+    const std::vector<uint8_t> midi = MidiLineBits({ 0x90, 0x3C, 0x64 });
+    Load(m, TuneProgram(static_cast<uint8_t>(midi.size())), midi);
+    m.Machine().RunNFrames(2);
+
+    constexpr int kFrames = 8;
+    constexpr int kFrom = 3;
+    std::vector<uint64_t> phase;     // the mixer's sample phase at each frame's start
+    std::vector<size_t> samples;     // the frame's sample count
+    std::vector<uint64_t> state;     // the card's state at its end
+    ASSERT_TRUE(m.Ttd()->StartRecording());
+    const uint64_t start = m.Ttd()->GetCheckpoint(0)->time.frame;
+    for (int f = 0; f < kFrames; f++)
+    {
+        phase.push_back(m.Context()->pSoundManager->samplePhase());
+        m.Machine().RunNFrames(1);
+        samples.push_back(card->Card().RowFrames());
+        state.push_back(CardStateHash(*card));
+    }
+    m.Ttd()->StopRecording();
+    // The live session goes on: the mixer's phase moves away from the recording's
+    m.Machine().RunNFrames(1);
+
+    ASSERT_TRUE(m.Ttd()->SeekTo({ start + kFrom, 0 }));
+    EXPECT_EQ(m.Context()->pSoundManager->samplePhase(), phase[kFrom]) << "the mixer's sample phase of the checkpoint";
+    for (int f = kFrom; f < kFrames; f++)
+    {
+        m.Machine().RunNFrames(1);
+        EXPECT_EQ(card->Card().RowFrames(), samples[static_cast<size_t>(f)]) << "frame " << f;
+        EXPECT_EQ(CardStateHash(*card), state[static_cast<size_t>(f)]) << "frame " << f;
     }
     std::remove(bank.c_str());
 }
@@ -606,7 +657,7 @@ TEST(TtdMultiSound_Test, RecordingRefusedWhenACardDeviceIsMissing)
     auto devices = [](std::initializer_list<PeripheralId> ids) {
         SlotManager::TtdDeviceSet set;
         for (PeripheralId id : ids)
-            set.ids.push_back(static_cast<uint8_t>(id));
+            set.devices.push_back({static_cast<ttd::TTDDeviceType>(id), {}});
         return set;
     };
     std::string why;
@@ -618,42 +669,60 @@ TEST(TtdMultiSound_Test, RecordingRefusedWhenACardDeviceIsMissing)
 
     why.clear();
     EXPECT_FALSE(SlotManager::TtdDevicesMatchPlan(plan, devices({}), why));
-    EXPECT_NE(why.find("zxbus.1: multisound did not register its device 58"), std::string::npos) << why;
+    EXPECT_NE(why.find("zxbus.1: multisound did not register its device of type 58"), std::string::npos) << why;
     EXPECT_NE(why.find("zxbus.1: the plan fits multisound, the device is none"), std::string::npos) << why;
 
     why.clear();
     EXPECT_FALSE(SlotManager::TtdDevicesMatchPlan(
         plan, devices({ PeripheralId::MultiSound, PeripheralId::Saa1099, PeripheralId::Sam2695 }), why));
-    EXPECT_NE(why.find("zxbus.1: multisound did not register its device 60"), std::string::npos) << why;
+    EXPECT_NE(why.find("zxbus.1: multisound did not register its device of type 60"), std::string::npos) << why;
 }
 
-/// Two instances of one module cannot both be recorded (a v1 checkpoint keeps one blob per id), so the planner
-/// refuses them up front: a second MultiSound's SAA, a GS card next to the card's GS. With the card's GS switched off
-/// by its DIP a GS card may stay: the card's GS records under its own id, the GS card under its own. Pure plans, then
-/// one Pentagon with both GS (~30 ms)
-TEST(TtdMultiSound_Test, TwoInstancesOfOneModuleRefusedByThePlanner)
+/// Two cards of one kind are two sets of devices: the planner hands out all four of the card's devices under the
+/// same four types, and the slot names each card's instances ("zxbus.1.multisound.saa1099", "zxbus.2..."), so the
+/// engine records both cards side by side (D23), which the legacy ids could not tell apart. One
+/// Pentagon with both cards, 3 frames (~40 ms)
+TEST(TtdMultiSound_Test, TwoCardsWithDisjointDipsAreRecordedSideBySide)
 {
-    SlotManager::Result plan = PlanOf(MM_PENTAGON, { { "zxbus.1", "multisound" }, { "zxbus.1.dip", "saa" },
-                                                     { "zxbus.2", "multisound" }, { "zxbus.2.dip", "saa" } });
-    ASSERT_EQ(plan.conflicts.size(), 1u) << plan.Refusal();
-    EXPECT_NE(plan.Refusal().find("`saa`"), std::string::npos) << plan.Refusal();
-
-    plan = PlanOf(MM_PENTAGON, { { "zxbus.1", "multisound" }, { "zxbus.2", "gs" } });
-    ASSERT_EQ(plan.conflicts.size(), 1u) << plan.Refusal();
-    EXPECT_NE(plan.Refusal().find("`gs`"), std::string::npos) << plan.Refusal();
-
-    plan = PlanOf(MM_PENTAGON, { { "zxbus.1", "multisound" }, { "zxbus.1.dip", "ym,saa,sd" }, { "zxbus.2", "gs" } });
+    const SlotManager::Result plan = PlanOf(MM_PENTAGON, { { "zxbus.1", "multisound" }, { "zxbus.1.dip", "ym" },
+                                                           { "zxbus.2", "multisound" }, { "zxbus.2.dip", "saa" } });
     EXPECT_TRUE(plan.conflicts.empty()) << plan.Refusal();
 
-    StagedMachine m("pentagon128k", "zxbus.1 = multisound\nzxbus.1.dip = ym,saa,sd\nzxbus.2 = gs");
+    StagedMachine m("pentagon128k", "zxbus.1 = multisound\nzxbus.1.dip = ym\nzxbus.2 = multisound\nzxbus.2.dip = saa");
     ASSERT_TRUE(m.Ok()) << m.Machine().GetInitError();
-    ASSERT_NE(m.Card(), nullptr);
-    ASSERT_NE(m.Context()->pSoundManager->getGeneralSound(), nullptr);
+    ASSERT_NE(m.Card("zxbus.1"), nullptr);
+    ASSERT_NE(m.Card("zxbus.2"), nullptr);
     ttd::TTDPeripheralRegistry registry;
     std::vector<std::unique_ptr<ttd::TTDSerializable>> owned;
     std::string error;
     ASSERT_TRUE(ttd::RegisterMachinePeripherals(m.Context(), registry, owned, &error)) << error;
-    EXPECT_TRUE(registry.IsRegistered(PeripheralId::GeneralSound));
-    EXPECT_TRUE(registry.IsRegistered(PeripheralId::MultiSoundGs));
+    for (const char* slot : { "zxbus.1", "zxbus.2" })
+        for (const auto& [type, suffix] : { std::pair{ ttd::TTDDeviceType::MultiSound, "" },
+                                            std::pair{ ttd::TTDDeviceType::Saa1099, ".saa1099" },
+                                            std::pair{ ttd::TTDDeviceType::Sam2695, ".sam2695" },
+                                            std::pair{ ttd::TTDDeviceType::MultiSoundGs, ".gs" } })
+            EXPECT_NE(registry.Find({ type, std::string(slot) + ".multisound" + suffix }), nullptr) << slot << suffix;
     EXPECT_TRUE(registry.CheckDeviceTable(error)) << error;
+
+    ASSERT_TRUE(m.Ttd()->StartRecording()) << "the engine keeps both cards' state: " << m.Ttd()->LastStartError();
+    m.Machine().RunNFrames(3);
+    m.Ttd()->StopRecording();
+    m.Machine().RunNFrames(2);   // the live cards move on
+
+    // A seek back restores each card from its own state
+    ASSERT_TRUE(m.Ttd()->SeekTo({ m.Ttd()->GetCheckpoint(1)->time.frame, 0 }));
+    for (const char* slot : { "zxbus.1", "zxbus.2" })
+        for (const auto& [type, suffix] : { std::pair{ ttd::TTDDeviceType::MultiSound, "" },
+                                            std::pair{ ttd::TTDDeviceType::Saa1099, ".saa1099" },
+                                            std::pair{ ttd::TTDDeviceType::Sam2695, ".sam2695" } })
+        {
+            const ttd::TTDDeviceKey key{ type, std::string(slot) + ".multisound" + suffix };
+            const std::vector<uint8_t> recorded = ttdtest::RecordedDeviceState(*m.Ttd(), 1, key);
+            ttd::TTDSerializable* device = m.Ttd()->GetPeripheralRegistry().Find(key);
+            ASSERT_NE(device, nullptr) << key.instance;
+            std::vector<uint8_t> live;
+            device->TTDSaveStateTo(live);
+            EXPECT_FALSE(recorded.empty()) << key.instance;
+            EXPECT_EQ(live, recorded) << key.instance;
+        }
 }

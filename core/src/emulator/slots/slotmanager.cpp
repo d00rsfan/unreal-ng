@@ -7,11 +7,13 @@
 #include <utility>
 
 #include "common/modulelogger.h"
+#include "debugger/debugmanager.h"
 #include "emulator/cpu/core.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/config.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/io/network/networkspec.h"
+#include "emulator/io/sprinter/isa/isaslotconfig.h"
 #include "emulator/media/mediamanager.h"
 #include "emulator/platform.h"
 #include "emulator/ports/portdecoder.h"
@@ -26,6 +28,7 @@ namespace
 
 constexpr const char* kAySocket = "ay-socket";
 constexpr const char* kBoardCovox = "covox";
+constexpr const char* kPrinterCovox = "covox-dd";   // the Scorpion's printer-port Covox ([SOUND] CovoxDD)
 
 const SlotPlanner& Planner()
 {
@@ -42,6 +45,7 @@ struct CardFields
     GSTypeKind gs = GSTypeKind::NONE;
     bool moonSound = false;
     bool covoxFb = false;
+    bool covoxDd = false;       ///< the Scorpion printer Covox (built-in covox-dd)
     bool sd = false;
     uint8_t sdMode = 0;         ///< the SounDrive card's port set: 0 both, 1, 2
     uint8_t zxBusNetwork = 0;   ///< networkspec::kCardZxNetUsb | kCardZxWifi
@@ -53,6 +57,7 @@ struct CardFields
         fields.gs = config.sound.gsTypeKind;
         fields.moonSound = config.sound.moonsound != 0;
         fields.covoxFb = config.sound.covoxFB != 0;
+        fields.covoxDd = config.sound.covoxDD != 0;
         fields.sd = config.sound.sd != 0;
         fields.sdMode = config.sound.sdMode;
         fields.zxBusNetwork = static_cast<uint8_t>(config.network.card & ~networkspec::kCardAtm2IoEsp);
@@ -70,7 +75,8 @@ struct CardFields
             case SlotCardGroup::MoonSound:
                 return moonSound == other.moonSound;
             case SlotCardGroup::Covox:
-                return covoxFb == other.covoxFb && sd == other.sd && (!sd || sdMode == other.sdMode);
+                return covoxFb == other.covoxFb && covoxDd == other.covoxDd && sd == other.sd &&
+                       (!sd || sdMode == other.sdMode);
             case SlotCardGroup::Network:
                 return zxBusNetwork == other.zxBusNetwork;
             case SlotCardGroup::Count:
@@ -96,6 +102,7 @@ struct CardFields
         if (groups & SlotGroupBit(SlotCardGroup::Covox))
         {
             config.sound.covoxFB = covoxFb ? 1 : 0;
+            config.sound.covoxDD = covoxDd ? 1 : 0;
             config.sound.sd = sd ? 1 : 0;
             config.sound.sdMode = sd ? sdMode : 0;
         }
@@ -194,6 +201,7 @@ CardFields ProjectFields(const SlotConfig& slotConfig, const CONFIG& config)
     fields.gs = GSTypeKind::NONE;
     fields.moonSound = false;
     fields.covoxFb = false;
+    fields.covoxDd = false;
     fields.sd = false;
     fields.zxBusNetwork = 0;
     for (const SlotConfigEntry& entry : slotConfig.entries)
@@ -233,6 +241,10 @@ CardFields ProjectFields(const SlotConfig& slotConfig, const CONFIG& config)
         if (builtIn.id == kBoardCovox && builtIn.on)
         {
             fields.covoxFb = true;
+        }
+        if (builtIn.id == kPrinterCovox && builtIn.on)
+        {
+            fields.covoxDd = true;
         }
     }
     return fields;
@@ -626,6 +638,49 @@ std::string SlotManager::Result::Refusal() const
     return text;
 }
 
+const SlotManager::MachineSlot* SlotManager::Result::FindMachineSlot(const std::string& slot) const
+{
+    for (const MachineSlot& machineSlot : machineSlots)
+    {
+        if (machineSlot.slot == slot)
+        {
+            return &machineSlot;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<SlotManager::MachineSlot> SlotManager::MachineSlotsOf(const CONFIG& config, const MachineDef* machine)
+{
+    std::vector<MachineSlot> out;
+    if (machine == nullptr)
+    {
+        return out;
+    }
+    for (const BusDef& bus : machine->buses)
+    {
+        // Isa8: the Sprinter's ISA slots, filled by its [ISA] section
+        if (bus.kind != BusKind::Isa8)
+        {
+            continue;
+        }
+        const std::vector<sprinterisa::SlotSummary> summaries = sprinterisa::SlotSummaries(config);
+        for (size_t n = 0; n < summaries.size(); n++)
+        {
+            MachineSlot slot;
+            slot.slot = std::string(bus.id) + "." + std::to_string(n + 1);
+            slot.bus = bus.id;
+            slot.card = summaries[n].key;
+            slot.name = summaries[n].name;
+            slot.source = "[ISA] Slot" + std::to_string(n + 1);
+            slot.hosts = summaries[n].hostsZxBus ? Describe(BusKind::ZxBus).id : "";
+            slot.details = summaries[n].details;
+            out.push_back(std::move(slot));
+        }
+    }
+    return out;
+}
+
 const SlotManager::BuiltIn* SlotManager::Result::FindBuiltIn(const std::string& id) const
 {
     for (const BuiltIn& builtIn : builtIns)
@@ -734,6 +789,12 @@ SlotConfig SlotManager::TranslateLegacy(const CONFIG& config, uint32_t groups)
         {
             out.builtIns.push_back({ kBoardCovox, config.sound.covoxFB != 0,
                                      std::string("[SOUND] CovoxFB=") + (config.sound.covoxFB ? "1" : "0") });
+        }
+        // The Scorpion's printer Covox: CovoxDD switches it (on by default)
+        if (FindBuiltIn(machine, kPrinterCovox) != nullptr)
+        {
+            out.builtIns.push_back({ kPrinterCovox, config.sound.covoxDD != 0,
+                                     std::string("[SOUND] CovoxDD=") + (config.sound.covoxDD ? "1" : "0") });
         }
         if (config.sound.sd)
         {
@@ -1477,7 +1538,9 @@ SlotManager::Result SlotManager::Plan(const CONFIG& config, uint32_t decidedGrou
             if (group == SlotCardGroup::Covox)
             {
                 requested.builtIns.erase(std::remove_if(requested.builtIns.begin(), requested.builtIns.end(),
-                                                        [](const SlotBuiltInSwitch& s) { return s.id == kBoardCovox; }),
+                                                        [](const SlotBuiltInSwitch& s) {
+                                                            return s.id == kBoardCovox || s.id == kPrinterCovox;
+                                                        }),
                                          requested.builtIns.end());
             }
             const SlotConfig translated = TranslateLegacy(config, SlotGroupBit(group));
@@ -1534,6 +1597,9 @@ SlotManager::Result SlotManager::Plan(const CONFIG& config, uint32_t decidedGrou
     {
         result.log.push_back("Config: [SLOTS] " + error);
     }
+
+    // The machine's own slots (the Sprinter's ISA slots): what the board holds there
+    result.machineSlots = MachineSlotsOf(config, machine);
 
     // Built-in devices and their switches
     if (machine != nullptr)
@@ -1635,6 +1701,33 @@ SlotManager::Result SlotManager::Plan(const CONFIG& config, uint32_t decidedGrou
         {
             disable("the slot is taken");
             continue;
+        }
+        // A slot of the machine's own (an ISA slot) holds a ZX-bus card only behind the ZX-bus adapter the board's
+        // configuration fits there (SL-8): the adapter hosts the card's bus
+        if (const BusDef* bus = FindBus(machine, BusOf(request.slot)); bus != nullptr && bus->kind == BusKind::Isa8)
+        {
+            const MachineSlot* host = result.FindMachineSlot(request.slot);
+            if (host == nullptr)
+            {
+                disable("the machine has no slot " + request.slot + " (two ISA slots: isa.1, isa.2)");
+                continue;
+            }
+            if (host->hosts.empty())
+            {
+                disable(request.slot + " holds " + (host->card == "none" ? std::string("no card") : host->name) +
+                        " (" + host->source + "), not the ZX-bus adapter a ZX-bus card needs: " + host->source +
+                        "=ZXBUS");
+                continue;
+            }
+            // The adapter as emulated passes the General Sound's ports only (Sprinter ISA phase I2); another card
+            // would be built and hear nothing - or answer the Z80's own port cycles, which never reach an ISA card
+            if (slot.group != SlotCardGroup::GeneralSound)
+            {
+                disable("the ZX-bus adapter in " + request.slot +
+                        " passes the General Sound's ports only (gs, gs-lw, neogs); other ZX-bus cards behind it wait "
+                        "for Sprinter ISA phase I5");
+                continue;
+            }
         }
 
         // The AY socket with its chip taken out
@@ -1854,6 +1947,8 @@ void SlotManager::Apply(const Result& result, CONFIG& config, uint32_t decidedGr
         return s.entry.card == "covox-fb" && !s.entry.disabled;
     });
     fields.covoxFb = covoxCard || (boardCovox != nullptr && boardCovox->kind == BuiltInKind::Switchable && boardCovox->on);
+    const BuiltIn* printerCovox = result.FindBuiltIn(kPrinterCovox);
+    fields.covoxDd = printerCovox != nullptr && printerCovox->on;
     fields.sd = false;
     fields.sdMode = 0;
     for (const Slot& s : result.entries)
@@ -2020,6 +2115,15 @@ bool SlotManager::BuildCards()
             const std::vector<PortClaim> claims = CardClaims(*def, slot.entry.options);
             const auto order = static_cast<uint8_t>(PortDecoder::kSlotCardSlotBase + _cards.size());
             decoder->AttachSlotCard(card.get(), claims, order, def->detection);
+            // A card with the Kempston joystick function (the `kempston` interface): the machine's joystick reaches
+            // the guest, so its input paths, connector and TTD blob come with it
+            for (const FunctionUse& use : CardFunctions(*def, slot.entry.options))
+            {
+                if (use.function == Function::KempstonJoystick)
+                {
+                    decoder->SetSlotKempstonJoystick(true);
+                }
+            }
         }
         if (SoundManager* sound = _context->pSoundManager)
         {
@@ -2048,6 +2152,11 @@ bool SlotManager::BuildCards()
             }
         }
     }
+    // A card's own General Sound (the MultiSound's): its debug hooks follow the new card
+    if (DebugManager* debug = _context->pDebugManager)
+    {
+        debug->OnSlotCardsChanged();
+    }
     return true;
 }
 
@@ -2069,8 +2178,15 @@ void SlotManager::ReleaseCards()
     if (decoder != nullptr && !_cards.empty())
     {
         decoder->BindSlotSignals(nullptr);
+        decoder->SetSlotKempstonJoystick(false);
     }
+    const bool hadCards = !_cards.empty();
     _cards.clear();
+    // The hooks forget the card that is gone
+    if (DebugManager* debug = _context != nullptr ? _context->pDebugManager : nullptr; debug != nullptr && hadCards)
+    {
+        debug->OnSlotCardsChanged();
+    }
 }
 
 ICard* SlotManager::FindCard(const std::string& slot) const

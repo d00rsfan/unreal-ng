@@ -11,7 +11,7 @@
 #include "emulator/cpu/core.h"
 #include "emulator/io/network/networkmanager.h"
 #include "emulator/io/network/networkspec.h"
-#include "debugger/ttd/timetravelhooks.h"
+#include "emulator/coordinator/ports.h"
 #include "emulator/slots/card.h"
 #include "emulator/slots/slotconfig.h"
 #include "emulator/slots/slotmatrix.h"
@@ -266,10 +266,14 @@ void RunChange(const SlotControlRequest& request, const std::string& emulatorId,
     restart["previousEmulatorId"] = result.previousEmulatorId.empty() ? emulatorId : result.previousEmulatorId;
     restart["emulatorId"] = result.emulator ? result.emulator->GetId() : emulatorId;
     restart["wasRunning"] = result.wasRunning;
+    restart["wasPaused"] = result.wasPaused;
     bool started = false;
-    if (result.Applied() && result.emulator && result.wasRunning && request.startWhenRunning)
+    if (result.Applied() && result.emulator && request.startWhenRunning)
     {
-        started = EmulatorManager::GetInstance()->StartEmulatorAsync(result.emulator->GetId());
+        // The run state the user had: a paused machine comes back started and paused, not "initialized"
+        const std::string id = result.emulator->GetId();
+        started = ModelSwitch::StartAsBefore(*result.emulator, {result.wasRunning, result.wasPaused},
+                                             [&id]() { EmulatorManager::GetInstance()->StartEmulatorAsync(id); });
     }
     restart["started"] = started;
     if (result.Applied())
@@ -357,7 +361,10 @@ void Network(const SlotControlRequest& request, std::shared_ptr<Emulator>& emula
         }
         if (!network->RequestChange(change, error))
         {
-            const bool recording = context->pTimeTravelHooks != nullptr && context->pTimeTravelHooks->IsRecording();
+            // The coordinator refused it (a recording the user started, the recorded past) or a setting is wrong
+            const coordinator::MachineMode mode =
+                context->pMachineOps ? context->pMachineOps->Mode() : coordinator::MachineMode::Live;
+            const bool recording = mode != coordinator::MachineMode::Live && mode != coordinator::MachineMode::BlackBox;
             reply.status = recording ? "recording" : "refused";
             reply.httpStatus = 409;
             reply.message = error;
@@ -866,7 +873,7 @@ StateNode SlotControl::CarryValue(const SlotManager::CarryReport& carry)
     return node;
 }
 
-StateNode SlotControl::Catalog(const SlotManager::Result& current)
+StateNode SlotControl::Catalog(const SlotManager::Result& current, const std::string& slot)
 {
     StateNode cards = StateNode::Array();
     const SlotSet fitted = current.Fitted();
@@ -875,6 +882,7 @@ StateNode SlotControl::Catalog(const SlotManager::Result& current)
         StateNode c = StateNode::Object();
         c["id"] = card.id;
         c["name"] = card.name;
+        c["label"] = PlainLabel(card.name);
         c["bus"] = Describe(card.bus).id;
         c["needs"] = Signals(card.needs);
         c["detection"] = Describe(card.detection).id;
@@ -930,21 +938,28 @@ StateNode SlotControl::Catalog(const SlotManager::Result& current)
         }
         c["media"] = std::move(media);
 
-        // How it would fit this machine now: the plan of a plug into the slot the planner suggests
+        // How it would fit this machine now: the plan of a plug into the slot asked for, else the one the planner suggests
         StateNode here = StateNode::Object();
         std::string fittedIn;
+        bool inSlot = false;
         for (const SlotEntry& entry : fitted)
         {
             if (entry.card == card.id)
             {
                 fittedIn += (fittedIn.empty() ? "" : ",") + entry.slot;
+                inSlot = inSlot || (!slot.empty() && entry.slot == slot);
             }
         }
         here["fittedIn"] = fittedIn;
+        if (!slot.empty())
+        {
+            here["inSlot"] = inSlot;
+        }
         if (current.machine != nullptr)
         {
             SlotRequest request;
             request.op = SlotRequest::Op::Plug;
+            request.slot = slot;
             request.card = card.id;
             request.dryRun = true;
             const SlotPlan plan = Planner().Plan(current.model, fitted, request);
@@ -969,6 +984,44 @@ StateNode SlotControl::Catalog(const SlotManager::Result& current)
         cards.push(std::move(c));
     }
     return cards;
+}
+
+std::string SlotControl::PlugHint(const SlotManager::Result& current, std::string_view card)
+{
+    if (current.machine == nullptr || Planner().FindCard(std::string(card)) == nullptr)
+    {
+        return {};
+    }
+    SlotRequest request;
+    request.op = SlotRequest::Op::Plug;
+    request.card = std::string(card);
+    request.dryRun = true;
+    const SlotPlan plan = Planner().Plan(current.model, current.Fitted(), request);
+    if (plan.hardRefusal || plan.slot.empty())
+    {
+        return {};
+    }
+    const std::string id(card);
+    std::string hint = "fit the `" + id + "` card: slots plug " + plan.slot + " " + id;
+    std::string mcp = "MCP emulator_manage slots_plug slot=" + plan.slot + " card=" + id;
+    std::string web = "WebAPI POST /emulator/{id}/slots/" + plan.slot + "/plug {\"card\":\"" + id + "\"";
+    if (!plan.allowed)
+    {
+        hint += " --replace";
+        mcp += " replace_if_incompatible=true";
+        web += ",\"replaceIfIncompatible\":true";
+    }
+    hint += " (" + mcp + "; " + web + "}); the machine restarts";
+    if (!plan.allowed)
+    {
+        std::string why;
+        for (const PlanReason& reason : plan.reasons)
+        {
+            why += (why.empty() ? "" : "; ") + reason.text;
+        }
+        hint += ". Needs the override: " + (why.empty() ? std::string("see slots_catalog") : why);
+    }
+    return hint;
 }
 
 SlotControlReply SlotControl::Execute(const SlotControlRequest& request)
@@ -1048,7 +1101,11 @@ SlotControlReply SlotControl::Execute(const SlotControlRequest& request)
     {
         reply.body["emulatorId"] = emulatorId;
         reply.body["model"] = current.machine->name;
-        reply.body["cards"] = Catalog(current);
+        if (!request.slot.empty())
+        {
+            reply.body["slot"] = request.slot;
+        }
+        reply.body["cards"] = Catalog(current, request.slot);
         return reply;
     }
 

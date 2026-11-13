@@ -69,7 +69,10 @@ void NeoGSDma::writeRegister(int reg, uint8_t value, int64_t now)
             const bool wasRunning = running(m);
             _regs[m][3] = static_cast<uint8_t>(value & 0x80);
             if (!wasRunning && running(m))
+            {
+                _host.dmaStarted(m);
                 start(m, now);
+            }
             else if (wasRunning && !running(m))
                 finish(m, false); // aborted: no interrupt
             return;
@@ -107,6 +110,7 @@ void NeoGSDma::start(Module m, int64_t now)
 void NeoGSDma::finish(Module m, bool raiseInterrupt)
 {
     _regs[m][3] = static_cast<uint8_t>(_regs[m][3] & 0x7F);
+    _host.dmaEnded(m, raiseInterrupt);
     if (m == SD)
     {
         _sdPhase = Phase::Idle;
@@ -194,6 +198,7 @@ void NeoGSDma::runSd(int64_t now)
         const uint32_t base = address(SD);
         for (int i = 0; i < BLOCK; i++)
             _mem.ram()[(base + static_cast<uint32_t>(i)) % _mem.ramSize()] = _sdBuffer[i];
+        _host.dmaRamWritten(base, BLOCK);
         advanceAddress(SD, BLOCK);
         _bytesMoved += BLOCK;
         const int64_t burst = static_cast<int64_t>(BLOCK * BURST_CLOCKS_PER_BYTE + GRANT_OVERHEAD_CLOCKS) * _host.dmaUnitsPerCycle();
@@ -203,6 +208,7 @@ void NeoGSDma::runSd(int64_t now)
         _sdAt = kNever;
         _regs[SD][3] = static_cast<uint8_t>(_regs[SD][3] & 0x7F);
         _irq.raise(NeoGSInterrupts::REQ_SD_DMA);
+        _host.dmaEnded(SD, true);
         (void)now;
     }
 }
@@ -225,7 +231,7 @@ void NeoGSDma::runMp3(int64_t now)
             t += 60 * byteTime; // ~50 us at 20 MHz
             continue;
         }
-        _mp3->sdi()->exchange(_mp3Buffer[_mp3Sent++]);
+        (_mp3Data ? _mp3Data : _mp3->sdi())->exchange(_mp3Buffer[_mp3Sent++]);
         _bytesMoved++;
         t += byteTime;
     }

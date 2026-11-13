@@ -71,7 +71,10 @@ packages; pushing a `v*` tag creates a milestone release.
 |----------|------|
 | Linux x86_64, portable (glibc 2.39+) | `UnrealNG-Suite-Linux-x86_64.AppImage` |
 | Linux x86_64, Ubuntu 24.04+ / Debian 13+ | `UnrealNG-Suite-Linux-x86_64.deb` |
+| Linux x86_64, bundled Qt, RPM-based distributions (glibc 2.39+) | `UnrealNG-Suite-Linux-x86_64.rpm` |
+| Linux x86_64, portable archive with bundled Qt (glibc 2.39+) | `UnrealNG-Suite-Linux.tar.gz` |
 | Ubuntu 26.04 x86_64, system Qt and libraries | `UnrealNG-Suite-Ubuntu-26.04-x86_64.deb` |
+| Steam Deck, AppImage with Steam library installer | `UnrealNG-SteamDeck-x86_64.tar.gz` |
 | macOS 12+, Apple Silicon / Intel | `UnrealNG-Suite-macOS-arm64.dmg` / `UnrealNG-Suite-macOS-x86_64.dmg` |
 | Windows x86_64 / ARM64 | `UnrealNG-Suite-Windows-x86_64.zip` / `UnrealNG-Suite-Windows-arm64.zip` |
 | Windows x86_64, MinGW build | `UnrealNG-Suite-Windows-x86_64-MinGW.zip` |

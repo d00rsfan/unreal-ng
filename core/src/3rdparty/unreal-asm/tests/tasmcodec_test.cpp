@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <tuple>
 
 #include "codecs/tasm/tasmcodec.h"
 #include "testdata.h"
@@ -15,6 +16,23 @@
 using namespace unrealasm;
 using unrealasm::testing::ReadTestData;
 using unrealasm::testing::ReadTestText;
+
+namespace
+{
+/// ORG and n lines, the text the editor's room was measured with (LOAD in the emulator, 2026-10-19)
+SourceDocument MeasuredText(size_t n, const std::string& dialect)
+{
+    std::string text = "        ORG 40000\n";
+    for (size_t i = 0; i < n; ++i)
+        text += i % 3 ? "        LD A,(IX+" + std::to_string(i % 100) + ")\n" : "        ADD A,"  + std::to_string(i % 200) + "\n";
+    return SourceDocument::FromText(text, dialect);
+}
+
+bool Longer(const EncodeResult& r)
+{
+    return std::any_of(r.diagnostics.begin(), r.diagnostics.end(), [](const Diagnostic& d) { return d.message.find("longer than") != std::string::npos; });
+}
+}  // namespace
 
 namespace
 {
@@ -204,6 +222,18 @@ TEST(TasmCodec_Test, DetectionByCatalogAndByStream)
     const DetectResult detected = CodecRegistry::Builtin().Detect(file.data, file.Hints());
     ASSERT_NE(detected.chosen, nullptr) << detected.reason;
     EXPECT_EQ(detected.chosen->Info().id, "tasm");
+    // The same bytes as another type are no TASM source (a screen, a MASM 1.x file of type a walk as TASM lines too)
+    CatalogHints code = file.Hints();
+    code.type = 's';
+    EXPECT_LT(codec.Detect(file.data, code), 50);
+    // A code file (type C, start #8000) whose bytes happen to walk as TASM lines: not taken for TASM text (TASM 3 / 4 /
+    // 5 save type A; TASM 2.0's type C files are text with its own start). Checked on the collection's 587 images: every
+    // file detection gives to tasm is a type A file with a TASM start
+    code.type = 'C';
+    code.start = 0x8000;
+    EXPECT_LT(codec.Detect(file.data, code), CodecRegistry::kMinScore);
+    const DetectResult asCode = CodecRegistry::Builtin().Detect(file.data, code);
+    EXPECT_TRUE(asCode.chosen == nullptr || asCode.chosen->Info().id != "tasm");
 }
 
 TEST(TasmCodec_Test, ConversionBetweenVersions)
@@ -309,4 +339,22 @@ TEST(TasmCodec_Test, Tasm5xStoresLinesStructurally)
     EXPECT_EQ(codecs::TasmCodec::DecodeBody(body, "5.5"), "LAB4    LD      A,(IX-LAB1)     ;C2");
     EXPECT_EQ(codecs::TasmCodec::DecodeBody(std::vector<uint8_t>{0xB3, 0x80, '1', 0x86, '2'}, "5.0"), "        LD      A,1,B,2");
     EXPECT_EQ(codecs::TasmCodec::DecodeBody(std::vector<uint8_t>{'L', 'A', 'B', '1', ',', 'L', 'A', 'B', '2'}, "5.0").substr(0, 4), "LAB1");
+}
+
+TEST(TasmCodec_Test, ALongerTextThanTheEditorHoldsIsReported)
+{
+    // each version's editor loads and edits a file up to its text's room (4.12 22801 bytes from #A6EE, 4.0 / 4.4 24663
+    // from #9FA8, 3.x 26314 from #9935, 2.0 26529) and says "OK" over a longer one, its text broken: a project's longer
+    // file is cut into INCLUDEd parts (zxasm convert --project). The line counts: the last that fit and the first that
+    // did not, measured in the emulator
+    const codecs::TasmCodec codec;
+    for (const auto& [version, fit, size] : {std::tuple<std::string, size_t, size_t>{"4.12", 2122, 22801}, {"4.0", 2099, 24655}, {"3", 2239, 26305}, {"2.0", 1930, 26529}})
+    {
+        EncodeOptions options;
+        options.subversion = version;
+        const EncodeResult fits = codec.Encode(MeasuredText(fit, "tasm"), options);
+        EXPECT_EQ(fits.bytes.size(), size) << version;
+        EXPECT_FALSE(Longer(fits)) << version;
+        EXPECT_TRUE(Longer(codec.Encode(MeasuredText(fit + 1, "tasm"), options))) << version;
+    }
 }

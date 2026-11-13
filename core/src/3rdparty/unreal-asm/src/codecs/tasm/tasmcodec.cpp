@@ -10,6 +10,20 @@ namespace unrealasm::codecs
 namespace
 {
 constexpr uint8_t kEndMarker = 0xFF;
+/// The longest file each version's editor holds (2026-10-19: LOAD then Edit of longer and longer files in the emulator).
+/// The text runs from its start below #FFFF (4.12 #A6EE, 4.0 / 4.4 #9FA8, 3.0-3.5 #9935); a longer file loads "OK"
+/// over itself. 2.0 loads its plain text from #975D, but the editor turns it into records: 26529 bytes edit, 26544 not
+size_t TextRoom(const std::string& version)
+{
+    return version == "4.12" ? 0xFFFF - 0xA6EE : version == "4.0" ? 0xFFFF - 0x9FA8 : version == "3" ? 0xFFFF - 0x9935 : version == "2.0" ? 26529 : 0;
+}
+
+/// A warning when the file is longer than the version's editor holds (a project's file is then cut into parts)
+void CheckRoom(EncodeResult& result, const std::string& version)
+{
+    if (const size_t room = TextRoom(version); room && result.bytes.size() > room)
+        result.diagnostics.push_back({Severity::Warning, 0, 0, "the source is longer than TASM " + version + "'s editor holds (" + std::to_string(room) + " bytes)"});
+}
 constexpr char32_t kRawBase = 0xF700;   // a byte the format gives no character: U+F700 + byte (as the encodings do)
 
 enum class Spacing : uint8_t
@@ -679,6 +693,10 @@ int TasmCodec::Detect(std::span<const uint8_t> bytes, const CatalogHints& hints)
     const bool tasmStart = hints.start == 39221 || hints.start == 40872 || hints.start <= 4096;
     if (hints.type == 'A' && tasmStart)
         return 95;
+    // TASM 3 / 4 / 5 save type A; data of another type also walks as TASM lines (a screen), and MASM 1.x shares the
+    // framing with type a
+    if (hints.type != 0 && hints.type != 'A')
+        return 20;
     return lines >= 3 ? 80 : 60;
 }
 
@@ -943,6 +961,7 @@ EncodeResult TasmCodec::Encode(const SourceDocument& document, const EncodeOptio
             if (!(unterminated && i + 1 == document.lines.size()))
                 result.bytes.insert(result.bytes.end(), {'\r', '\n'});
         }
+        CheckRoom(result, version);
         result.ok = !HasErrors(result.diagnostics);
         return result;
     }
@@ -990,6 +1009,7 @@ EncodeResult TasmCodec::Encode(const SourceDocument& document, const EncodeOptio
         result.bytes.insert(result.bytes.end(), document.attrs.bytes.begin(), document.attrs.bytes.end());
     else
         result.bytes.insert(result.bytes.end(), {kEndMarker, kEndMarker});
+    CheckRoom(result, version);
     result.ok = !HasErrors(result.diagnostics);
     return result;
 }

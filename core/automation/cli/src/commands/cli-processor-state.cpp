@@ -15,8 +15,11 @@
 #include <sstream>
 
 #include "cli-processor.h"
+#include "cli-next-format.h"
 #include "cli-sprinter-format.h"
+#include <emulator/state/devicecatalog.h>
 #include <emulator/state/devicestate.h>
+#include <emulator/state/statenodejson.h>
 
 
 /// region <State Inspection Commands>
@@ -46,6 +49,7 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
         ss << "Usage: state <subsystem> [subcommand] [args]" << NEWLINE;
         ss << NEWLINE;
         ss << "Available subsystems:" << NEWLINE;
+        ss << "  devices [all]  - The state reports this machine has: id, title, summary, the command; all: the absent ones and why (--json)" << NEWLINE;
         ss << "  memory         - Memory configuration (ROM + RAM + paging)" << NEWLINE;
         ss << "  memory ram     - RAM bank mapping (alias: ram)" << NEWLINE;
         ss << "  memory rom     - ROM configuration (alias: rom)" << NEWLINE;
@@ -64,6 +68,18 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
         ss << "  cdaudio        - CD drives' audio: disc, tracks, status, head, volume, mixer row" << NEWLINE;
         ss << "  tsconf         - TS-Conf machine: memory map, video, TSU, interrupts, DMA, clock, SD" << NEWLINE;
         ss << "  tsconf tsu     - TS-Conf TSU objects (tile layers, 85 sprites) and the 256 CRAM cells" << NEWLINE;
+        ss << "  next           - ZX Spectrum Next: machine, CPU clock, DivMMC, interrupts, CTC, SPI" << NEWLINE;
+        ss << "  next regs      - the NextREG table: value and reset of every register" << NEWLINE;
+        ss << "  next mmu       - the eight 8K MMU slots and the paging latches" << NEWLINE;
+        ss << "  next dma       - the DMA as programmed and running (no side effect on its read sequence)" << NEWLINE;
+        ss << "  next video     - layer order, ULA / Layer 2 / tilemap / sprites switches, clip windows, raster" << NEWLINE;
+        ss << "  next palette [palette=selected|0-7|name|all] [range=0-255] - the 9-bit palettes" << NEWLINE;
+        ss << "  next ports [port=6B] [access=r|w] - the internal port enable word; which device answers a port" << NEWLINE;
+        ss << "  next nextreg [reg=07] [changed=true] - one NextREG with decoded bits, or all (no side effect)" << NEWLINE;
+        ss << "  next copper [from=0] [count=64] [raw=true] - the copper list as a disassembly, control mode, write address, pc" << NEWLINE;
+        ss << "  next sprites [from=0] [count=128] [all=true] - the sprite attributes decoded, switches, collision flags, pattern memory" << NEWLINE;
+        ss << "  next journal [regs=07,02] [sources=nextreg,port,copper,internal] [since=N] [from=F] [to=F] [limit=N] | on | off | clear" << NEWLINE;
+        ss << "                 - who wrote which NextREG, when (frame, T, PC), through the NEXTREG instruction, port #253B or the copper" << NEWLINE;
         ss << "  sprinter       - Sprinter Sp2000: PLD, windows, cells, clock + waits, video, accelerator, sound, Z84C15, floppy, BIOS" << NEWLINE;
         ss << "  sprinter ports [map=0-3] [dos=0|1] [pn5=0|1] [rw=r|w|rw] - the decoded port table (page #40)" << NEWLINE;
         ss << "  sprinter port <hex> [rw=r|w] [map=..] [dos=..] [pn5=..]  - one port: index, code, name" << NEWLINE;
@@ -82,6 +98,7 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
         ss << "  audio channels - Audio mixer state for all sound sources" << NEWLINE;
         ss << NEWLINE;
         ss << "Examples:" << NEWLINE;
+        ss << "  state devices        - List the machine's devices and the command that shows each" << NEWLINE;
         ss << "  state memory         - Show complete memory configuration" << NEWLINE;
         ss << "  state memory ram     - Show RAM banking only" << NEWLINE;
         ss << "  state ram            - Same as above (alias)" << NEWLINE;
@@ -100,6 +117,8 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
         ss << "  state cdaudio        - Show the CD drives' audio state" << NEWLINE;
         ss << "  state tsconf         - Show the TS-Conf machine state (also: ts)" << NEWLINE;
         ss << "  state tsconf tsu     - Show the TSU objects and the palette (debug views)" << NEWLINE;
+        ss << "  state next           - Show the ZX Spectrum Next machine state (also: zxn)" << NEWLINE;
+        ss << "  state next journal on - Record NextREG writes; then `state next journal regs=02` shows who reset the machine" << NEWLINE;
         ss << "  state sprinter       - Show the Sprinter machine state (also: sp)" << NEWLINE;
         ss << "  state sprinter ports map=0 dos=0 rw=w - Show the OUT half of map 0 with TR-DOS off" << NEWLINE;
         ss << "  state sprinter port 21BC rw=w         - Which device answers OUT (#21BC)" << NEWLINE;
@@ -207,6 +226,19 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
         return;
     }
     // Handle 'audio' subsystem
+    else if (subsystem == "devices")
+    {
+        // The device catalog (DeviceState::Catalog): what a front end lists, the same on every plane
+        const bool all = std::find(args.begin(), args.end(), "all") != args.end();
+        const StateNode catalog = DeviceState::Catalog(context, all);
+        if (std::find(args.begin(), args.end(), "--json") != args.end())
+        {
+            session.SendResponse(StateNodeToJsonText(catalog) + NEWLINE);
+            return;
+        }
+        session.SendResponse(std::string("Devices") + NEWLINE + "=======" + NEWLINE + DeviceState::CatalogText(catalog, NEWLINE));
+        return;
+    }
     else if (subsystem == "fdc" || subsystem == "disk" || subsystem == "wd1793")
     {
         HandleStateFdc(session, context);
@@ -238,9 +270,23 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
         session.SendResponse(ts.str());
         return;
     }
+    else if (subsystem == "next" || subsystem == "zxn")
+    {
+        session.SendResponse(CliNext::StateText(context, args, NEWLINE));
+        return;
+    }
     else if (subsystem == "sprinter" || subsystem == "sp")
     {
         session.SendResponse(CliSprinter::StateText(context, args, NEWLINE));
+        return;
+    }
+    else if (subsystem == "execution" || subsystem == "exec")
+    {
+        // The execution arbiter: who decides whether the Z80 runs (DeviceState::Execution)
+        std::stringstream report;
+        report << "Execution arbiter" << NEWLINE << "=================" << NEWLINE
+               << DeviceState::ToText(DeviceState::Execution(context));
+        session.SendResponse(report.str());
         return;
     }
     else if (subsystem == "rtc" || subsystem == "cmos")
@@ -368,7 +414,7 @@ void CLIProcessor::HandleState(const ClientSession& session, const std::vector<s
     else
     {
         session.SendResponse(std::string("Error: Unknown subsystem '") + subsystem + "'" + NEWLINE +
-                             "Available subsystems: memory, ram, rom, screen, audio" + NEWLINE);
+                             "Type 'state' for every subsystem; 'state devices' lists this machine's devices" + NEWLINE);
         return;
     }
 }
@@ -473,6 +519,10 @@ void CLIProcessor::HandleStateMemory(const ClientSession& session, EmulatorConte
     ss << "  Bank 3 (0xC000-0xFFFF): " << memory.GetCurrentBankName(3) << NEWLINE;
     ss << NEWLINE;
 
+    // GMX: the card's register file (DeviceState::GmxPaging)
+    if (config.mem_model == MM_GMX)
+        ss << "GMX card:" << NEWLINE << DeviceState::ToText(DeviceState::GmxPaging(context), 1) << NEWLINE;
+
     // Paging State
     if (config.mem_model == MM_SPRINTER)
     {
@@ -563,6 +613,9 @@ void CLIProcessor::HandleStateMemoryRAM(const ClientSession& session, EmulatorCo
     // Bank 3 (always RAM, pageable on 128K)
     ss << "Bank 3 (0xC000-0xFFFF): RAM Page " << (int)memory.GetRAMPageForBank3() << " (" << access(3) << contended(3) << ")"
        << NEWLINE;
+
+    if (config.mem_model == MM_GMX)
+        ss << NEWLINE << "GMX card:" << NEWLINE << DeviceState::ToText(DeviceState::GmxPaging(context), 1);
 
     if (config.mem_model == MM_SPRINTER)
     {
@@ -1222,3 +1275,16 @@ void CLIProcessor::HandleStateAudioChannels(const ClientSession& session, Emulat
 /// endregion </Audio State Commands>
 
 /// endregion </State Inspection Commands>
+
+// HandleNext - next nextreg <reg> <value> [nextreg|port|internal]: write a NextREG through the board's write choke point (core
+// NextRegWriteControl, the WebAPI POST /next/nextreg); any other word is a `state next` subcommand (`next dma`, `next video` ...)
+void CLIProcessor::HandleNext(const ClientSession& session, const std::vector<std::string>& args)
+{
+    auto emulator = GetSelectedEmulator(session);
+    if (!emulator)
+    {
+        session.SendResponse(std::string("No emulator selected.") + NEWLINE);
+        return;
+    }
+    session.SendResponse(CliNext::NextCommand(emulator.get(), args, NEWLINE));
+}

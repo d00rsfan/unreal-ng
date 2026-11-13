@@ -9,6 +9,8 @@
 //   cpu            the CPU's view, addresses 0..#FFFF (what is paged in now)
 //   ram5 / rom2 / cache0   one physical page, offsets 0..#3FFF (what the CPU does not see now as well)
 //   ram            every RAM page of the machine, in page order; a match is reported as page + offset
+//   <region>       a device memory by name or alias (DeviceMemory: sprinter.vram / vram, neogs.ram, tsconf.cram,
+//                  moonsound.wave, ...), offsets 0..size-1; a match is reported as region + offset
 
 #include <cstdint>
 #include <string>
@@ -28,8 +30,10 @@ struct MemorySearchRequest
     {
         Cpu,
         Page,
-        AllRam
+        AllRam,
+        Region
     } space = Space::Cpu;
+    std::string region;                      // Space::Region: the name or alias as given
     MemoryBankModeEnum pageType = BANK_RAM;  // Space::Page
     uint8_t page = 0;
 
@@ -46,6 +50,7 @@ struct MemorySearchMatch
     uint32_t address = 0;   // Cpu: the CPU address; Page / AllRam: the offset in `page`
     int pageType = -1;      // Page / AllRam: MemoryBankModeEnum of the page; -1 for Cpu
     int page = -1;
+    std::string region;     // Region: the region's canonical name; `address` is the offset in it
     uint32_t contextStart = 0;   // where `bytes` starts (the same space as `address`)
     std::vector<uint8_t> bytes;  // contextBefore bytes, the matched bytes, contextAfter bytes
 };
@@ -59,7 +64,7 @@ struct MemorySearchResult
 
 namespace MemorySearch
 {
-/// RAM pages of the machine (config.ramsize / 16)
+/// RAM pages of the machine (config.ramsize / 16, at least the 8 pages of the 128K numbering)
 uint32_t RamPageCount(EmulatorContext* context);
 /// The host memory of one physical page (RAM, ROM, cache); nullptr when the machine has no such page
 const uint8_t* PageHost(EmulatorContext* context, MemoryBankModeEnum type, uint32_t page);
@@ -67,10 +72,15 @@ const uint8_t* PageHost(EmulatorContext* context, MemoryBankModeEnum type, uint3
 bool ParsePattern(const std::string& text, std::vector<uint8_t>& pattern, std::vector<uint8_t>& mask, std::string& error);
 /// A number as a pattern, its hex digits as written: 0xAF3C -> "AF3C", 0xF -> "0F"
 std::string NumberPattern(uint64_t value);
-/// "cpu", "ram" or a page ("ram5", "rom2", "cache0") into the request's space. False with the reason
+/// "cpu", "ram", a page ("ram5", "rom2", "cache0") or a device memory region's name into the request's space.
+/// False with the reason (a region is looked up when the search runs)
 bool ParseSpace(const std::string& text, MemorySearchRequest& request, std::string& error);
 /// "cpu", "ram", or the page name: the request's space as the surfaces name it
 std::string SpaceName(const MemorySearchRequest& request);
+/// The offsets where @p pattern (with @p mask, empty: every bit) matches in a host buffer, in order, at most @p max
+/// (the analysis detectors match signatures against memory images with it)
+std::vector<uint32_t> FindInBuffer(const uint8_t* data, size_t size, const std::vector<uint8_t>& pattern,
+                                   const std::vector<uint8_t>& mask, unsigned max = 64);
 /// Runs the search on the machine's memory (side-effect free reads)
 MemorySearchResult Search(EmulatorContext* context, const MemorySearchRequest& request);
 /// A request from what the surfaces take: pattern text (or `patternBytes` when not null), optional mask text,

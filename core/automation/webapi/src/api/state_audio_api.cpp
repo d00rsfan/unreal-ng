@@ -15,7 +15,7 @@
 #include "../common/statenode_json.h"
 #include <emulator/state/devicestate.h>
 #include <emulator/sound/audiomixer.h>
-#include <debugger/ttd/timetravelmanager.h>
+#include <debugger/ttd/timetravelcontroller.h>
 #include <emulator/sound/chips/gs/soundchip_gs.h>
 #include <emulator/sound/chips/neogs/neogsmedia.h>
 
@@ -36,7 +36,7 @@ extern void ReplyDeviceState(const StateNode& node, std::function<void(const Htt
 // visible here without an EmulatorAPI instance.
 
 /// @brief GET /api/v1/emulator/{id}/state/audio/ay
-void EmulatorAPI::getStateAudioAY(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+void EmulatorAPI::getStateAudioAY(const HttpRequestPtr& /*req*/, std::function<void(const HttpResponsePtr&)>&& callback,
                                   const std::string& id) const
 {
     auto emulator = getEmulatorByIdOrIndex(id);
@@ -91,7 +91,7 @@ void EmulatorAPI::getStateAudioAY(const HttpRequestPtr& req, std::function<void(
 }
 
 /// @brief GET /api/v1/emulator/{id}/state/audio/ay/{chip}
-void EmulatorAPI::getStateAudioAYIndex(const HttpRequestPtr& req,
+void EmulatorAPI::getStateAudioAYIndex(const HttpRequestPtr& /*req*/,
                                        std::function<void(const HttpResponsePtr&)>&& callback, const std::string& id,
                                        const std::string& chipStr) const
 {
@@ -181,7 +181,7 @@ void EmulatorAPI::getStateAudioAYIndex(const HttpRequestPtr& req,
 }
 
 /// @brief GET /api/v1/emulator/{id}/state/audio/ay/register/{reg}
-void EmulatorAPI::getStateAudioAYRegister(const HttpRequestPtr& req,
+void EmulatorAPI::getStateAudioAYRegister(const HttpRequestPtr& /*req*/,
                                           std::function<void(const HttpResponsePtr&)>&& callback, const std::string& id,
                                           const std::string& chipStr, const std::string& regStr) const
 {
@@ -419,7 +419,7 @@ void EmulatorAPI::getStateAudioAYRegister(const HttpRequestPtr& req,
 }
 
 /// @brief GET /api/v1/emulator/{id}/state/audio/beeper
-void EmulatorAPI::getStateAudioBeeper(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+void EmulatorAPI::getStateAudioBeeper(const HttpRequestPtr& /*req*/, std::function<void(const HttpResponsePtr&)>&& callback,
                                       const std::string& id) const
 {
     auto emulator = getEmulatorByIdOrIndex(id);
@@ -830,7 +830,7 @@ void EmulatorAPI::postControlAudioGS(const HttpRequestPtr& req, std::function<vo
     else if (action == "sd_insert" || action == "sd_eject" || action == "flash_save")
     {
         // Checked here, carried out on the machine's thread (neogsmedia.h);
-        // insert / eject are refused while a TTD recording runs
+        // insert / eject follow the media rules (while TTD records: an event at the next frame boundary)
         NeoGSMediaResult result;
         if (action == "sd_insert")
         {
@@ -890,6 +890,7 @@ const char* gsTraceSideToString(GSTraceSide side)
         case GSTraceSide::DacFetch: return "dac";
         case GSTraceSide::Interrupt: return "interrupt";
         case GSTraceSide::ZxDma: return "zxdma";
+        case GSTraceSide::Idle: return "idle";
     }
     return "unknown";
 }
@@ -993,6 +994,8 @@ void EmulatorAPI::getStateAudioGSPortTrace(const HttpRequestPtr& req, std::funct
                 ev["card_address"] = (static_cast<uint32_t>(e.channel) << 16) | e.port;
             if (e.side == GSTraceSide::Interrupt)
                 ev["nmi"] = e.isNmi();
+            if (e.side == GSTraceSide::Idle)
+                ev["iterations"] = e.iterations;
             eventsJson.append(ev);
         }
         ret["events"] = eventsJson;
@@ -1106,7 +1109,7 @@ void EmulatorAPI::getStateAudioCovox(const HttpRequestPtr& req, std::function<vo
 }
 
 /// @brief GET /api/v1/emulator/{id}/state/audio/channels
-void EmulatorAPI::getStateAudioChannels(const HttpRequestPtr& req,
+void EmulatorAPI::getStateAudioChannels(const HttpRequestPtr& /*req*/,
                                         std::function<void(const HttpResponsePtr&)>&& callback,
                                         const std::string& id) const
 {
@@ -1409,6 +1412,59 @@ void EmulatorAPI::setAudioMixer(const HttpRequestPtr& req, std::function<void(co
         return reply(err, HttpStatusCode::k400BadRequest);
     }
     reply(StateNodeToJson(DeviceState::AudioMixer(emulator->GetContext())), HttpStatusCode::k200OK);
+}
+
+/// @brief GET /api/v1/emulator/{id}/audio/mixer/{source} - one row ("ay1") or channel ("ay1.a"): muted, solo, audible,
+/// volume, gain_db, peak, active, the row's channels
+void EmulatorAPI::getAudioMixerSource(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+                                      const std::string& id, const std::string& source) const
+{
+    (void)req;
+    auto emulator = getEmulatorByIdOrIndex(id);
+    Json::Value body;
+    HttpStatusCode code = HttpStatusCode::k200OK;
+    StateNode node;
+    std::string error;
+    if (!emulator)
+    {
+        body["error"] = "Not Found";
+        body["message"] = "Emulator not found with ID: " + id;
+        code = HttpStatusCode::k404NotFound;
+    }
+    else if (!AudioMixer::Read(emulator->GetContext(), source, node, error))
+    {
+        body["error"] = "Not Found";
+        body["message"] = error;
+        code = HttpStatusCode::k404NotFound;
+    }
+    else
+        body = StateNodeToJson(node);
+    auto resp = HttpResponse::newHttpJsonResponse(body);
+    resp->setStatusCode(code);
+    addCorsHeaders(resp);
+    callback(resp);
+}
+
+/// @brief GET /api/v1/emulator/{id}/audio/levels - the mixer's levels (the topic audio.mixer pushes the same value)
+void EmulatorAPI::getAudioLevels(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+                                 const std::string& id) const
+{
+    (void)req;
+    auto emulator = getEmulatorByIdOrIndex(id);
+    Json::Value body;
+    HttpStatusCode code = HttpStatusCode::k200OK;
+    if (!emulator)
+    {
+        body["error"] = "Not Found";
+        body["message"] = "Emulator not found with ID: " + id;
+        code = HttpStatusCode::k404NotFound;
+    }
+    else
+        body = StateNodeToJson(AudioMixer::Levels(emulator->GetContext()));
+    auto resp = HttpResponse::newHttpJsonResponse(body);
+    resp->setStatusCode(code);
+    addCorsHeaders(resp);
+    callback(resp);
 }
 
 }  // namespace v1

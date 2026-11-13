@@ -37,6 +37,10 @@ enum class TTDRegionId : uint16_t
     SmucEeprom = 16,
     MultiSoundGsRam = 17,      ///< the ZX-MultiSound's General Sound RAM (1-2 MB), next to a GS card's GeneralSoundRam
     EvoFlash = 18,             ///< the ZX-Evo's 512 KB ROM chip (the machine's ROM pages 0-31), written through its flash commands
+    /// A further instance's region of a kind above (two cards of one kind, D23): 0x4000 + n x 0x100 + the kind's
+    /// id, n = 1, 2, ... in registration order (TTDPeripheralRegistry::CollectRegions)
+    InstanceRegionFirst = 0x4000,
+    WildSoundFlash = 19,       ///< the Sprinter ISA Wild Sound's upload store (999 424 bytes; its state is in the SprinterIsa blob)
     /// The engine's own regions holding device states (Phase 2, Step 2): one
     /// per device of the table, from this value on
     DeviceStateFirst = 0x8000,

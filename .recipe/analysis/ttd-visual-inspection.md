@@ -10,8 +10,8 @@ Use this instead of live pause/screenshot cycles whenever you need to be
 certain two inspections (or a screenshot you're comparing against a
 person's own screenshot) are of the *same* instant. A live `pause` +
 `capture/screen` round-trip is not that guarantee — a screenshot takes the
-presented frame, which lags the machine by the present delay (2 frames by
-default, more with ZX DLSS), so two calls a moment apart can land on
+presented frame, which lags the machine by the present delay (the frame
+whose sound is heard now: about 2 frames, the audio path's delay; more with ZX DLSS), so two calls a moment apart can land on
 different frames while the machine is running. (The GUI and the screenshot
 read that same presented frame; see
 [agent-screenshot-view.md](../media/agent-screenshot-view.md).) Seeking TTD to a recorded frame removes that
@@ -60,6 +60,14 @@ time_travel        {"action":"step_back_instruction"}
 # 5. dump memory at this exact frame for byte-level checks
 invoke_api         {"method":"GET","path":"/api/v1/emulator/{id}/memory/read/0xC000",
                    "query_params":{"length":256,"format":"full"}}
+
+# Find the frame instead of walking to it, one call each:
+time_travel        {"action":"timeline"}                   # the recording cut into phases (tape, disk, screen, ...)
+time_travel        {"action":"find_event","find":"screen","min_changed":20,"limit":10}
+                                                           # the frames whose picture changed by 20 % or more
+time_travel        {"action":"explain_frame","frame":3520} # what that frame did: routines, paging, ports, writes
+time_travel        {"action":"diff","from_frame":3519,"to_frame":3520}
+                                                           # what differs between two moments, with the last writers
 ```
 
 ## WebAPI
@@ -69,7 +77,7 @@ the inspection loop.
 
 ```bash
 # record → stop → seek to the frame of interest: a frame alone lands at its end
-# (its final picture and the machine state that goes with it, backend engine);
+# (its final picture and the machine state that goes with it);
 # add "tinframe":0 for the frame's start
 curl -s -X POST "$BASE/emulator/$EMU_ID/ttd/start" -H 'Content-Type: application/json' -d '{}' | jq '.state'
 curl -s -X POST "$BASE/emulator/$EMU_ID/ttd/stop"  | jq '.state'
@@ -84,6 +92,10 @@ curl -s "$BASE/emulator/$EMU_ID/capture/screen?area=full&format=png&path=scratch
 curl -s "$BASE/emulator/$EMU_ID/memory/read/0xC000?length=256&format=full" | jq '.data[:8]'
 ```
 
+The same finders over curl: `GET /ttd/timeline`, `GET /ttd/find-event?kind=screen&cond=change&min_changed=20`,
+`GET /ttd/explain-frame?frame=3520`, `GET /ttd/diff?from_frame=3519&to_frame=3520` (add `text=true` for a short
+text answer). Compare two moments with `diff`, not with two memory reads and a diff of your own.
+
 For a whole range of frames, `POST /ttd/export-clip` writes a lossless clip in
 one call instead of a seek and a capture per frame (see
 [ttd-recording.md](ttd-recording.md#inspect-a-file-search-port-journals-export-a-clip)).
@@ -97,10 +109,9 @@ one call instead of a seek and a capture per frame (see
   polling, turbo/speed-multiplier drift).
 - **Free back-and-forth.** `step-back`/`step-forward`/`seek` all work
   once recording has stopped, and while it records they pause it
-  (`recording_paused: true`; on `backend: v1` scrubbing while still
-  `recording` is a `409`). You can walk one frame at a time across a
-  glitch boundary to see exactly which frame introduced it, then
-  `step-instruction` within that frame to find which write did it.
+  (`recording_paused: true`). `find-event` names the frame that introduced
+  a glitch (a screen change, a byte's change, a key) and `cause-chain` the
+  write behind a byte; `step-instruction` walks inside that frame.
 - **A screenshot of a seeked frame IS the frame.** There's no present-queue
   latency to worry about — TTD restores
   full state (including the framebuffer) to that recorded point before
@@ -109,18 +120,20 @@ one call instead of a seek and a capture per frame (see
 ## Pitfalls (shared with ttd-recording.md, repeated because they bite here specifically)
 
 - `ttd/seek`/`step-*` while `state: "recording"` pause the recording
-  (`recording_paused: true`; resume at the paused point continues it). On
-  `backend: v1` they answer `409`: call `ttd/stop` first (history is retained).
+  (`recording_paused: true`; resume at the paused point continues it).
 - Load the software **before** `ttd/start`: a tape or disk load (and disk
-  create) is refused while recording and wipes a stopped session's history;
-  a ROM reload, model switch or slot change ends the session (the engine). A snapshot load on the engine is part of the recording
-  (v1 refuses it). A reset stops the recording and keeps it.
+  create) while recording is an event of the recording (it lands at the next
+  frame boundary; a seek to before it shows the slot empty) and wipes a
+  stopped session's history;
+  a ROM reload, model switch or slot change ends the session (the engine). A snapshot load and a reset END the session
+  and keep its history (one rule; a new session only with the `ttdrestart` feature or a black box).
 - While recording, the host speed is held at 1x and turbo / fast tape /
   fast disk are off, so a recording plays at real speed. See
   [command-interface.md → TTD Session Rules](../../docs/emulator/design/control-interfaces/command-interface.md#ttd-session-rules).
-- Development mode (`{}`, the default on `ttd/start`) costs ~64MB
-  journal + page store for a long capture — fine for "record a few
-  thousand frames to inspect a glitch," not for hours-long sessions.
+- Development mode (`{}`, the default on `ttd/start`) also keeps the
+  write journal (`find-last`, `cause-chain`, `diff`'s last writers); the
+  history keeps a window (the history limit, see
+  [ttd-recording.md](ttd-recording.md)), older frames drop out.
 - If you need the *live* machine to keep running from a past point
   (rather than just inspecting it), `ttd/seek` then `ttd/resume` —
   otherwise seeking alone leaves the instance paused at that frame,

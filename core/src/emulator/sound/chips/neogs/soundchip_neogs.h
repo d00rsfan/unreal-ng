@@ -26,6 +26,8 @@
 #include "3rdparty/unreal-z80/z80cpu.h"
 #include "common/sound/filters/filterdcblocker.h"
 #include "common/modulelogger.h"
+#include "emulator/bus/bustap.h"
+#include "emulator/bus/spitapdevice.h"
 #include "emulator/io/flash/flash29f040b.h"
 #include "emulator/io/sdcard/sdcardspi.h"
 #include "emulator/media/mediaslot.h"
@@ -45,6 +47,8 @@
 #include "emulator/sound/chips/neogs/neogsspi.h"
 #include "emulator/sound/chips/neogs/neogszxdma.h"
 #include "emulator/sound/chips/neogs/vs10xx.h"
+#include "debugger/history/devicehistory.h"
+#include "sysdefs.h"
 
 class EmulatorContext;
 namespace ttd
@@ -137,9 +141,22 @@ public:
     std::string deviceDescription() const override;
     bool isCPUHalted() const override { return _cpu && Z80CpuHalted(_cpu) != 0; }
     uint16_t getCPUReg(GSCpuRegister reg) const override;
+    // Card CPU debugging (gs-debugger design §4)
+    bool setDebugHooks(IGSDebugHooks* hooks) override;
+    CardPage mapCardAddress(uint16_t addr) const override;
+    uint32_t cardPageCount(CardPage::Kind kind) const override;
+    bool cardRegisters(Z80CpuRegisters& out) const override;
+    int64_t cardTime() const override { return _runner.now(); }
+    int64_t cardFrameTime() const override { return _runner.now() - _frameStartTicks; }
+    bool inFrameEndCatchUp() const override { return _frameEndCatchUp; }
+    bool pokeCardMemory(uint16_t addr, uint8_t value) override { return _cpu && _mem.writeRam(addr, value); }
+    bool setCardRegisters(const Z80CpuRegisters& regs) override;
+    double cardUnitsPerSecond() const override { return TICKS_PER_SECOND; }
 
     const GSActivityCounters& getActivityCounters() const override { return _activityCounters; }
     void resetActivityCounters() override { _activityCounters = GSActivityCounters{}; }
+
+    void attachPortTrace(GSHistory* history) override { _portTrace.attach(history, _context); }
 
     void startPortTrace() override { _portTrace.start(); }
     void stopPortTrace() override { _portTrace.stop(); }
@@ -221,11 +238,23 @@ public:
     const NeoGSZxDma& zxDma() const { return _zx; }
     NeoGSSpi& spi() { return _spi; }
     NeoGSMemory& memory() { return _mem; }
+    /// What the DMA modules tell the card (tests: a module's RAM write without the module)
+    NeoGSDma::Host& dmaHost() { return *this; }
+    NeoGSZxDma::Host& zxHost() { return *this; }
     const NeoGSMemory& memory() const { return _mem; }
     Flash29F040B& flash() { return _flash; }
     const NeoGSConfig& config() const { return _config; }
     const std::string& flashTitle() const { return _flashTitle; }
     uint8_t peek(uint16_t addr) const { return _mem.peek(addr); }
+    /// What the runner may do with this card (GSCardRunner reads these, not the private hooks themselves: a
+    /// requires-expression on a befriended private member is false under MSVC 2019, which compiled the sleep out)
+    static constexpr bool kRunnerIdleSleep = true;          ///< sleepAllowed() and the rest: the idle loop is slept through
+    static constexpr bool kRunnerBatchQuietEvents = true;   ///< sleepQuietEventsBefore()
+
+    /// The firmware's idle poll loop slept through (on by default; off steps it: comparison tests, diagnosis)
+    void setIdleSleep(bool on) { _runner.setSleepOn(on); }
+    /// Card CPU steps the sleeps stood for (tests, diagnosis)
+    uint64_t stepsSlept() const { return _runner.stepsSlept(); }
     void poke(uint16_t addr, uint8_t value) { _mem.poke(addr, value); }
     /// Flash persistence ([NGS] FlashWrite, neogs-tdd.md §5.8). In persist
     /// mode a modified flash is saved as neogs-flash-<sha256 of the shipped
@@ -239,7 +268,7 @@ public:
 
     /// SD card slot `sd.ngs`: insert an image or a folder, eject, inspect.
     /// With a media manager these go through it (the slot's settings from
-    /// [MEDIA] / [NGS], refused while TTD records); without one (bare
+    /// [MEDIA] / [NGS], the media rules while TTD records); without one (bare
     /// contexts) the card opens the image itself
     static constexpr const char* SD_SLOT_ID = "sd.ngs";
     /// [NGS] SDWrite as the slot's access mode (session / persist / off)
@@ -266,12 +295,12 @@ public:
     bool sdCardPresent() const { return _sd && _sd->present(); }
 
     /// Run the card by itself for `ticks` (tests, module replay)
-    void runFor(int64_t ticks) { _runner.runTo(_runner.now() + ticks); }
+    void runFor(int64_t ticks) { runTo(_runner.now() + ticks); }
     /// endregion
 
-    /// TTD blob (neogs-tdd.md §7.4, TTD v1: every checkpoint carries it all):
-    /// the fixed card state, the SD card's protocol, the decoder, the DMA
-    /// modules, ZX-DMA, then RAM and flash contents
+    /// TTD blob (neogs-tdd.md §7.4): the fixed card state, the SD card's
+    /// protocol, the decoder, the DMA modules, ZX-DMA; RAM and flash are the
+    /// engine's regions (layout 4)
     static constexpr size_t TTD_FIXED_STATE_SIZE = 256;
     static constexpr size_t TTD_SD_OFFSET = TTD_FIXED_STATE_SIZE;
     static constexpr size_t TTD_MP3_OFFSET = TTD_SD_OFFSET + SdCardSpi::STATE_SIZE;
@@ -279,8 +308,8 @@ public:
     static constexpr size_t TTD_ZX_OFFSET = TTD_DMA_OFFSET + NeoGSDma::STATE_SIZE;
     static constexpr size_t TTD_DEVICE_STATE_END = TTD_ZX_OFFSET + NeoGSZxDma::STATE_SIZE;
     /// 3: + ZX-DMA (neogs-zxdma-design.md §5.9). 4: card RAM and flash left
-    /// out - large memories are not snapshotted in TTD v1 checkpoints (every
-    /// checkpoint carried up to 4.5 MB); they become TTD v2 memory regions
+    /// out - they are the engine's memory regions (a v1 checkpoint carried up
+    /// to 4.5 MB of them)
     static constexpr uint8_t TTD_LAYOUT = 4;
 
 private:
@@ -296,7 +325,27 @@ private:
     void onIntAccepted();
     void runEvents(int64_t now);
     int64_t unitsPerCycle() const { return _ticksPerCycle; }
-    void onStep()
+    // Sleeping through the firmware's idle poll loop (GSCardRunner): the bus accesses that are not plain RAM / ROM
+    // reads or the mailbox status and command reads count as side effects; the quiet events are the timer and the
+    // DAC sides (nothing the loop reads changes with them)
+    uint32_t busEffects() const { return _busEffects; }
+    bool sleepAllowed() const
+    {
+        return !_nmiPending && _resetRequest == ResetKind::None && _nextTicksPerCycle == _ticksPerCycle &&
+               !Z80CpuIntPossible(_cpu);
+    }
+    int64_t sleepHardStop() const { return std::min(_dma.nextEvent(), _zx.nextEvent()); }
+    void onStepsSkipped(uint64_t steps) { _activityCounters.cpuSteps += steps; }
+    /// One sleep, one record in each history that is on (the event trace's Idle, the execution history's idle)
+    void onSlept(uint16_t head, int64_t start, uint64_t iterations)
+    {
+        if (_portTrace.isCapturing()) [[unlikely]]
+            traceIdle(head, start, iterations);
+        recordExecIdle(head, iterations);
+    }
+    bool sleepQuietEventsBefore(int64_t end);
+    // Forced: the fast and the debug loop both call it, and an outlined call per instruction costs the fast one 4 %
+    __forceinline void onStep()
     {
         _activityCounters.cpuSteps++;
         // A GSCFG0 clock change applies from the next instruction
@@ -316,15 +365,38 @@ private:
     int64_t replayByteStepUnits() const { return 2 * 3200; }                   // two timer periods
     int64_t replayMaxByteWaitUnits() const { return 200 * 239602 * int64_t{10}; } // as the classic card, in ticks
 
-    // Z80 bus callbacks
-    static uint8_t memReadCb(Z80CPU* cpu, uint16_t addr, int m1State, void* userData);
-    static void memWriteCb(Z80CPU* cpu, uint16_t addr, uint8_t value, void* userData);
-    static uint8_t portReadCb(Z80CPU* cpu, uint16_t port, void* userData);
-    static void portWriteCb(Z80CPU* cpu, uint16_t port, uint8_t value, void* userData);
+    // Z80 bus callbacks. Never inlined: the CPU calls them through pointers anyway, and a debug callback that inlined
+    // one would give its own inlined parts (readMem, cardIn) a second site and push them out of the fast callback
+    static UNREAL_NOINLINE uint8_t memReadCb(Z80CPU* cpu, uint16_t addr, int m1State, void* userData);
+    static UNREAL_NOINLINE void memWriteCb(Z80CPU* cpu, uint16_t addr, uint8_t value, void* userData);
+    static UNREAL_NOINLINE uint8_t portReadCb(Z80CPU* cpu, uint16_t port, void* userData);
+    static UNREAL_NOINLINE void portWriteCb(Z80CPU* cpu, uint16_t port, uint8_t value, void* userData);
     static uint8_t intVectorCb(Z80CPU* cpu, void* userData);
+    // The same with the debug hooks told (setDebugHooks): the access done, then reported
+    static uint8_t memReadDebugCb(Z80CPU* cpu, uint16_t addr, int m1State, void* userData);
+    static void memWriteDebugCb(Z80CPU* cpu, uint16_t addr, uint8_t value, void* userData);
+    static uint8_t portReadDebugCb(Z80CPU* cpu, uint16_t port, void* userData);
+    static void portWriteDebugCb(Z80CPU* cpu, uint16_t port, uint8_t value, void* userData);
+    /// The catch-up: the fast loop, or the debug loop while a debugger's hooks are set (one test per run)
+    void runTo(int64_t target)
+    {
+        syncExecHistory();
+        if (_debugHooks) [[unlikely]]
+            runToDebug(target);
+        else if (execRecording()) [[unlikely]]
+            runToRecord(target);
+        else
+            _runner.runTo(target);
+    }
+    /// Out of line: the debug loop's and the execution history's code stay away from the fast loop's
+    void runToDebug(int64_t target);
+    void runToRecord(int64_t target);
 
     uint8_t readMem(uint16_t addr)
     {
+        // Flash reads are timed, #6000-#7FFF reads feed the DAC: neither is a plain read the idle loop may repeat
+        if (!_mem.plainRead(addr) || (addr & 0xE000) == 0x6000)
+            _busEffects++;
         const uint8_t value = _mem.read(addr, _runner.now());
         if ((addr & 0xE000) == 0x6000)
             dacCapture(addr, value);
@@ -347,6 +419,17 @@ private:
     void dmaStall(int64_t units) override { _runner.stall(units); }
     int64_t dmaUnitsPerCycle() const override { return _ticksPerCycle; }
     void dmaSdByteDone(uint8_t received) override { _spi.state(NeoGSSpi::SD).rx = received; }
+    void dmaStarted(NeoGSDma::Module m) override
+    {
+        if (_debugHooks) [[unlikely]]
+            _debugHooks->onEvent(GSCardEvent::DmaStart, 0, static_cast<uint8_t>(m));
+    }
+    void dmaEnded(NeoGSDma::Module m, bool finished) override
+    {
+        if (_debugHooks) [[unlikely]]
+            _debugHooks->onEvent(GSCardEvent::DmaDone, finished ? 1 : 0, static_cast<uint8_t>(m));
+    }
+    void dmaRamWritten(uint32_t offset, uint32_t length) override;
 
     // NeoGSZxDma::Host (neogs-zxdma-design.md §5.5)
     void zxCatchUp() override { flush(); }
@@ -363,6 +446,7 @@ private:
     void zxReschedule() override { reschedule(); }
     void zxLateStart(int64_t units) override;
     void zxTrace(bool write, uint32_t address, uint8_t value) override;
+    void zxRamWritten(uint32_t offset, uint8_t value) override;
 
     // Lazy sync with the host
     void flush();
@@ -377,6 +461,18 @@ private:
 
     // Audio
     void dacSideEvent(int64_t crystal);
+    /// One mixer side as the board's DAC gets it
+    int32_t mixerLevel(bool right) const
+    {
+        return _snd.mix(right, _gscfg0) * static_cast<int32_t>(_config.volume) / 16384;
+    }
+    /// One side with the mixer's channel volumes (host-side, setHostChannelGain): what the listener hears of it
+    int32_t hostMixerLevel(bool right) const
+    {
+        return _snd.mixGained(right, _gscfg0, _hostGain) * static_cast<int32_t>(_config.volume) / 16384;
+    }
+    /// Both sides after the listening choice (stereo mode): what the output stage is given
+    void listeningMix(int32_t& left, int32_t& right) const;
     int64_t blipPosition() const { return _runner.now() / TICKS_PER_CRYSTAL - _frameStartTicks / TICKS_PER_CRYSTAL; }
     int64_t blipFrameLength() const
     {
@@ -388,12 +484,13 @@ private:
     void onHostCommandWrite(uint8_t value);
 
     void traceEvent(GSTraceSide side, uint16_t port, uint8_t value, bool isOut, uint8_t channel = 0, uint8_t extraFlags = 0);
+    void traceIdle(uint16_t head, int64_t start, uint64_t iterations);
     uint32_t currentFrameNumber() const;
     void markReplayBarrier(ttd::TTDExternalEventKind kind, const char* reason);
-    bool ttdRecording() const;
     bool openSdImage(const std::string& path); // no media manager: the card opens the image itself
     SdCardSpi::Type sdType() const;
     void reselectSd();
+    void wireBusTaps();
     void serializeFixedState(uint8_t* dst) const;
     void serializeDeviceState(uint8_t* dst, bool machineVisibleOnly) const;
 
@@ -408,6 +505,14 @@ private:
     ttd::TTDRegionTracker _flashTracker;
     NeoGSInterrupts _irq;
     NeoGSSound _snd;
+    // The bus analyzer's view of the card's three SPI masters (docs/inprogress/2026-10-11-bus-analyzer): the taps
+    // sit in front of the devices, so the master's bytes and the DMA's are both seen
+    BusTap _sdTap{"neogs.sd", BusProtocol::Spi, "NeoGS SD card SPI (SD_SEND / SD_READ, SCTRL chip select, card DMA)"};
+    BusTap _sciTap{"neogs.mp3.sci", BusProtocol::Spi, "NeoGS MP3 decoder control SPI (SCI)"};
+    BusTap _sdiTap{"neogs.mp3.sdi", BusProtocol::Spi, "NeoGS MP3 decoder data SPI (SDI, no chip select)"};
+    SpiTapDevice _sdDevice{_sdTap, 0};
+    SpiTapDevice _sciDevice{_sciTap, 0};
+    SpiTapDevice _sdiDevice{_sdiTap, 0};
     NeoGSSpi _spi;
     std::unique_ptr<SdCardSpi> _sd;
 
@@ -432,6 +537,15 @@ private:
     bool _sdWriteProtect = false; // the slot's write-protect switch (SSTAT bit 2)
     std::string _sdSource;        // the attached medium's source path
     std::unique_ptr<Vs10xxDecoder> _mp3; // absent with MP3Support=none
+    /// The MP3 decoder's SCI register writes, `<slot>.mp3` (with the decoder only)
+    struct Mp3Record
+    {
+        uint64_t frame = 0;
+        uint8_t reg = 0;
+        uint16_t value = 0;
+        void ToState(StateNode& node) const;
+    };
+    std::unique_ptr<history::Registered<Mp3Record>> _mp3History;
     NeoGSDma _dma;
     NeoGSZxDma _zx{*this, _dma, _mem};
     bool _zxLateStartLogged = false;
@@ -458,6 +572,7 @@ private:
     int64_t _extraStrobeAt = 0;       // TIM_FREQ switch edge (INT64_MAX: none)
     int64_t _nextDacCrystal = 0;      // next mixer side, crystal clocks
     bool _nmiPending = false;
+    uint32_t _busEffects = 0;         // GSCardRunner::busEffects
     ResetKind _resetRequest = ResetKind::None;
 
     // Ready detection (§7.1)
@@ -467,6 +582,7 @@ private:
     // Host frame bases
     uint64_t _frameStartZxTacts = 0;
     int64_t _frameStartTicks = 0;
+    bool _frameEndCatchUp = false;  // inside handleFrameEnd's run (a card hook's edit names the frame)
     int64_t _frameTicks = 0;
 
     // Audio
@@ -485,6 +601,9 @@ private:
     bool _synthesisSuppressed = false;
     int32_t _outL = 0; // each side as the board's DAC gets it
     int32_t _outR = 0;
+    // Each side with the mixer's channel volumes (host-side, not state; read only while a gain is not unity)
+    int32_t _hostOutL = 0;
+    int32_t _hostOutR = 0;
     NeoGSConfig::StereoMode _stereoMode = NeoGSConfig::StereoMode::Separated; // listening choice, not state
     bool _frameHadActivity = false;
     bool _wasActive = false;
@@ -501,4 +620,5 @@ private:
     GSUploadCapture _upload;
     GSActivityCounters _activityCounters;
     GSPortTraceRecorder _portTrace;
+    IGSDebugHooks* _debugHooks = nullptr;  // a card CPU debugger (setDebugHooks): the debug loop and bus
 };

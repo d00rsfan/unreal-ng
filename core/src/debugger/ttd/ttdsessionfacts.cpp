@@ -4,14 +4,46 @@
 #include "debugger/ttd/engine/ttdcontainer.h"
 #include "debugger/ttd/ttdbookmarks.h"
 #include "debugger/ttd/ttdfileinfo.h"
+#include "debugger/ttd/ttdperipheralmask.h"
+#include "debugger/ttd/ttdperipheralregistry.h"
 
 namespace ttd
 {
 
 namespace
 {
-constexpr uint16_t kFactsVersion = 1;
-constexpr uint16_t kBookmarksVersion = 1;
+/// 3 (D23): the not-recorded devices as keys, no mask of the recorded ones (the session's device table lists them);
+/// 2: two masks of legacy ids as word lists (u8 count, u64 words: any u8 id); 1: one u64 each (ids 0..63). The masks of
+/// versions 1 and 2 are read: the recorded one dropped, the not-recorded one as keys {type of the id, ""}
+constexpr uint16_t kFactsVersion = 3;
+constexpr uint16_t kFactsVersionFirst = 1;
+constexpr uint16_t kFactsVersionKeys = 3;
+
+bool ReadMask(TTDByteReader& r, uint16_t version, PeripheralMask& mask)
+{
+    mask = PeripheralMask{};
+    if (version < 2)
+    {
+        uint64_t low = 0;
+        if (!r.U64(low))
+            return false;
+        mask = PeripheralMask::FromLow(low);
+        return true;
+    }
+    uint8_t words = 0;
+    if (!r.U8(words) || words == 0 || words > PeripheralMask::kWords)
+        return false;
+    for (uint8_t i = 0; i < words; ++i)
+    {
+        uint64_t value = 0;
+        if (!r.U64(value))
+            return false;
+        mask.SetWord(i, value);
+    }
+    return true;
+}
+// 1: frame, T, label. 2 (2026-11-03, agent notes): + note, tags, the context at the moment, watched ranges
+constexpr uint16_t kBookmarksVersion = 2;
 }  // namespace
 
 std::vector<uint8_t> EncodeSessionFacts(const TTDSessionFacts& facts)
@@ -23,8 +55,12 @@ std::vector<uint8_t> EncodeSessionFacts(const TTDSessionFacts& facts)
     w.U64(facts.romSignature);
     w.U64(facts.capturedAtUnixMs);
     w.Str(facts.recordedBy);
-    w.U64(facts.peripheralMask);
-    w.U64(facts.notRecordedMask);
+    w.Varint(facts.notRecorded.size());
+    for (const TTDDeviceKey& key : facts.notRecorded)
+    {
+        w.U16(static_cast<uint16_t>(key.type));
+        w.Str(key.instance);
+    }
     w.U8(facts.inputHistoryComplete ? 1 : 0);
     w.U8(facts.portJournalValid ? 1 : 0);
     w.Str(facts.portJournalOffReason);
@@ -36,12 +72,35 @@ bool DecodeSessionFacts(const std::vector<uint8_t>& bytes, TTDSessionFacts& fact
     TTDByteReader r(bytes);
     uint16_t version = 0;
     uint8_t input = 0, port = 0;
-    if (!r.U16(version) || version != kFactsVersion)
+    if (!r.U16(version) || version < kFactsVersionFirst || version > kFactsVersion)
         return false;
     TTDSessionFacts f;
     if (!r.U8(f.modelId) || !r.U16(f.modelRamPages) || !r.U64(f.romSignature) || !r.U64(f.capturedAtUnixMs) ||
-        !r.Str(f.recordedBy) || !r.U64(f.peripheralMask) || !r.U64(f.notRecordedMask) || !r.U8(input) ||
-        !r.U8(port) || !r.Str(f.portJournalOffReason))
+        !r.Str(f.recordedBy))
+        return false;
+    if (version < kFactsVersionKeys)
+    {
+        PeripheralMask recorded, notRecorded;
+        if (!ReadMask(r, version, recorded) || !ReadMask(r, version, notRecorded))
+            return false;
+        f.notRecorded = TTDPeripheralRegistry::KeysOfV1Mask(notRecorded);
+    }
+    else
+    {
+        uint64_t count = 0;
+        if (!r.Varint(count) || count > r.Left())
+            return false;
+        for (uint64_t i = 0; i < count; ++i)
+        {
+            uint16_t type = 0;
+            TTDDeviceKey key;
+            if (!r.U16(type) || !r.Str(key.instance))
+                return false;
+            key.type = static_cast<TTDDeviceType>(type);
+            f.notRecorded.push_back(std::move(key));
+        }
+    }
+    if (!r.U8(input) || !r.U8(port) || !r.Str(f.portJournalOffReason))
         return false;
     f.inputHistoryComplete = input != 0;
     f.portJournalValid = port != 0;
@@ -60,6 +119,30 @@ std::vector<uint8_t> EncodeBookmarks(const TTDBookmarkJournal& bookmarks)
         w.U64(b.time.frame);
         w.U32(b.time.tInFrame);
         w.Str(b.label);
+        w.Str(b.note);
+        w.U8(static_cast<uint8_t>(b.tags.size()));
+        for (const std::string& tag : b.tags)
+            w.Str(tag);
+        const TTDBookmarkContext& c = b.context;
+        w.U8(c.valid ? 1 : 0);
+        if (c.valid)
+        {
+            for (const uint16_t v : {c.pc, c.sp, c.af, c.bc, c.de, c.hl, c.ix, c.iy, c.codePage})
+                w.U16(v);
+            w.U8(c.iff1);
+            w.U8(c.im);
+            w.U8(c.p7FFD);
+            w.U8(c.codeKind);
+            w.Str(c.instruction);
+        }
+        w.U8(static_cast<uint8_t>(b.watches.size()));
+        for (const TTDBookmarkWatch& watch : b.watches)
+        {
+            w.U16(watch.address);
+            w.U8(watch.length);
+            w.U8(static_cast<uint8_t>(watch.bytes.size()));
+            w.Bytes(watch.bytes.data(), watch.bytes.size());
+        }
     }
     return std::move(w.bytes);
 }
@@ -69,7 +152,7 @@ bool DecodeBookmarks(const std::vector<uint8_t>& bytes, TTDBookmarkJournal& book
     TTDByteReader r(bytes);
     uint16_t version = 0;
     uint64_t count = 0;
-    if (!r.U16(version) || version != kBookmarksVersion || !r.Varint(count) || count > r.Left())
+    if (!r.U16(version) || version < 1 || version > kBookmarksVersion || !r.Varint(count) || count > r.Left())
         return false;
     TTDBookmarkJournal read;
     for (uint64_t i = 0; i < count; ++i)
@@ -77,7 +160,40 @@ bool DecodeBookmarks(const std::vector<uint8_t>& bytes, TTDBookmarkJournal& book
         TTDBookmark b;
         if (!r.U64(b.time.frame) || !r.U32(b.time.tInFrame) || !r.Str(b.label))
             return false;
-        read.Add(b);
+        if (version >= 2)
+        {
+            uint8_t tags = 0;
+            uint8_t valid = 0;
+            uint8_t watches = 0;
+            if (!r.Str(b.note) || !r.U8(tags))
+                return false;
+            b.tags.resize(tags);
+            for (std::string& tag : b.tags)
+                if (!r.Str(tag))
+                    return false;
+            if (!r.U8(valid))
+                return false;
+            TTDBookmarkContext& c = b.context;
+            c.valid = valid != 0;
+            if (c.valid)
+            {
+                for (uint16_t* v : {&c.pc, &c.sp, &c.af, &c.bc, &c.de, &c.hl, &c.ix, &c.iy, &c.codePage})
+                    if (!r.U16(*v))
+                        return false;
+                if (!r.U8(c.iff1) || !r.U8(c.im) || !r.U8(c.p7FFD) || !r.U8(c.codeKind) || !r.Str(c.instruction))
+                    return false;
+            }
+            if (!r.U8(watches))
+                return false;
+            b.watches.resize(watches);
+            for (TTDBookmarkWatch& watch : b.watches)
+            {
+                uint8_t n = 0;
+                if (!r.U16(watch.address) || !r.U8(watch.length) || !r.U8(n) || !r.Bytes(watch.bytes, n))
+                    return false;
+            }
+        }
+        read.Add(b);   // one that breaks a bound (a hand-edited file) is left out, the rest load
     }
     bookmarks.Clear();
     for (const TTDBookmark& b : read.Snapshot())
@@ -148,8 +264,13 @@ bool ReadEngineFileInfo(const ITTDByteSource& source, TTDFileInfo& info, std::st
     info.machine.modelId = facts.modelId;
     info.machine.ramPageBound = facts.modelRamPages;
     info.machine.romSignature = facts.romSignature;
-    info.machine.peripheralMask = facts.peripheralMask;
-    info.machine.notRecordedMask = facts.notRecordedMask;
+    std::vector<TTDDeviceDescriptor> devices;
+    if (!TTDSessionFile::ReadDevices(source, devices, error))
+        return false;
+    for (const TTDDeviceDescriptor& d : devices)
+        info.machine.devices.push_back({d.Key(), d.legacyId});
+    for (const TTDDeviceKey& key : facts.notRecorded)
+        info.machine.notRecordedDevices.push_back({key, PeripheralId::None});
     DescribeRecordedMachine(info.machine);
     return true;
 }

@@ -10,6 +10,8 @@ sudo apt install ./UnrealNG-Suite-Ubuntu-26.04-x86_64.deb
 
 The package contains the emulator, screen viewer, video wall, MCP bridge and their
 resources, including the MIDI sound bank and unpacked configuration disk images.
+It also includes the Stream Deck daemon and Studio, the Qt debugger, both SDL3
+terminal debuggers, and the example programs shipped by the portable packages.
 It uses the same package name and installation paths as the existing
 bundled DEB, so installing one replaces the other. Ubuntu 24.04 and Debian 13 users
 should use the existing bundled DEB; this native build is tested on Ubuntu 26.04 only.
@@ -28,12 +30,14 @@ and PulseAudio backends, are declared explicitly because they are loaded dynamic
 Unused Qt build modules do not become runtime dependencies. Apt owns these libraries
 and updates them independently of Unreal-NG.
 
-The native release enables OpenSSL for both host TLS used by emulated devices and
-Trantor. This does not change the local WebAPI's default plain HTTP listener.
+The native release enables OpenSSL for host TLS used by emulated devices.
+The local WebAPI uses plain HTTP with Trantor TLS disabled, as in the portable builds.
 
 Project-specific code remains compiled in: the patched Drogon/Trantor stack,
 the patched GIF encoder, miniz's codec/archive API, header-only helpers and emulator
-device/codec implementations. This option replaces the standard packaged dependencies;
+device/codec implementations. The Stream Deck companion's patched HID backend and
+the terminal debuggers' SDL3, FTXUI and Z80 implementation also remain compiled in,
+matching upstream's debugger builds. This option replaces the selected packaged dependencies;
 it does not claim that every third-party source has been removed. The vendored 7-Zip
 LZMA SDK is used only by tests in this mode, as a compatibility oracle for CHD streams.
 Production CHD compression uses the shared XZ library's raw LZMA1 API without an end marker.

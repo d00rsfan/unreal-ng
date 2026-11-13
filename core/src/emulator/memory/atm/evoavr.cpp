@@ -2,7 +2,6 @@
 
 #include "evoavr.h"
 
-#include <chrono>
 #include <cstring>
 #include <fstream>
 
@@ -14,10 +13,13 @@ namespace
 {
     constexpr uint8_t kExtensionFirst = 0xF0;
 
-    /// atx.h PWROFF_KEY_TIME: F12 held longer than this is the ATX power-off
+    /// atx.h PWROFF_KEY_TIME: F12 held longer than this is the ATX power-off. The AVR counts it on its own
+    /// timer, so it is emulated time: a replay and a turbo run decide the same way the recording did
     /// (not emulated); a shorter press-and-release soft-resets the Z80
-    constexpr auto kF12PowerOff = std::chrono::seconds(5);
+    constexpr uint64_t kF12PowerOffMicros = 5'000'000;
 }  // namespace
+
+EvoAvr::~EvoAvr() = default;
 
 EvoAvr::EvoAvr() : Ds12887(256)
 {
@@ -174,12 +176,11 @@ void EvoAvr::SetSdStatus(bool present, bool writeProtected)
 
 void EvoAvr::OnPcKey(PcKey key, bool pressed)
 {
-    // zx.c to_zu: a key pressed while Ctrl and Alt are both held never reaches
-    // the Z80 - it is the board's hard reset (FLAG_HARD_RESET). F12 included:
-    // the documented Right Alt + Ctrl + F12 "exit to Gluk boot". The modifiers
-    // are checked before this key's own bytes parse, so the Ctrl or Alt press
-    // itself never fires it
-    if (pressed && key != PcKey::None
+    // zx.c: Ctrl+Alt+Del is the board's hard reset (cb_ctrl_alt_del = func_reset, FLAG_HARD_RESET). Ctrl+Alt+F11
+    // and Ctrl+Alt+F12 have callbacks of their own (the egg, setup / service config), not emulated; any other
+    // key with Ctrl and Alt is a key (AltGr on Windows is Ctrl+Alt: AltGr characters must not reset). The
+    // modifiers are checked before this key's own bytes parse
+    if (pressed && key == PcKey::Delete
         && (_ps2.modifiers & (kModLeftCtrl | kModRightCtrl)) != 0
         && (_ps2.modifiers & (kModLeftAlt | kModRightAlt)) != 0
         && _resetHandler)
@@ -194,16 +195,17 @@ void EvoAvr::OnPcKey(PcKey key, bool pressed)
     {
         if (pressed)
         {
-            if (!_f12Down)
+            if (!_ps2.f12Down)
             {
-                _f12Down = true;
-                _f12Press = std::chrono::steady_clock::now();
+                _ps2.f12Down = 1;
+                _ps2.f12PressMicros = _emulatedClock ? _emulatedClock() : 0;
             }
         }
-        else if (_f12Down)
+        else if (_ps2.f12Down)
         {
-            _f12Down = false;
-            if (std::chrono::steady_clock::now() - _f12Press < kF12PowerOff && _resetHandler)
+            _ps2.f12Down = 0;
+            const uint64_t now = _emulatedClock ? _emulatedClock() : 0;
+            if (now - _ps2.f12PressMicros < kF12PowerOffMicros && _resetHandler)
                 _resetHandler(/*hardReset=*/false);
         }
     }

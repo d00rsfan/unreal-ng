@@ -1,10 +1,13 @@
 #include "stdafx.h"
 
+#include <optional>
+
 #include "modelswitch.h"
 
 #include <algorithm>
 
 #include "common/stringhelper.h"
+#include "emulator/actions/targetstate.h"
 #include "emulator/config.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatorcontext.h"
@@ -134,11 +137,10 @@ ModelSwitchResult ModelSwitch::Run(const ModelSwitchRequest& request)
         return out;
     }
 
-    // The old machine stops executing; stranded writes are dealt with while it
+    // The old machine stops executing (its CPU held: Emulator::CpuHold); stranded writes are dealt with while it
     // can still go on (a failed save leaves it as it was)
-    const bool wasRunning = old->IsRunning() && !old->IsPaused();
-    if (wasRunning)
-        old->Pause(false);
+    std::optional<Emulator::CpuHold> hold;
+    hold.emplace(*old, "model switch");
     for (const SlotInfo& info : out.stranded)
     {
         MediaResult kept = MediaResult::Success();
@@ -149,8 +151,7 @@ ModelSwitchResult ModelSwitch::Run(const ModelSwitchRequest& request)
         if (!kept.Ok())
         {
             emulators.RemoveEmulator(created->GetId());
-            if (wasRunning)
-                old->Resume(false);
+            hold.reset();
             out.result = MediaResult::Fail(kept.error, info.descriptor.id + ": " + kept.message);
             return out;
         }
@@ -158,12 +159,16 @@ ModelSwitchResult ModelSwitch::Run(const ModelSwitchRequest& request)
 
     if (old->IsRunning())
         old->Stop();
+    hold.reset();  // the old machine is stopped: nothing left to hold
     MediaTransfer transfer = from.TakeMediaSet();
     if (request.beforeRelease)
         request.beforeRelease(*old);
     const bool wasSelected = emulators.GetSelectedEmulatorId() == old->GetId();
     const std::string oldId = old->GetId();
     old.reset();
+    // Views showing the old machine and `instance:` pins on it move to the new one (targeting.md §5) before the
+    // removal would let them fall back
+    actions::TargetState::Instance().InstanceReplaced(oldId, created->GetId());
     emulators.RemoveEmulator(oldId);
 
     out.media = to.AdoptMediaSet(std::move(transfer));
@@ -175,4 +180,26 @@ ModelSwitchResult ModelSwitch::Run(const ModelSwitchRequest& request)
     out.result.report = out.slotCarry.lines;
     out.result.report.insert(out.result.report.end(), out.media.lines.begin(), out.media.lines.end());
     return out;
+}
+
+ModelSwitch::RunStateBefore ModelSwitch::RunStateBefore::Of(Emulator& emulator)
+{
+    RunStateBefore state;
+    state.running = emulator.IsRunning() && !emulator.IsPaused();
+    state.paused = emulator.IsRunning() && emulator.IsPaused();
+    return state;
+}
+
+bool ModelSwitch::StartAsBefore(Emulator& fresh, const RunStateBefore& before, const std::function<void()>& start)
+{
+    if (!before.running && !before.paused)
+        return false;
+    if (start)
+        start();
+    else
+        fresh.StartAsync();
+    // The start's Run intent is queued first: this pause is newer and wins at the loop's first park
+    if (before.paused)
+        fresh.Pause(execution::Requester{execution::Origin::Lifecycle, {}}, "restart");
+    return true;
 }

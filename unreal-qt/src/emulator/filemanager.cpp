@@ -14,6 +14,8 @@ PatternCategoryMap FileManager::_extensions =
     { "z80", SupportedFileCategoriesEnum::FileSnapshot },
     { "szx", SupportedFileCategoriesEnum::FileSnapshot },
     { "spg", SupportedFileCategoriesEnum::FileSnapshot },  // TS-Conf program (the TS-Conf machine only)
+    { "nex", SupportedFileCategoriesEnum::FileSnapshot },  // ZX Spectrum Next program (the Next only)
+    { "snx", SupportedFileCategoriesEnum::FileSnapshot },  // NextZXOS snapshot (an .sna for the Next)
     { "rzx", SupportedFileCategoriesEnum::FileSnapshot },  // input recording, played from its start snapshot
 
     { "trd", SupportedFileCategoriesEnum::FileDisk },
@@ -25,6 +27,11 @@ PatternCategoryMap FileManager::_extensions =
     { "mgt", SupportedFileCategoriesEnum::FileDisk },
     { "img", SupportedFileCategoriesEnum::FileDisk },
     { "ima", SupportedFileCategoriesEnum::FileDisk },
+    { "mb2", SupportedFileCategoriesEnum::FileDisk },
+    { "mbd", SupportedFileCategoriesEnum::FileDisk },
+    { "d40", SupportedFileCategoriesEnum::FileDisk },
+    { "d80", SupportedFileCategoriesEnum::FileDisk },
+    { "pro", SupportedFileCategoriesEnum::FileDisk },
 
     { "gz", SupportedFileCategoriesEnum::FileArchive },
     { "tar", SupportedFileCategoriesEnum::FileArchive },

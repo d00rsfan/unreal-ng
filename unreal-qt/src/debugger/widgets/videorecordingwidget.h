@@ -15,21 +15,38 @@
 #include <QHash>
 #include <QTimer>
 
+#include <QPointer>
+
+#include "widgets/recordingplan.h"
+
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <string>
 
+class DeviceScreenWrapper;
+class Emulator;
 class EmulatorContext;
+struct RecordingSettings;
+class WindowRecorder;
 
 class VideoRecordingWidget : public QWidget
 {
     Q_OBJECT
 
 public:
-    explicit VideoRecordingWidget(EmulatorContext* context, QWidget* parent = nullptr);
+    explicit VideoRecordingWidget(std::shared_ptr<Emulator> emulator, QWidget* parent = nullptr);
     ~VideoRecordingWidget();
 
-    /// Update the emulator context (call when emulator instance changes)
-    void setContext(EmulatorContext* context);
+    /// The active machine (call when the emulator instance changes); held, so a removed one stays readable until
+    /// the GUI moves on (BUGS.md #11)
+    void setEmulator(std::shared_ptr<Emulator> emulator);
+
+    /// The window recorder (recording the window as it draws it, with the CRT shaders) and the window's current
+    /// screen: with them the Window source works here exactly as in the recording panel
+    void setWindowRecording(WindowRecorder* recorder, std::function<DeviceScreenWrapper*()> screen);
+    /// Show a window recording another recording UI (the panel, the WebAPI) started or finished
+    void syncWindowRecordingState();
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -47,6 +64,7 @@ private slots:
     void onUpdateStats();
     void onIncludeAudioChanged(int state);
     void onProfileChanged();
+    void onSourceChanged();
     void onMultiTrackConfigure();
     void onBenchmark();
 
@@ -58,6 +76,20 @@ private:
     void refreshFromContext();
     void updateRealtimeEstimate();
     void updateRecordingControls();
+
+    // The options shared with the recording panel (RecordingSettings): every control saves its change at once and
+    // follows the changes of the other UI
+    void saveFromControls();
+    void applySharedSettings();
+    void applyFormatFromSettings(const RecordingSettings& settings);
+    void updateSourceAvailability();
+    static QString codecIdOf(const QString& codecText);
+    QString currentCodecId() const;
+    bool windowSourceAvailable() const;
+    bool windowSourceChosen() const;  ///< the Window source is selected (and the format takes it)
+    void startWindowRecording(const QString& filename, const QString& container, const QString& codec, bool audio);
+    void stopWindowRecording();
+    void updateWindowRecordingStats();
     void populateCodecCombos();
     void populateContainers();
     void populateAudioCodecs();
@@ -70,20 +102,21 @@ private:
     /// Check if audio-only mode is selected (Audio tab active)
     bool isAudioOnlyMode() const;
 
-    /// Verify _context still points to a live emulator; clear it if the
-    /// emulator was destroyed (raw pointer can dangle after Release()).
+    /// Drop the held machine once it was removed (retired): the controls go idle
     void validateContext();
 
     /// Refresh the audio tab's capture-rate readout (core rate = the rate
     /// audio-only recordings capture at; device native rate for reference)
     void updateAudioRateInfo();
 
-    /// Look up the RecordingManager for the emulator we started recording
-    /// with. Returns nullptr if that emulator was destroyed.
-    /// When not recording, falls back to the active _context.
-    EmulatorContext* recordingContext() const;
+    /// The emulator we started recording with (a reference of the caller's own: it stays readable for the call).
+    /// nullptr if that emulator was removed. When not recording, the active one
+    std::shared_ptr<Emulator> recordingEmulator() const;
+    /// The active machine's context, per call (never stored)
+    EmulatorContext* context() const;
 
     // Encoder capability matrix (what the selected backend can actually produce)
+    recordingplan::Environment environment() const;
     QStringList containersForBackend() const;
     QStringList videoCodecsFor(const QString& container) const;
     QStringList audioCodecsFor(const QString& container) const;
@@ -101,8 +134,8 @@ private:
     void loadBenchmarkResults();
     void saveBenchmarkResults();
 
-    EmulatorContext* _context = nullptr;
-    std::string _contextEmulatorId;     // Emulator ID for _context (for staleness check)
+    std::shared_ptr<Emulator> _emulator;
+    std::string _contextEmulatorId;     // Emulator ID of _emulator
     std::string _recordingEmulatorId;   // Emulator ID we started recording with
     QTimer* _statsTimer = nullptr;
 
@@ -130,6 +163,7 @@ private:
     QComboBox* _captureCombo = nullptr;
     QComboBox* _sizeCombo = nullptr;
     QComboBox* _profileCombo = nullptr;  ///< native / 1080p / 1440p / 4K (fixed frame, sharp scale)
+    QComboBox* _sourceCombo = nullptr;   ///< Raw frame buffer / Window (as drawn: shaders, temporal processing)
 
     // Estimation
     QLabel* _estimateLabel = nullptr;
@@ -164,6 +198,13 @@ private:
     QComboBox* _dsdPunchAmountCombo = nullptr;
 
     bool _signalsConnected = false;
+
+    // Shared options and the window recording
+    bool _syncing = false;    ///< the controls are being set from the shared settings: no saving back
+    bool _selfSave = false;   ///< this dialog is saving: it does not reload its own change
+    QPointer<WindowRecorder> _windowRecorder;
+    std::function<DeviceScreenWrapper*()> _windowScreen;
+    bool _windowRecording = false;  ///< the running recording is the window's, not the recording manager's
 
     // Cached encoder availability (detected in refreshFromContext / onDetectFFmpeg)
     bool _nativeAvailable = false;

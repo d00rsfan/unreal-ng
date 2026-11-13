@@ -14,7 +14,7 @@
 ///   1. TTD_Bookmarks_Test — pure journal (no emulator): Add validation
 ///      (empty / overlong / duplicate labels), time-sorted Snapshot, Find,
 ///      Remove, DropAfter boundary semantics, Clear.
-///   2. TTD_Bookmarks_API_Test — TimeTravelManager integration: bounds
+///   2. TTD_Bookmarks_API_Test — TimeTravelController integration: bounds
 ///      validation, the acceptance flows, lifecycle (StartRecording /
 ///      InvalidateSession / ResumeRecordingFrom / DeserializeSession) and
 ///      .ttd round-trip.
@@ -30,14 +30,14 @@
 #include "common/modulelogger.h"
 #include "debugger/ttd/ttdbookmarks.h"
 #include "debugger/ttd/ttdexternalevents.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/memory/memory.h"
 #include "emulator/platform.h"
 
-using SeekHaltReason = ttd::TimeTravelManager::TTDSeekHaltReason;
-using SeekResult     = ttd::TimeTravelManager::TTDSeekResult;
+using SeekHaltReason = ttd::TimeTravelController::TTDSeekHaltReason;
+using SeekResult     = ttd::TimeTravelController::TTDSeekResult;
 
 // ===========================================================================
 // Suite 1 — pure journal unit tests (no emulator, no manager).
@@ -187,7 +187,7 @@ TEST_F(TTD_Bookmarks_Test, Clear_ResetsToEmpty)
 }
 
 // ===========================================================================
-// Suite 2 — TimeTravelManager integration.
+// Suite 2 — TimeTravelController integration.
 // ===========================================================================
 
 class TTD_Bookmarks_API_Test : public ::testing::Test
@@ -195,7 +195,7 @@ class TTD_Bookmarks_API_Test : public ::testing::Test
 protected:
     Emulator* _emulator = nullptr;
     EmulatorContext* _context = nullptr;
-    ttd::TimeTravelManager* _ttd = nullptr;
+    ttd::TimeTravelController* _ttd = nullptr;
     FeatureManager* _fm = nullptr;
     Memory* _memory = nullptr;
 
@@ -205,7 +205,7 @@ protected:
         ASSERT_TRUE(_emulator->Init());
         _context = _emulator->GetContext();
         ASSERT_NE(_context, nullptr);
-        _ttd = _context->pTimeTravelManager;
+        _ttd = _context->pTimeTravelController;
         ASSERT_NE(_ttd, nullptr);
         _memory = _context->pMemory;
         ASSERT_NE(_memory, nullptr);
@@ -362,12 +362,14 @@ TEST_F(TTD_Bookmarks_API_Test, SeekToBookmark_AfterRemove_Fails)
 
 TEST_F(TTD_Bookmarks_API_Test, SeekToBookmark_BehindRealMarker_HaltsAtMarkerNotBookmark)
 {
+    // The engine replays tape and disk from its journals: a marker that stops a seek is one without its data
+    // (a debugger edit that carries no bytes, a reset, an unclassified marker)
     // Same timeline shape as TTD_ExternalEvents_Seek_Test.IntraFrame_MarkerInInterval_
     // StopsAtMarker: checkpoint at (1,0), marker at (1,M), timeline past it.
     ASSERT_TRUE(_ttd->StartRecording());
     RunFrames(1);
     _emulator->RunTStates(500, true);
-    _ttd->RecordExternalEvent(ttd::TTDExternalEventKind::DiskWrite, "wd1793 write");
+    _ttd->RecordExternalEvent(ttd::TTDExternalEventKind::DebuggerEdit, "debugger poke");
     RunFrames(2);
     _ttd->StopRecording();
 
@@ -387,7 +389,7 @@ TEST_F(TTD_Bookmarks_API_Test, SeekToBookmark_BehindRealMarker_HaltsAtMarkerNotB
     EXPECT_EQ(r.haltReason, SeekHaltReason::ExternalEvent);
     EXPECT_EQ(r.arrivedAt.frame, 1u);
     EXPECT_EQ(r.arrivedAt.tInFrame, markerT);
-    EXPECT_STREQ(r.blockingMarker.reason, "wd1793 write");
+    EXPECT_STREQ(r.blockingMarker.reason, "debugger poke");
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +424,7 @@ TEST_F(TTD_Bookmarks_API_Test, StopRecording_KeepsBookmarks_FreshStartRecordingC
     EXPECT_TRUE(_ttd->GetBookmarks().empty());
 }
 
-TEST_F(TTD_Bookmarks_API_Test, ResumeFromPast_DropsFutureBookmarks_KeepsPast)
+TEST_F(TTD_Bookmarks_API_Test, ResumeFromPast_KeepsEveryBookmark)
 {
     ASSERT_TRUE(_ttd->StartRecording());
     RunFrames(5);
@@ -435,14 +437,18 @@ TEST_F(TTD_Bookmarks_API_Test, ResumeFromPast_DropsFutureBookmarks_KeepsPast)
     ASSERT_TRUE(_ttd->SeekTo({2, 0}, &r));
     ASSERT_EQ(_ttd->GetState(), ttd::TTDSessionState::Detached);
 
-    // Resuming from (2,0) rewinds the timeline: bookmarks strictly after the
-    // resume point describe history that no longer exists.
+    // Resuming from (2,0) forks a branch: the old future, with the bookmark in it, stays on the trunk
     ASSERT_TRUE(_ttd->ResumeRecordingFrom({2, 0}));
+    EXPECT_EQ(_ttd->Branches().Count(), 2u);
 
-    const auto bookmarks = _ttd->GetBookmarks();
-    ASSERT_EQ(bookmarks.size(), 1u);
+    const auto bookmarks = _ttd->GetAllBookmarks();
+    ASSERT_EQ(bookmarks.size(), 2u);
     EXPECT_EQ(bookmarks[0].label, "early");
-    EXPECT_EQ(bookmarks[0].time.frame, 1u);
+    EXPECT_EQ(bookmarks[1].label, "late");
+    // The new branch's lineage holds the early one; the late one lies on the trunk's old future
+    const auto lineage = _ttd->GetBookmarks();
+    ASSERT_EQ(lineage.size(), 1u);
+    EXPECT_EQ(lineage[0].label, "early");
 }
 
 // ---------------------------------------------------------------------------

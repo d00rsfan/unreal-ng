@@ -4,6 +4,7 @@
 #include <cctype>
 
 #include "debugger/breakpoints/breakpointmanager.h"
+#include "emulator/memory/devicememory.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/platform.h"
 
@@ -29,6 +30,8 @@ struct View
     Memory* memory = nullptr;
     const uint8_t* page = nullptr;
     std::vector<const uint8_t*> ramPages;
+    std::vector<uint8_t> copy;   // Region: the region's bytes (read once through DeviceMemory)
+    std::string regionName;      // Region: its canonical name
     MemorySearchRequest::Space space = MemorySearchRequest::Space::Cpu;
     uint32_t size = 0;
 
@@ -46,7 +49,10 @@ struct View
 
 uint32_t RamPageCount(EmulatorContext* context)
 {
-    return context && context->config.ramsize ? context->config.ramsize / 16 : MAX_RAM_PAGES;
+    if (!context || !context->config.ramsize)
+        return MAX_RAM_PAGES;
+    // The 16K and 48K boards number their RAM as the 128K does (5, 2, 0 at #4000, #8000, #C000)
+    return std::max<uint32_t>(context->config.ramsize / 16, 8);
 }
 
 const uint8_t* PageHost(EmulatorContext* context, MemoryBankModeEnum type, uint32_t page)
@@ -143,9 +149,20 @@ bool ParseSpace(const std::string& text, MemorySearchRequest& request, std::stri
         request.space = MemorySearchRequest::Space::AllRam;
         return true;
     }
+    // ram5 / rom2 / cache0 (and a bad page number of those kinds) is a page; any other name is a region
+    const size_t digits = lower.find_first_of("0123456789");
+    const std::string kind = lower.substr(0, digits);
+    const bool pageLike = digits != std::string::npos && lower.find_first_not_of("0123456789", digits) == std::string::npos &&
+                          (kind == "ram" || kind == "rom" || kind == "cache" || kind == "misc");
+    if (!pageLike)
+    {
+        request.space = MemorySearchRequest::Space::Region;
+        request.region = lower;
+        return true;
+    }
     if (!BreakpointManager::ParsePageSpec(lower, request.page, request.pageType, error))
     {
-        error = "space must be cpu, ram (every RAM page) or a page (ram5, rom2, cache0); " + error;
+        error = "space must be cpu, ram (every RAM page), a page (ram5, rom2, cache0) or a memory region; " + error;
         return false;
     }
     request.space = MemorySearchRequest::Space::Page;
@@ -158,8 +175,30 @@ std::string SpaceName(const MemorySearchRequest& request)
     {
         case MemorySearchRequest::Space::Cpu: return "cpu";
         case MemorySearchRequest::Space::AllRam: return "ram";
+        case MemorySearchRequest::Space::Region: return request.region;
         default: return std::string(BreakpointManager::PageKindName(request.pageType)) + std::to_string(request.page);
     }
+}
+
+std::vector<uint32_t> FindInBuffer(const uint8_t* data, size_t size, const std::vector<uint8_t>& pattern,
+                                   const std::vector<uint8_t>& mask, unsigned max)
+{
+    std::vector<uint32_t> out;
+    const size_t n = pattern.size();
+    if (data == nullptr || n == 0 || n > size || (!mask.empty() && mask.size() != n))
+        return out;
+    for (size_t at = 0; at + n <= size && out.size() < max; ++at)
+    {
+        bool matched = true;
+        for (size_t i = 0; i < n && matched; ++i)
+        {
+            const uint8_t m = mask.empty() ? 0xFF : mask[i];
+            matched = ((data[at + i] ^ pattern[i]) & m) == 0;
+        }
+        if (matched)
+            out.push_back(static_cast<uint32_t>(at));
+    }
+    return out;
 }
 
 MemorySearchResult Search(EmulatorContext* context, const MemorySearchRequest& request)
@@ -204,6 +243,21 @@ MemorySearchResult Search(EmulatorContext* context, const MemorySearchRequest& r
                 return result;
             }
             view.size = PAGE_SIZE;
+            break;
+        }
+        case MemorySearchRequest::Space::Region:
+        {
+            std::string error;
+            IDeviceMemoryRegion* region = DeviceMemory::Find(context, request.region, &error);
+            if (!region || !DeviceMemory::Read(context, request.region, 0, region->Size(), view.copy, error))
+            {
+                result.error = "space must be cpu, ram, a page (ram5, rom2, cache0) or a memory region: " + error;
+                return result;
+            }
+            view.space = MemorySearchRequest::Space::Page;   // read like a page, from the copy
+            view.page = view.copy.data();
+            view.size = region->Size();
+            view.regionName = region->Name();
             break;
         }
         case MemorySearchRequest::Space::AllRam:
@@ -268,6 +322,11 @@ MemorySearchResult Search(EmulatorContext* context, const MemorySearchRequest& r
             match.address = at;
             match.pageType = request.pageType;
             match.page = request.page;
+        }
+        else if (request.space == MemorySearchRequest::Space::Region)
+        {
+            match.address = at;
+            match.region = view.regionName;
         }
         else
         {
@@ -351,7 +410,12 @@ StateNode ToState(const MemorySearchRequest& request, const MemorySearchResult& 
     for (const MemorySearchMatch& m : result.matches)
     {
         StateNode match = StateNode::Object();
-        if (m.page < 0)
+        if (!m.region.empty())
+        {
+            match["region"] = m.region;
+            match["offset"] = static_cast<uint64_t>(m.address);
+        }
+        else if (m.page < 0)
             match["address"] = static_cast<uint64_t>(m.address);
         else
         {

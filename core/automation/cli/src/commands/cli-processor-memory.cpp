@@ -12,7 +12,6 @@
 
 #include <common/dumphelper.h>
 #include <common/filehelper.h>
-#include <debugger/ttd/timetravelmanager.h>  // TimeTravelManager (Item 6 markers)
 #include <emulator/emulator.h>
 #include <emulator/emulatormanager.h>
 #include <emulator/emulatorcontext.h>
@@ -43,6 +42,10 @@ void CLIProcessor::HandleMemory(const ClientSession& session, const std::vector<
         session.SendResponse("No emulator selected. Use 'select <id>' or 'status' to see available emulators.");
         return;
     }
+    // --cpu gs / ms: the sound card CPU's view (cli-processor-cardcpu.cpp)
+    if (HandleCardCpuCommand(session, *emulator, "memory", args,
+                             [&](const std::vector<std::string>& rest) { HandleMemory(session, rest); }))
+        return;
 
     if (args.empty())
     {
@@ -74,7 +77,11 @@ void CLIProcessor::HandleMemory(const ClientSession& session, const std::vector<
     {
         // A tool edit (Emulator::EditMemoryFromTool): one event per command with
         // the bytes it wrote, so a TTD replay reproduces it (D9)
-        emulator->EditMemoryFromTool("CLI memory write", [&]() { HandleMemoryWrite(session, memory, args); });
+        const std::string refused =
+            emulator->EditMemoryFromTool(Emulator::ToolEdit::Of("CLI memory write", "memory"),
+                                         [&]() { HandleMemoryWrite(session, memory, args); });
+        if (!refused.empty())
+            session.SendResponse("Error: " + refused + NEWLINE);
     }
     else if (subcommand == "dump")
     {
@@ -142,6 +149,8 @@ void CLIProcessor::ShowMemoryHelp(const ClientSession& session)
     oss << "Z80 Address Space:" << NEWLINE;
     oss << "  memory read <addr> [len]          - Read from Z80 address space" << NEWLINE;
     oss << "  memory write <addr> <bytes...>    - Write to Z80 address space" << NEWLINE;
+    oss << "  ... --cpu gs|ms                   - The sound card CPU's view (read, write, info / map: its windows)"
+        << NEWLINE;
     oss << NEWLINE;
     oss << "Device memory regions (the Sprinter's video RAM 'vram'):" << NEWLINE;
     oss << "  memory regions                                    - List the regions" << NEWLINE;
@@ -1114,6 +1123,10 @@ void CLIProcessor::HandleRegisters(const ClientSession& session, const std::vect
         session.SendResponse("No emulator selected. Use 'select <id>' or 'status' to see available emulators.");
         return;
     }
+    // --cpu gs / ms: the sound card CPU's registers (cli-processor-cardcpu.cpp)
+    if (HandleCardCpuCommand(session, *emulator, "registers", args,
+                             [&](const std::vector<std::string>& rest) { HandleRegisters(session, rest); }))
+        return;
 
     // Get the Z80 state from the emulator
     Z80State* z80State = emulator->GetZ80State();
@@ -1132,6 +1145,7 @@ void CLIProcessor::HandleRegisters(const ClientSession& session, const std::vect
         ss << "  reg get <name>           - Get single register" << NEWLINE;
         ss << "  reg <name> <value>       - Set register" << NEWLINE;
         ss << "  reg set <name> <value>   - Set register" << NEWLINE;
+        ss << "  ... --cpu gs|ms          - The sound card CPU's (General Sound / NeoGS, MultiSound)" << NEWLINE;
         ss << NEWLINE;
         ss << "8-bit registers:  A, B, C, D, E, H, L, F, I, R" << NEWLINE;
         ss << "                  A', B', C', D', E', H', L', F' (alternate)" << NEWLINE;
@@ -1202,13 +1216,17 @@ void CLIProcessor::HandleRegisters(const ClientSession& session, const std::vect
             }
 
             const Z80::RegisterInfo* regInfo = Z80::FindRegister(regName);
-            if (regInfo && Z80::SetRegisterValue(z80State, regName, value))
+            std::string refused;
+            if (regInfo && emulator->SetRegisterFromTool("cli register", regName, value, &refused))   // a tool edit
             {
-                emulator->NoteDebugChange();   // the debugger snapshot's seq
                 std::stringstream ss;
                 ss << "Set " << regName << " = 0x" << std::hex << std::uppercase << std::setfill('0');
                 ss << std::setw(regInfo->is16bit ? 4 : 2) << value << NEWLINE;
                 session.SendResponse(ss.str());
+            }
+            else if (!refused.empty())
+            {
+                session.SendResponse("Error: " + refused + NEWLINE);
             }
             else if (regInfo)
             {
@@ -1236,13 +1254,17 @@ void CLIProcessor::HandleRegisters(const ClientSession& session, const std::vect
                     return;
                 }
 
-                if (Z80::SetRegisterValue(z80State, firstArg, value))
+                std::string refused;
+                if (emulator->SetRegisterFromTool("cli register", firstArg, value, &refused))   // a tool edit
                 {
-                    emulator->NoteDebugChange();   // the debugger snapshot's seq
                     std::stringstream ss;
                     ss << "Set " << firstArg << " = 0x" << std::hex << std::uppercase << std::setfill('0');
                     ss << std::setw(is16bit ? 4 : 2) << value << NEWLINE;
                     session.SendResponse(ss.str());
+                }
+                else if (!refused.empty())
+                {
+                    session.SendResponse("Error: " + refused + NEWLINE);
                 }
                 else
                 {
@@ -1480,7 +1502,6 @@ void CLIProcessor::HandleMemCounters(const ClientSession& session, const std::ve
         bool isROM = (bank < 2) ? (bank == 0 ? memory->IsBank0ROM() : memory->GetMemoryBankMode(bank) == BANK_ROM)
                                 : false;  // Banks 2-3 are always RAM
 
-        uint16_t page = memory->GetPageForBank(bank);
         const char* type = isROM ? "ROM" : "RAM";
         std::string bankName = memory->GetCurrentBankName(bank);
 
@@ -1799,7 +1820,7 @@ void CLIProcessor::HandleCallTrace(const ClientSession& session, const std::vect
 void CLIProcessor::HandleFind(const ClientSession& session, const std::vector<std::string>& args)
 {
     static const char* const kUsage =
-        "Usage: find <hex pattern, ?? = any byte> [--space cpu|ram|ram5|rom2|cache0] [--mask <hex>] [--from N] [--to N] "
+        "Usage: find <hex pattern, ?? = any byte> [--space cpu|ram|ram5|rom2|cache0|<region>] [--mask <hex>] [--from N] [--to N] "
         "[--align 1|2] [--max N]";
     auto emulator = GetSelectedEmulator(session);
     if (!emulator)
@@ -1873,7 +1894,9 @@ void CLIProcessor::HandleFind(const ClientSession& session, const std::vector<st
     for (const MemorySearchMatch& m : result.matches)
     {
         // The address (a page match: page:offset), then the context from context_start: 4 before, the match, 4 after
-        if (m.page < 0)
+        if (!m.region.empty())
+            ss << "  " << m.region << ":$" << std::setw(5) << m.address << ":";
+        else if (m.page < 0)
             ss << "  $" << std::setw(4) << m.address << ":";
         else
             ss << "  " << BreakpointManager::PageKindName(static_cast<MemoryBankModeEnum>(m.pageType)) << std::dec << m.page

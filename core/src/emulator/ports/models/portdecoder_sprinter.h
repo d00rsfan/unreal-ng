@@ -9,13 +9,16 @@
 #include "emulator/io/rtc/ds12887.h"
 #include "emulator/io/sprinter/isa/sprinterisabus.h"
 #include "emulator/io/z84c15/z84c15engine.h"
+#include "emulator/sound/chips/chipwritehistory.h"
 #include "emulator/machineeventjournal.h"
 #include "emulator/memory/sprinter/sprinteraccelerator.h"
 #include "emulator/memory/sprinter/sprinterwaits.h"
 #include "emulator/ports/models/sprinter/sprinterinput.h"
 #include "emulator/ports/models/sprinter/sprinterpldconfiguration.h"
 #include "emulator/ports/models/sprinter/sprinterpldstate.h"
+#include "emulator/ports/models/sprinter/sprinterstatetransferhost.h"
 #include "emulator/ports/portdecoder.h"
+#include "emulator/sound/chips/gs/gsdebughooks.h"
 #include "emulator/sound/sprinter/covoxblaster.h"
 #include "emulator/video/sprinter/sprinterintsource.h"
 #include "emulator/video/sprinter/sprintervideoram.h"
@@ -102,12 +105,8 @@ public:
     bool IsPagingLocked() const override { return false; }
     /// 3.5 or 21 MHz
     uint8_t TtdClockUnits() const override { return 6; }
-    /// The IM2 vector (the Z84C15 daisy chain, the PLD's INT answering #FF) and the stepped engines (PLD
-    /// resets, the loader watchdog, the CTC) follow the checkpointed state and the TTD input journal only
-    /// (s7-ttd-outcome.md): the port journals record on the Sprinter
-    bool TtdEnginesSealed() const override { return true; }
     /// A session recorded with another ISA slot population is refused (blob 33's kinds against the fitted cards)
-    bool TtdSessionMatches(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs, std::string& why) const override;
+    bool TtdSessionMatches(const ttd::TTDDeviceStates& states, std::string& why) const override;
     /// A ZX-bus only through an ISA ZX-bus adapter ([ISA] SlotN=ZXBUS; 2026-10-02-sprinter-isa/tdd.md §6, phase I2):
     /// the General Sound / NeoGS of [SOUND] GSType is fitted only then. The adapter passes I/O cycles only, so
     /// no ZX-bus card sees the Sprinter's memory cycles (the NeoGS ZX-DMA cannot install)
@@ -125,9 +124,9 @@ public:
     /// alone: STEP and DRQ never change them, [Beta128] TurboVG= cannot override them
     FdcClockPolicy DefaultFdcClockPolicy() const override { return FdcClockPolicy::Latched; }
     /// Code #15 (port #FF in TR-DOS, #1F / #0F outside it) carries the Kempston bits
-    bool HasKempstonJoystick() const override { return true; }
+    bool BoardHasKempstonJoystick() const override { return true; }
 
-    std::vector<ttd::PeripheralId> GetTTDModelStateIds() const override;
+    std::vector<ttd::TTDDeviceType> GetTTDModelStateTypes() const override;
     /// Port code #58 reads the board mouse (SprinterInput::ReadMouseView; this debug read: PeekMouseView)
     bool PeekMouseRegister(uint8_t reg, uint8_t& value) const override
     {
@@ -149,6 +148,8 @@ public:
     /// #3D13 (ToBios3D13), where the port table's "DOS on" half answers
     void BeforeMachineM1(uint16_t address) override;
     void OnMachineM1(uint16_t address) override { (void)address; }
+    /// BeforeMachineM1 would not move the DOS signal
+    bool RepeatM1IsInert(uint16_t address) const override;
     /// endregion
 
     /// region <IMachineStepHook: PLD-driven CPU resets, the loader watchdog>
@@ -163,6 +164,7 @@ public:
     /// The daisy chain took / ended an interrupt: the ISA slot report counts and journals the PIO port B ones
     void OnChipAcknowledge(uint8_t vector) override;
     void OnChipReti() override;
+    void OnBoardAcknowledge(uint8_t vector) override;
     /// When the step hook next catches the cards up (base T-states, UINT64_MAX: never): set while the PIO waits for
     /// an ISA interrupt (port B in bit mode, interrupt enabled, an IRQ bit monitored) and a card has a timed event
     uint64_t IsaLineDeadline() const { return _isaDeadline; }
@@ -170,6 +172,8 @@ public:
 
     /// region <PLD state and parts>
 public:
+    /// A Spectrum state moves into / out of the ZX mode the machine runs, behind its PLD cells (MachineStateTransfer)
+    const IStateTransferHost* GetStateTransferHost() const override { return &SprinterStateTransferHost::Instance(); }
     SprinterPldState& GetPldState() { return _pld; }
     const SprinterPldState& GetPldState() const { return _pld; }
     SprinterVideoRam& GetVideoRam() { return _vram; }
@@ -179,6 +183,8 @@ public:
     void CollectMemoryRegions(std::vector<IDeviceMemoryRegion*>& out) override { out.push_back(&_vramRegion); }
     SprinterIntSource& GetIntSource() { return _intSource; }
     Z84Lib::Z84C15& GetZ84() { return _z84; }
+    /// The Z84C15 engine the CPU runs on (null before the Z80 exists)
+    Z84C15Engine* GetCpuEngine() { return _cpuEngine.get(); }
     SprinterInput& GetInput() { return _input; }
     /// The two ISA-8 slots (Sprinter ISA tdd §4): window 3 in ISA mode reaches them, code #1B writes the latch
     SprinterIsaBus& GetIsaBus() { return _isaBus; }
@@ -337,8 +343,11 @@ private:
     void NoteModuleBeforeLoad();
     static constexpr uint8_t kNoModule = 0xFF;
 
-    /// The journal is on and the machine runs live (a TTD replay re-executes history: nothing is noted)
-    bool JournalOn() const { return _journal.Enabled() && !_context->ttdReplayActive; }
+    /// The journal is on, or an event breakpoint listens (pld_event), and the machine runs live (a TTD replay
+    /// re-executes history: nothing is noted)
+    bool JournalOn() const { return (_journal.Enabled() || _context->machineEventWatch) && !_context->ttdReplayActive; }
+    /// A machine event for the main CPU's event breakpoints (platform-debugging P7), while one listens
+    void NoteMachineEvent(GSCardEvent kind, uint8_t value, int arg = -1);
     /// Append an event at the current frame, base T and `pc`
     void JournalEvent(const char* kind, uint16_t pc, int port, int value, int previous, std::string text,
                       std::vector<std::string> details = {});
@@ -373,6 +382,19 @@ private:
     SprinterInput _input{_context, _z84, _intSource, _pld};
     /// The Z84C15 as the CPU's engine (created once the Z80 exists, installed by InstallHooks)
     std::unique_ptr<Z84C15Engine> _cpuEngine;
+    /// The engine's fused bus: this machine's memory in one call per access (SprinterMemory::FusedRead / FusedWrite)
+    class FastBus final : public IZ84FastBus
+    {
+    public:
+        explicit FastBus(PortDecoder_Sprinter& owner) : _owner(owner) {}
+        bool Matches() override;
+        uint8_t Read(uint16_t addr, bool isExecution) override;
+        void Write(uint16_t addr, uint8_t value) override;
+
+    private:
+        PortDecoder_Sprinter& _owner;
+    };
+    FastBus _fastBus{*this};
     SprinterMemory* _sprinterMemory = nullptr;
     std::unique_ptr<SprinterWaits> _waits;
     std::unique_ptr<SprinterOrigWaits> _origWaits;
@@ -385,6 +407,10 @@ private:
 
     /// The Covox / Covox-Blaster (codes #88 / #89, page #FD), its INT through _intSource
     CovoxBlaster _cbl{_context};
+    /// The Covox Blaster's data and control writes (chipwritehistory.h)
+    ChipWriteHistory _cblHistory{ ChipHistoryRegistry(_context),
+                                  [this]() { return ChipHistoryDevice(_context, 0x004E, "covox-blaster"); },
+                                  "Covox Blaster writes", kChipWriteRing };
     /// The ISA-8 slots and the #9FBD latch; the population comes from [ISA] at creation
     SprinterIsaBus _isaBus;
     int _zxBusSlot = -1;           ///< the slot of the ZX-bus adapter with the GS (-1: none)
@@ -393,6 +419,13 @@ private:
     void StallCpuOnIsa(int slot);
     /// The ZX-bus adapters of [ISA] (phase I2), fitted when the decoder is built (before SoundManager attaches the GS)
     void FitZxBusAdapters();
+    void FitWildSoundCards();
+
+public:
+    void BeforeRelease() override;
+    void CollectTTDRegionSources(std::vector<ttd::ITTDRegionSource*>& out) override;
+
+private:
     /// The slots' IRQ / DRQ lines into PIO port B (only a change reaches the PIO: its bit-mode edge), the journal
     /// and counters of the edges and the requests they cause; then the next deadline
     void PushIsaLines();

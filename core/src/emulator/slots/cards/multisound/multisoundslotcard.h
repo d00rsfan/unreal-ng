@@ -18,9 +18,12 @@
 #include <memory>
 #include <vector>
 
+#include "debugger/history/exechistory.h"
 #include "emulator/slots/card.h"
 #include "emulator/slots/cards/multisound/multisoundcard.h"
 #include "emulator/slots/cards/multisound/multisoundttd.h"
+#include "emulator/sound/chips/chipwritehistory.h"
+#include "emulator/sound/chips/gs/gsporttrace.h"
 
 class EmulatorContext;
 
@@ -54,11 +57,15 @@ public:
     void FrameEnd(size_t samples) override;
     void SetOutputRate(uint32_t rate) override;
     void MixerRows(std::vector<CardMixerRow>& out) const override;
-    int16_t* VoicedMixerBuffer(AudioSourceType type) override;
+    int16_t* SsgMixerBuffer(AudioSourceType type) override;
     uint64_t RenderEpoch() const override { return _card.RenderEpoch(); }
     bool SetFmTrimDb(double db) override;
     bool FmTrimDb(double& db) const override;
     const int16_t* MixerBuffer(AudioSourceType type) const override;
+    /// ms_ssg1/2.a..c (the SSG parts' channels), ms_fm1/2.1..3 (the YM2203 FM channels), ms_midi.1..16 (the SAM2695's
+    /// parts: mute only)
+    void MixerChannels(AudioSourceType type, std::vector<MixerChannelDesc>& out) const override;
+    void SetMixerChannel(AudioSourceType type, size_t index, bool muted, float volume) override;
     bool WantsWideMix() const override
     {
         return true;
@@ -69,8 +76,9 @@ public:
     /// `slots.<slot>.bank`: the MIDI bank's SHA-256 folded to 64 bits (0: no bank)
     void TtdFingerprint(std::vector<std::pair<std::string, uint64_t>>& out) const override;
     /// A session recorded with another MIDI bank is refused (the synthesizer's blob names its bank)
-    bool TtdSessionMatches(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs,
-                           std::string& why) const override;
+    bool TtdSessionMatches(const ttd::TTDDeviceStates& states, std::string& why) const override;
+    /// The card's General Sound: the debugger's `ms` CPU
+    GeneralSoundCard* DebugGeneralSound() override;
     /// endregion </ICard>
 
     MultiSoundCard& Card()
@@ -102,6 +110,11 @@ public:
         _origin = origin;
         _last = last;
     }
+    /// The mixer's frame-start sample phase (SoundManager::samplePhase): how many samples the frames have, so how
+    /// many the card renders. Part of the card's blob: a machine without a board AY device (a ZX-Evo, whose YM2149
+    /// the card takes out of its socket) has nothing else that puts it back after a seek
+    uint64_t MixerSamplePhase() const;
+    void AdoptMixerSamplePhase(uint64_t phase);
 
     /// The time-travel devices (tests)
     MultiSoundCardTtd& CardTtd()
@@ -118,6 +131,10 @@ private:
     void TrackM1();
 
     EmulatorContext* _context;
+    // Before the card: they outlive its pointers to them
+    ChipWriteHistory _chipHistory;                 ///< `<slot>.chips`: the SAA and SounDrive writes
+    history::Registered<GSTraceEvent> _gsHistory;  ///< `<slot>.gs`: the card's GS port and activity events
+    ExecHistory _gsExecHistory;                    ///< `<slot>.gs.cpu`: the instructions of the card's GS Z80
     MultiSoundCard _card;
     uint64_t _origin = 0;
     uint64_t _last = 0;

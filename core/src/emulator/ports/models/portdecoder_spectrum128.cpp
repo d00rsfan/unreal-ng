@@ -144,11 +144,10 @@ uint8_t PortDecoder_Spectrum128::DecodePortIn(uint16_t port, uint16_t pc)
         disp.decodedPort = port;
         disp.wasHandledInline = true;
     }
-    else if (IsBeta128Port(port) && !(_context->emulatorState.flags & CF_TRDOS))
+    else if (TryBeta128LowBytePortIn(port, result, disp))
     {
-        // Beta 128 FDC ports answer only while the TR-DOS ROM is paged in (as in the Pentagon decoder):
-        // outside TR-DOS the port stays undecoded and Z80::in() serves the floating bus
-        disp.wasBeta128Gated = true;
+        // Beta 128 FDC ports: low byte decode, answer only while the TR-DOS ROM is paged in (outside it the port
+        // stays undecoded and Z80::in() serves the floating bus)
     }
     else
     {
@@ -165,8 +164,7 @@ uint8_t PortDecoder_Spectrum128::DecodePortIn(uint16_t port, uint16_t pc)
     if (!key_exists(_loggingMutePorts, port))
     {
         // Determine RAM/ROM page where code executed from
-        std::string currentMemoryPage = GetPCAddressLocator(pc);
-        MLOGINFO("[In] [PC:%04X%s] Port: %02X; Value: %02X", pc, currentMemoryPage.c_str(), port, result);
+        MLOGINFO("[In] [PC:%04X%s] Port: %02X; Value: %02X", pc, GetPCAddressLocator(pc).c_str(), port, result);
     }
     /// endregion </Debug logging>
 
@@ -235,13 +233,16 @@ void PortDecoder_Spectrum128::DecodePortOut(uint16_t port, uint8_t value, uint16
         disp.wasDecoded = true;
         disp.wasHandledInline = true;
     }
+    else if (TryBeta128LowBytePortOut(port, value, disp))
+    {
+        // Beta 128: the WD1793 and #FF take writes only while the TR-DOS ROM is paged in (they never did before)
+    }
     else
     {
         if (_logger && _logger->GetLevel() <= LoggerLevel::LogWarning)
         {
             // Determine RAM/ROM page where code executed from
-            std::string currentMemoryPage = GetPCAddressLocator(pc);
-            MLOGWARNING("[Out] [PC:%04X%s] Port: %02X; Value: %02X", pc, currentMemoryPage.c_str(), port, value);
+            MLOGWARNING("[Out] [PC:%04X%s] Port: %02X; Value: %02X", pc, GetPCAddressLocator(pc).c_str(), port, value);
         }
     }
 
@@ -252,8 +253,7 @@ void PortDecoder_Spectrum128::DecodePortOut(uint16_t port, uint8_t value, uint16
         if (!key_exists(_loggingMutePorts, port))
         {
             // Determine RAM/ROM page where code executed from
-            std::string currentMemoryPage = GetPCAddressLocator(pc);
-            MLOGINFO("[Out] [PC:%04X%s] Port: %02X; Value: %02X", pc, currentMemoryPage.c_str(), port, value);
+            MLOGINFO("[Out] [PC:%04X%s] Port: %02X; Value: %02X", pc, GetPCAddressLocator(pc).c_str(), port, value);
         }
     }
     /// endregion </Debug logging>

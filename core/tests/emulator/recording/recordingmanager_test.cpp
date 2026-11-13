@@ -91,7 +91,9 @@ TEST(RecordingManager_Test, FrameLengthChange_TimestampsAreTheSumOfTheFrames)
         ASSERT_EQ(timestamps.size(), static_cast<size_t>(i + 1));
         EXPECT_NEAR(timestamps[i], expected, 1e-9) << "frame " << i;
         if (i > 0)
+        {
             ASSERT_GT(timestamps[i], timestamps[i - 1]) << "frame " << i << ": the timestamps only grow";
+        }
         expected += short312 ? kFrame312 : kFrame320;
     }
     context->config.frame = savedFrame;
@@ -287,7 +289,7 @@ TEST(RecordingManager_Test, ProfiFramesKeepTheScreensWindowInBothModes)
     ASSERT_NE(rm, nullptr);
 
     std::vector<FrameSinkEncoder::Frame> frames;
-    rm->SetScaleFactor(2);   // "Native 2x": the screen's window at 704x576
+    rm->SetScaleFactor(2);   // "Native 2x": the encoder scales the picture; frames reach it at the picture's own size
     ASSERT_TRUE(rm->StartRecordingWithEncoder(TestPathHelper::GetUniqueTestScratchPath("rm-profi") + ".mp4",
                                               std::make_unique<FrameSinkEncoder>(frames)));
 
@@ -299,21 +301,19 @@ TEST(RecordingManager_Test, ProfiFramesKeepTheScreensWindowInBothModes)
     ASSERT_EQ(frames.size(), 3u) << "a mode switch keeps recording";
     for (const auto& frame : frames)
     {
-        EXPECT_EQ(frame.width, 704u);
-        EXPECT_EQ(frame.height, 576u);
+        EXPECT_EQ(frame.width, 352u) << "the file's picture: the 352:288 window, the same for either Profi mode";
+        EXPECT_EQ(frame.height, 288u);
     }
 
-    // Spectrum frame: every pixel twice in each direction
+    // Spectrum frame: as stored
     EXPECT_EQ(SourceX(frames[0], 0, 0), 0u);
-    EXPECT_EQ(SourceX(frames[0], 703, 575), 351u);
-    EXPECT_EQ(SourceY(frames[0], 703, 575), 287u);
-    EXPECT_EQ(SourceX(frames[0], 351, 0), 175u);
-    // Hi-res frame: 608 columns across the same 704, each line twice
+    EXPECT_EQ(SourceX(frames[0], 351, 287), 351u);
+    EXPECT_EQ(SourceY(frames[0], 351, 287), 287u);
+    // Hi-res frame: 608 columns across the same 352 (its lines doubled to the CRT shape, then fitted: nearest pixel)
     EXPECT_EQ(SourceX(frames[1], 0, 0), 0u);
-    EXPECT_EQ(SourceX(frames[1], 703, 0), 607u);
-    EXPECT_EQ(SourceX(frames[1], 352, 0), 304u) << "the middle stays the middle";
-    EXPECT_EQ(SourceY(frames[1], 0, 575), 287u);
-    EXPECT_EQ(SourceY(frames[1], 0, 1), 0u);
+    EXPECT_NEAR(static_cast<double>(SourceX(frames[1], 350, 0)), 606.0, 3.0);
+    EXPECT_NEAR(static_cast<double>(SourceX(frames[1], 176, 0)), 304.0, 2.0) << "the middle stays the middle";
+    EXPECT_NEAR(static_cast<double>(SourceY(frames[1], 0, 287)), 287.0, 2.0);
 
     rm->StopRecording();
     rm->SetScaleFactor(1);
@@ -596,6 +596,89 @@ TEST(RecordingManager_Test, OutputProfile4k_WritesIntoTheEncodersOwnBuffer)
     ASSERT_EQ(sink.corner.size(), 4u);
     EXPECT_EQ(sink.corner[0], 0x00);
     EXPECT_EQ(sink.corner[3], 0xFF);
+
+    ASSERT_TRUE(rm->SetOutputProfile("native"));
+    EmulatorTestHelper::CleanupEmulator(emulator);
+}
+
+namespace
+{
+/// An NV12 lender (the NVENC layout): keeps what the scaler wrote
+class Nv12LendingEncoder : public EncoderBase
+{
+public:
+    explicit Nv12LendingEncoder(LendingStats& stats) : _stats(stats) {}
+    bool Start(const std::string&, const EncoderConfig&) override
+    {
+        _recording = true;
+        return true;
+    }
+    void Stop() override { _recording = false; }
+    bool IsRecording() const override { return _recording; }
+    std::string GetType() const override { return "nv12"; }
+    std::string GetDisplayName() const override { return "nv12 lending sink"; }
+    bool SupportsVideo() const override { return true; }
+    bool SupportsAudio() const override { return false; }
+    void OnVideoFrame(const FramebufferDescriptor&, double) override { _stats.plainFrames++; }
+
+    FrameTargetResult AcquireFrameTarget(uint32_t width, uint32_t height, FrameTarget& target) override
+    {
+        _pitch = width + 32;
+        _buffer.assign(static_cast<size_t>(_pitch) * height * 3 / 2, 0x77);
+        target.format = FrameTargetFormat::Nv12;
+        target.data = _buffer.data();
+        target.stride = _pitch;
+        target.uv = _buffer.data() + static_cast<size_t>(_pitch) * height;
+        target.uvStride = _pitch;
+        target.width = width;
+        target.height = height;
+        target.handle = this;
+        return FrameTargetResult::Ready;
+    }
+    void SubmitFrameTarget(FrameTarget& target, double) override
+    {
+        _stats.lentFrames++;
+        _stats.lastWidth = target.width;
+        _stats.lastHeight = target.height;
+        _stats.lastStride = target.stride;
+        // Bar pixels: Y 16 at the top-left, U = V = 128
+        _stats.corner = {_buffer[0], target.uv[0], target.uv[1]};
+    }
+
+private:
+    LendingStats& _stats;
+    bool _recording = false;
+    size_t _pitch = 0;
+    std::vector<uint8_t> _buffer;
+};
+}  // namespace
+
+/// An NV12 lender (NVENC) gets the 4K frame as Y + U,V planes: no plain hand-over, bars black
+TEST(RecordingManager_Test, OutputProfile4k_WritesNv12IntoTheEncodersOwnBuffer)
+{
+    Emulator* emulator = EmulatorTestHelper::CreateStandardEmulator("PENTAGON", LoggerLevel::LogError);
+    ASSERT_NE(emulator, nullptr);
+    RecordingManager* rm = emulator->GetContext()->pRecordingManager;
+    ASSERT_NE(rm, nullptr);
+    emulator->RunNFrames(2);
+    ASSERT_TRUE(rm->SetOutputProfile("4k"));
+
+    LendingStats sink;
+    ASSERT_TRUE(rm->StartRecordingWithEncoder(TestPathHelper::GetUniqueTestScratchPath("rm-4k-nv12") + ".mp4",
+                                              std::make_unique<Nv12LendingEncoder>(sink)));
+    for (int i = 0; i < 2; i++)
+        rm->CaptureFrame(emulator->GetContext()->pScreen->GetFramebufferDescriptor());
+    rm->StopRecording();
+
+    EXPECT_EQ(sink.lentFrames, 2);
+    EXPECT_EQ(sink.plainFrames, 0);
+    EXPECT_EQ(sink.lastWidth, 3840u);
+    EXPECT_EQ(sink.lastHeight, 2160u);
+    EXPECT_EQ(sink.lastStride, static_cast<size_t>(3840 + 32));
+    ASSERT_EQ(sink.corner.size(), 3u);
+    EXPECT_EQ(sink.corner[0], 16);
+    EXPECT_EQ(sink.corner[1], 128);
+    EXPECT_EQ(sink.corner[2], 128);
 
     ASSERT_TRUE(rm->SetOutputProfile("native"));
     EmulatorTestHelper::CleanupEmulator(emulator);

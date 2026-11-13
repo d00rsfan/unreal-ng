@@ -45,8 +45,31 @@ public:
     virtual void setSlot(uint8_t slot, uint8_t bank) = 0;
     virtual void writeBank(uint8_t bank, const std::vector<uint8_t>& data) = 0;
 
+    // ZX Next. A bank is an 8K Next bank (RAM 0..223; 0xFF the ROM, 16K that wraps), the offset wraps inside it.
+    // The defaults are for machines without them: reads give zeros, writes do nothing
+    virtual std::vector<uint8_t> readBankMemory(uint8_t /*bank*/, uint16_t /*offset*/, uint16_t size) const
+    {
+        return std::vector<uint8_t>(size, 0);
+    }
+    virtual void writeBankMemory(uint8_t /*bank*/, uint16_t /*offset*/, const std::vector<uint8_t>& /*data*/) {}
+    // The sprites (CMD_GET_SPRITES_PALETTE .. CMD_GET_SPRITE_PATTERNS): empty on a machine without them
+    /// 256 pairs (colour 8 bit RRRGGGBB, then bit 0 the low blue bit and bit 7 the Layer 2 priority) of sprite palette `which` (0 / 1)
+    virtual std::vector<uint8_t> getSpritesPalette(uint8_t /*which*/) const { return {}; }
+    /// `count` sprites from `index`, five attribute bytes each (x, y, attr 2, attr 3, attr 4)
+    virtual std::vector<uint8_t> getSprites(uint8_t /*index*/, uint8_t /*count*/) const { return {}; }
+    /// `count` patterns of 256 bytes from `index`
+    virtual std::vector<uint8_t> getSpritePatterns(uint8_t /*index*/, uint8_t /*count*/) const { return {}; }
+    /// The sprites' clip window x left, x right, y top, y bottom, then NR #15 (sprite and layers control)
+    virtual std::vector<uint8_t> getSpritesClipWindowAndControl() const { return {}; }
+    virtual uint8_t readNextReg(uint8_t /*reg*/) const { return 0; }
+    /// The 16K ROM (0-3) a slot whose MMU value is 0xFF shows (ZX Next)
+    virtual uint8_t nextRomSelect() const { return 0; }
+    virtual void writeNextReg(uint8_t /*reg*/, uint8_t /*value*/) {}
+
     // Breakpoints
     // bank: wire format is bank+1 (0 = any bank, 1 = bank 0, etc.)
+    // condition: in the core breakpoint-condition language (breakpointcondition.h), empty for none; the
+    //   breakpoint then stops only when it holds. 0 when it does not compile (the caller may retry without)
     // temporary=true marks breakpoint for auto-removal after next pause
     virtual uint16_t addBreakpoint(uint16_t addr, uint8_t bank = 0,
                                     const std::string& condition = "",
@@ -76,6 +99,13 @@ public:
     virtual uint8_t readPort(uint16_t port) const = 0;
     virtual void writePort(uint16_t port, uint8_t value) = 0;
 
+    // CMD_INTERRUPT_ON_OFF: IFF1 and IFF2 set (true) or cleared
+    virtual void setInterrupts(bool /*enabled*/) {}
+
+    // ZRCP snapshot-save / snapshot-load of a file (ZEsarUX picks the format by the extension). "" = done, else why not
+    virtual std::string saveSnapshotFile(const std::string& /*path*/) { return "snapshots not supported"; }
+    virtual std::string loadSnapshotFile(const std::string& /*path*/) { return "snapshots not supported"; }
+
     // --- ZRCP (ZEsarUX protocol) transport capabilities ---
     // Used by the zesarux module's ZRCP server; safe defaults keep other
     // transports working. Executes exactly one instruction. Call only while
@@ -95,6 +125,12 @@ public:
     // again - DeZog re-sends all breakpoints on the next connect.
     virtual void onSessionOpened() {}
     virtual void onSessionClosed() {}
+
+    // Automation sessions (execution arbiter design §6a): a client connected from `peer` ("host:port") - the GUI shows
+    // the user where the debugger is; controlTakenBack: the user took control back at the GUI, the server tells the
+    // client why (NTF_PAUSE with the reason) and drops the connection
+    virtual void onClientConnected(const std::string& /*peer*/) {}
+    virtual bool controlTakenBack() const { return false; }
 
     // Blocks up to timeoutMs for a debug target to exist (the host UI may
     // still be creating its emulator when DeZog connects). Returns false when
@@ -175,6 +211,8 @@ private:
 
     // Command handlers
     Response handleInit(const Command& cmd);
+    /// The user took control back at the GUI: NTF_PAUSE with the reason (DeZog shows it), the session then closes
+    void tellControlTakenBack();
     Response handleClose(const Command& cmd);
     Response handleGetRegisters(const Command& cmd);
     Response handleSetRegister(const Command& cmd);
@@ -189,9 +227,24 @@ private:
     Response handleGetSupportedCommands(const Command& cmd);
     Response handleSetSlot(const Command& cmd);
     Response handleWriteBank(const Command& cmd);
+    Response handleReadBankMem(const Command& cmd);
+    Response handleWriteBankMem(const Command& cmd);
+    Response handleSetNextRegs(const Command& cmd);
+    Response handleGetTbblueReg(const Command& cmd);
+    Response handleReadMemBlocks(const Command& cmd);
+    Response handleGetSpritesPalette(const Command& cmd);
+    Response handleGetSprites(const Command& cmd);
+    Response handleGetSpritePatterns(const Command& cmd);
+    Response handleGetSpritesClip(const Command& cmd);
     Response handleSetBorder(const Command& cmd);
     Response handleReadPort(const Command& cmd);
     Response handleWritePort(const Command& cmd);
+    // dezogif's commands (DeZog sends them to a real ZX Next only; not advertised, answered in their shape)
+    Response handleSetBreakpoints(const Command& cmd);
+    Response handleRestoreMem(const Command& cmd);
+    Response handleLoopback(const Command& cmd);
+    Response handleExecAsm(const Command& cmd);
+    Response handleInterruptOnOff(const Command& cmd);
     Response handleReadState(const Command& cmd);
     Response handleWriteState(const Command& cmd);
     Response handleGetHistoryInfo(const Command& cmd);

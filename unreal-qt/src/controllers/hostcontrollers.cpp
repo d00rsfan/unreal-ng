@@ -1,0 +1,1724 @@
+#include "hostcontrollers.h"
+
+#include <QAbstractSpinBox>
+#include <QApplication>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QGuiApplication>
+#include <QKeyEvent>
+#include <QLineEdit>
+#include <QLockFile>
+#include <QMetaObject>
+#include <QSettings>
+#include <QPlainTextEdit>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include <QTextEdit>
+#include <QThread>
+
+#include <algorithm>
+#include <filesystem>
+#include <functional>
+
+#include "3rdparty/message-center/messagecenter.h"
+#include "common/filehelper.h"
+#include "emulator/emulator.h"
+#include "emulator/emulatorbinding.h"
+#include "emulator/emulatorcontext.h"
+#include "emulator/emulatormanager.h"
+#include "emulator/io/keyboard/pckey.h"
+#include "emulator/actions/contextstate.h"
+#include "emulator/keyboardmanager.h"
+#include "platform/windowlesssession.h"
+#ifdef __linux__
+#include "platform/linux/steamoverlay.h"
+#endif
+#include "platform/windows/wheelmenu_windows.h"
+
+#ifdef ENABLE_CONTROLLERS
+#include "clientqueue.h"
+#include "debugger/ttd/timetravelhooks.h"
+#include "devicedatabase.h"
+#include "devicesfeed.h"
+#include "emulator/config.h"
+#include "emulator/io/controllers/controllercontrol.h"
+#include "emulator/io/controllers/controllermanager.h"
+#include "emulator/monitoring/hostdevices.h"
+#include "emulator/notifications.h"
+#include "emulator/platform.h"
+#include "haptics/profilehaptics.h"
+#include "hostcontrols.h"
+#include "platform/processinfo.h"
+#include "profiles/json.h"
+#include "profiles/memoryprofilemarkup.h"
+#include "debugger/debugmanager.h"
+#include "router/inputrouter.h"
+#ifdef ENABLE_SWSIGNATURE
+#include "swsignature.h"
+#endif
+
+using namespace controllers;
+
+namespace
+{
+constexpr const char* kKeyboard = "kbd:system";
+
+/// The signature hook (C6, D7): the program's signatures (exact, tape content / TR-DOS file set / memory) and its
+/// TR-DOS file set into @p context; without the signature library the file's SHA-256 alone
+bool ProgramSignatures(const uint8_t* data, size_t size, const std::string& name, ProfileContext& context,
+                       std::string& error)
+{
+    context.signatures.clear();
+    context.fileSha256.clear();
+    context.fileSet.clear();
+#ifdef ENABLE_SWSIGNATURE
+    unrealng::swsignature::Signatures signatures;
+    if (!unrealng::swsignature::Compute(data, size, name, signatures, error))
+        return false;
+    context.signatures = signatures.Keys();
+    context.fileSha256 = {signatures.sha256};
+    context.fileSet = signatures.FileSet();
+    return true;
+#else
+    (void)name;
+    (void)error;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData(QByteArrayView(reinterpret_cast<const char*>(data), static_cast<qsizetype>(size)));
+    context.fileSha256 = {hash.result().toHex().toStdString()};
+    return true;
+#endif
+}
+
+bool ProgramSignatures(const std::string& path, ProfileContext& context, std::string& error)
+{
+#ifdef ENABLE_SWSIGNATURE
+    context.signatures.clear();
+    context.fileSha256.clear();
+    context.fileSet.clear();
+    unrealng::swsignature::Signatures signatures;
+    if (!unrealng::swsignature::ComputeFile(path, signatures, error))
+        return false;
+    context.signatures = signatures.Keys();
+    context.fileSha256 = {signatures.sha256};
+    context.fileSet = signatures.FileSet();
+    return true;
+#else
+    context.signatures.clear();
+    context.fileSha256.clear();
+    context.fileSet.clear();
+    QFile file(QString::fromStdString(path));
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!QFileInfo(file).isFile() || !file.open(QIODevice::ReadOnly) || !hash.addData(&file))
+    {
+        error = "cannot read '" + path + "'";
+        return false;
+    }
+    context.fileSha256 = {hash.result().toHex().toStdString()};
+    return true;
+#endif
+}
+
+/// HostInputControl's view of the Qt client's host input
+class ControlOwner : public IHostInputOwner
+{
+public:
+    explicit ControlOwner(HostControllers& host) : _host(host)
+    {
+    }
+    ProfileStore& Profiles() override
+    {
+        return _host.Profiles();
+    }
+    ProfileContext Context() const override
+    {
+        return _host.Context();
+    }
+    const ResolvedProfiles& Resolved() const override
+    {
+        return _host.Resolved();
+    }
+    std::string UserProfileDir() const override
+    {
+        return HostControllers::UserProfileDir().toStdString();
+    }
+    std::string UserControllersDir() const override
+    {
+        return HostControllers::UserControllersDir().toStdString();
+    }
+    std::string ManualProfile() const override
+    {
+        return _host.ManualProfile();
+    }
+    void SetManualProfile(const std::string& id) override
+    {
+        _host.SetManualProfile(id);
+    }
+    void Reapply() override
+    {
+        _host.Reapply();
+    }
+    HostInputService* Input() override
+    {
+        return &_host.Service();
+    }
+    std::string ChoosePlayerConnector(const std::string& device, const std::string& connector,
+                                      std::string& message) override
+    {
+        return _host.ChoosePlayerConnector(device, connector, message);
+    }
+    std::string PlayerChoice(const std::string& device) const override
+    {
+        return _host.PlayerChoice(device);
+    }
+    std::string SetHapticsTrial(const JsonValue& overlay, std::string& message) override
+    {
+        return _host.SetHapticsTrial(overlay, message);
+    }
+    JsonValue HapticsTrial() const override
+    {
+        return _host.HapticsTrial();
+    }
+    JsonValue HapticsUnderTrial() const override
+    {
+        return _host.HapticsUnderTrial();
+    }
+    bool SignaturesOf(const std::string& path, ProfileContext& context, std::string& error) override
+    {
+        return ProgramSignatures(path, context, error);
+    }
+
+private:
+    HostControllers& _host;
+};
+}  // namespace
+#endif
+
+HostControllers::HostControllers(EmulatorBinding* binding, QObject* parent) : QObject(parent), _binding(binding)
+{
+    _debugLayer = QSettings().value("Controllers/DebugLayer", false).toBool();
+    _soundHaptics = QSettings().value("Controllers/SoundHaptics", false).toBool();
+    _soundHapticsDsp = QSettings().value("Controllers/SoundHapticsDsp", false).toBool();
+    _globalShortcuts = QSettings().value("Controllers/GlobalShortcuts", false).toBool();
+    _pauseOnDisconnect = QSettings().value("Controllers/PauseOnDisconnect", false).toBool();
+#ifdef ENABLE_CONTROLLERS
+    // The user's device entries over the compiled-in database (device-database.md §7), before a device is matched
+    {
+        QFile user(QDir(UserControllersDir()).filePath("devices.user.json"));
+        std::string error;
+        if (user.exists() && user.open(QIODevice::ReadOnly) &&
+            !DeviceDatabase::SetUser(user.readAll().toStdString(), error))
+            qWarning("controllers: %s: %s", qPrintable(user.fileName()), error.c_str());
+    }
+    _service = std::make_unique<HostInputService>();
+    // The window keyboard: its debug bindings are the debugger's shortcuts; it never drives a connector
+    _service->Router().SetRole(kKeyboard, DeviceRole::DebuggerRemote);
+    _service->SetHapticsDspDefaults(_soundHapticsDsp);
+    _service->OnDeviceAdded({kKeyboard, tr("Keyboard").toStdString(), "keyboard", "keyboard", "qt"});
+    std::vector<std::string> errors;
+    _profiles.LoadDirectory(UserProfileDir().toStdString(), ProfileScope::User, errors);
+    // The promoted devices' old ids (architecture.md §5): profiles naming a `gc:` id follow its IOHID id
+    std::string aliasError;
+    if (!_profiles.LoadAliases(UserProfileDir().toStdString(), aliasError))
+        errors.push_back(aliasError);
+    // The shipped game profiles: the index now, a profile when a loaded file or a manual choice names it
+    _profiles.OpenGames(FileHelper::GetResourcesPath() + "/software", errors);
+    for (const std::string& error : errors)
+        qWarning("controllers: %s", error.c_str());
+    _service->Router().SetActionSink([this](const ActionEvent& event) {
+        HostActionEvent out;
+        out.action = QString::fromStdString(event.action);
+        out.pressed = event.pressed;
+        out.value = event.value;
+        out.device = QString::fromStdString(event.device);
+        out.turn = event.turn;
+        out.rate = event.rate;
+        if (!event.params.IsNull())
+            out.params = QString::fromStdString(event.params.Dump());
+        out.instance = QString::fromStdString(event.instance);
+        QMetaObject::invokeMethod(this, [this, out] { emit actionTriggered(out); }, Qt::QueuedConnection);
+    });
+    // A pad's layer key takes the instance into the debugger: every surface follows, not only that pad
+    _service->Router().SetLayerSink([this](const HostDeviceId& device, const std::string& instance, bool up) {
+        QMetaObject::invokeMethod(this, [this, device, instance, up] { onDebugLayer(device, instance, up); },
+                                  Qt::QueuedConnection);
+    });
+    // A windowless session opens no gamepad, HID device or Surface Dial: they are the person's at the desk
+    if (WindowlessSessionUses("controllers"))
+        _service->StartNative();
+    // Several clients on the machine see the same devices: the one activated last owns them. The temporary folder is
+    // the user's own (TMPDIR on macOS, %TEMP% on Windows); on Linux /tmp is shared, so the name carries the user.
+    // A windowless session never takes them from a window
+    if (!IsWindowlessSession())
+    {
+        const QString user = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME"));
+        _ownersPath = QDir(QDir::tempPath()).filePath("unreal-ng-controllers-" + user + ".owners");
+        connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive)
+                claimControllers();
+        });
+        if (QGuiApplication::applicationState() == Qt::ApplicationActive)
+            claimControllers();
+        else
+            updateOwner();
+#ifdef __linux__
+        if (auto overlay = std::make_shared<gamescope::SteamOverlay>(); overlay->Available())
+        {
+            _steamOverlay = overlay;
+            _steamOverlayTimer = new QTimer(this);
+            connect(_steamOverlayTimer, &QTimer::timeout, this, &HostControllers::checkSteamOverlay);
+            _steamOverlayTimer->start(50);
+        }
+#endif
+    }
+    // The host verbs of the automation surfaces run here, on the GUI thread
+    _controlOwner = std::make_unique<ControlOwner>(*this);
+    HostInputControl::SetOwner(_controlOwner.get(), [](const std::function<void()>& task) {
+        QCoreApplication* app = QCoreApplication::instance();
+        if (app == nullptr || QThread::currentThread() == app->thread())
+            task();
+        else
+            QMetaObject::invokeMethod(app, [&task] { task(); }, Qt::BlockingQueuedConnection);
+    });
+    // markup save from any plane: the profiles are this object's, so the write runs on the GUI thread too
+    markup::SetProfileSaver([this](Emulator& emulator, const markup::SaveRequest& request) {
+        markup::Reply reply;
+        QCoreApplication* app = QCoreApplication::instance();
+        if (app == nullptr || QThread::currentThread() == app->thread())
+            reply = saveMarkup(emulator, request);
+        else
+            QMetaObject::invokeMethod(
+                this, [this, &emulator, &request, &reply] { reply = saveMarkup(emulator, request); },
+                Qt::BlockingQueuedConnection);
+        return reply;
+    });
+    // The program loaded: its file's hash keys the game profiles, and the auto decision starts again
+    _fileObserver = MessageCenter::DefaultMessageCenter().AddObserver(NC_FILE_LOADED, [this](int, Message* message) {
+        auto* payload = message != nullptr ? dynamic_cast<FileLoadedPayload*>(message->obj) : nullptr;
+        if (payload == nullptr || !payload->ok)
+            return;
+        const QString id = QString::fromStdString(payload->emulatorId.toString());
+        const QString path = QString::fromStdString(payload->path);
+        QMetaObject::invokeMethod(this, [this, id, path] { onFileLoaded(id, path); }, Qt::QueuedConnection);
+    });
+    // A program the guest read from a block medium (a NEX started from NextZXOS's Browser): the machine loaded it,
+    // not this client, so the bytes the core read give the same keys
+    _guestObserver = MessageCenter::DefaultMessageCenter().AddObserver(NC_GUEST_PROGRAM, [this](int, Message* message) {
+        auto* payload = message != nullptr ? dynamic_cast<GuestProgramPayload*>(message->obj) : nullptr;
+        if (payload == nullptr || payload->data.empty())
+            return;
+        const QString id = QString::fromStdString(payload->emulatorId.toString());
+        const QString path = QString::fromStdString(payload->path);
+        const QByteArray bytes(reinterpret_cast<const char*>(payload->data.data()),
+                               static_cast<qsizetype>(payload->data.size()));
+        QMetaObject::invokeMethod(this, [this, id, path, bytes] { onGuestProgram(id, path, bytes); },
+                                  Qt::QueuedConnection);
+    });
+    // The context of an instance changed (ctx.set on any plane, the GUI's own panes): the router follows it
+    _contextObserver = MessageCenter::DefaultMessageCenter().AddObserver(NC_SURFACE_CONTEXT, [this](int, Message*) {
+        QMetaObject::invokeMethod(this, [this] { followContext(); }, Qt::QueuedConnection);
+    });
+    _breakpointObserver =
+        MessageCenter::DefaultMessageCenter().AddObserver(NC_EXECUTION_BREAKPOINT, [this](int, Message* message) {
+            auto* payload = message != nullptr ? dynamic_cast<BreakpointTriggeredPayload*>(message->obj) : nullptr;
+            if (payload == nullptr || payload->hidden)
+                return;
+            const QString id = QString::fromStdString(payload->emulatorId.toString());
+            QMetaObject::invokeMethod(this, [this, id] { onBreakpointHit(id); }, Qt::QueuedConnection);
+        });
+#endif
+    connect(_binding, &EmulatorBinding::bound, this, &HostControllers::onBound);
+    connect(_binding, &EmulatorBinding::unbound, this, &HostControllers::onUnbound);
+    // ui-ux.md §7: a 250 ms poll of the revisions, nothing else while nothing changes
+    connect(&_timer, &QTimer::timeout, this, &HostControllers::poll);
+    _timer.start(250);
+    if (_binding->emulator() != nullptr)
+        onBound();
+}
+
+HostControllers::~HostControllers()
+{
+    if (_mainWindow != nullptr || _debuggerWindow != nullptr)
+        qApp->removeEventFilter(this);
+    onUnbound();
+#ifdef ENABLE_CONTROLLERS
+    HostInputControl::SetOwner(nullptr);
+    markup::SetProfileSaver({});
+    monitoring::HostDevices::Instance().Withdraw();
+    MessageCenter::DefaultMessageCenter().RemoveObserverById(NC_FILE_LOADED, _fileObserver);
+    MessageCenter::DefaultMessageCenter().RemoveObserverById(NC_GUEST_PROGRAM, _guestObserver);
+    MessageCenter::DefaultMessageCenter().RemoveObserverById(NC_SURFACE_CONTEXT, _contextObserver);
+    MessageCenter::DefaultMessageCenter().RemoveObserverById(NC_EXECUTION_BREAKPOINT, _breakpointObserver);
+    releaseWheelMenu();
+    _service->Router().SetActionSink(nullptr);
+    _service->Router().SetLayerSink(nullptr);
+    _service->Stop();
+    leaveControllers();
+#endif
+}
+
+void HostControllers::SetSoundHapticsDsp(bool on)
+{
+    if (on == _soundHapticsDsp)
+        return;
+    _soundHapticsDsp = on;
+    QSettings().setValue("Controllers/SoundHapticsDsp", on);
+#ifdef ENABLE_CONTROLLERS
+    _service->SetHapticsDspDefaults(on);
+    if (_attached)
+        attachHaptics();  // the key below names the filters: the sound feed is made again
+#endif
+}
+
+void HostControllers::SetSoundHaptics(bool on)
+{
+    if (on == _soundHaptics)
+        return;
+    _soundHaptics = on;
+    QSettings().setValue("Controllers/SoundHaptics", on);
+#ifdef ENABLE_CONTROLLERS
+    if (_attached)
+        attachHaptics();
+#endif
+}
+
+void HostControllers::SetPauseOnDisconnect(bool on)
+{
+    _pauseOnDisconnect = on;
+    QSettings().setValue("Controllers/PauseOnDisconnect", on);
+}
+
+void HostControllers::SetGlobalShortcuts(bool on)
+{
+    if (on == _globalShortcuts)
+        return;
+    _globalShortcuts = on;
+    QSettings().setValue("Controllers/GlobalShortcuts", on);
+}
+
+void HostControllers::SetShortcutWindows(QWidget* main, QWidget* debugger)
+{
+    if (_mainWindow == nullptr && _debuggerWindow == nullptr)
+    {
+        qApp->installEventFilter(this);
+        connect(qApp, &QApplication::focusChanged, this, &HostControllers::updateGuiContext, Qt::UniqueConnection);
+        connect(qApp, &QGuiApplication::focusWindowChanged, this, &HostControllers::updateGuiContext,
+                Qt::UniqueConnection);
+    }
+    _mainWindow = main;
+    _debuggerWindow = debugger;
+}
+
+void HostControllers::SetContextWidgets(std::vector<std::pair<QWidget*, std::string>> widgets, QWidget* ttdPanel)
+{
+    _contextWidgets = std::move(widgets);
+    _ttdPanel = ttdPanel;
+    connect(qApp, &QApplication::focusChanged, this, &HostControllers::updateGuiContext, Qt::UniqueConnection);
+}
+
+void HostControllers::OnDebuggerVisible(bool visible)
+{
+    if (visible)
+        return;
+    _guiPane.clear();
+    releaseGuiContext("debug");
+}
+
+void HostControllers::OnTtdPanelVisible(bool visible)
+{
+    // Shown it sets nothing: the context is where the focus is (the panel open beside a game keeps the pads in it)
+    if (visible)
+        return;
+    if (_guiPane == actions::ContextState::kTtd)
+        _guiPane.clear();
+    releaseGuiContext(actions::ContextState::kTtd);
+}
+
+void HostControllers::updateGuiContext()
+{
+    QWidget* active = QApplication::activeWindow();
+    if (active == nullptr)
+        return;  // another application has the focus: the surfaces keep what they drove
+    QWidget* focus = QApplication::focusWidget();
+    const auto inside = [focus](QWidget* widget) {
+        return focus != nullptr && widget != nullptr && (widget == focus || widget->isAncestorOf(focus));
+    };
+    std::string pane;
+    for (const auto& [widget, context] : _contextWidgets)
+        if (inside(widget))
+            pane = context;
+    if (pane.empty() && inside(_ttdPanel))
+        pane = actions::ContextState::kTtd;
+    const bool debugger = _debuggerWindow != nullptr && _debuggerWindow->isVisible() &&
+                          (active == _debuggerWindow || inside(_debuggerWindow));
+    if (pane.empty() && debugger)
+        pane = "debug";
+    if (pane == _guiPane)
+        return;
+    const std::string left = _guiPane;
+    _guiPane = pane;
+    Emulator* emulator = _binding->emulator();
+    if (pane.empty())
+    {
+        // Out of the pane, panel or debugger window: what the GUI set there goes back to the default
+        if (!left.empty())
+            releaseGuiContext(left == actions::ContextState::kTtd ? left : std::string("debug"));
+        return;
+    }
+    if (pane == "debug" && emulator != nullptr)
+    {
+        const std::string now = actions::ContextState::Instance().Get(emulator->GetId(), emulator).context;
+        if (now == pane || now.rfind("debug.", 0) == 0)
+            return;  // the debugger window keeps a `debug.*` context somebody set: it is in the debugger already
+    }
+    setGuiContext(pane);  // entering a pane sets its context once; another setter's later one stays until then
+}
+
+void HostControllers::onDebugLayer(const std::string& device, const std::string& instance, bool up)
+{
+#ifdef ENABLE_CONTROLLERS
+    std::shared_ptr<Emulator> emulator = EmulatorManager::GetInstance()->GetEmulator(instance);
+    if (!emulator)
+        return;
+    actions::ContextState& contexts = actions::ContextState::Instance();
+    const std::string by = "host-device:" + device;
+    std::string error;
+    if (up)
+    {
+        const actions::ContextInfo before = contexts.Get(instance, emulator.get());
+        if (InputRouter::FollowsIntoDebug(before.context, false))
+            return;  // in the debugger already: the key changes nothing anybody else follows
+        _layerContexts[device] = {instance, before};
+        if (!contexts.Set(instance, emulator.get(), "debug", by, error))
+            qWarning("controllers: context 'debug': %s", error.c_str());
+        return;
+    }
+    const auto held = _layerContexts.find(device);
+    if (held == _layerContexts.end())
+        return;
+    const HeldContext restore = held->second;
+    _layerContexts.erase(held);
+    // Somebody set another context while the key was held: the last setter wins (Q-5), the key restores nothing
+    const actions::ContextInfo now = contexts.Get(restore.instance, emulator.get());
+    if (now.by != by || now.context != "debug")
+        return;
+    const std::string context = restore.before.set ? restore.before.context : std::string{};
+    const std::string setter = restore.before.set ? restore.before.by : by;
+    if (!contexts.Set(restore.instance, emulator.get(), context, setter, error))
+        qWarning("controllers: context '%s': %s", context.c_str(), error.c_str());
+#else
+    (void)device;
+    (void)instance;
+    (void)up;
+#endif
+}
+
+void HostControllers::setGuiContext(const std::string& context)
+{
+    Emulator* emulator = _binding->emulator();
+    if (emulator == nullptr)
+        return;
+    std::string error;
+    if (!actions::ContextState::Instance().Set(emulator->GetId(), emulator, context, "gui", error))
+        qWarning("controllers: context '%s': %s", context.c_str(), error.c_str());
+    followContext();
+}
+
+void HostControllers::releaseGuiContext(const std::string& prefix)
+{
+    Emulator* emulator = _binding->emulator();
+    if (emulator == nullptr)
+        return;
+    const actions::ContextInfo info = actions::ContextState::Instance().Get(emulator->GetId(), emulator);
+    if (info.set && info.by == "gui" && info.context.compare(0, prefix.size(), prefix) == 0)
+        setGuiContext({});
+}
+
+void HostControllers::followContext()
+{
+#ifdef ENABLE_CONTROLLERS
+    // Every instance: a device pinned to one follows that one's context. The default (Q-7: `ttd` while a history
+    // exists) is also read by the poll
+    EmulatorManager* manager = EmulatorManager::GetInstance();
+    for (const std::string& id : manager->GetEmulatorIds())
+    {
+        std::shared_ptr<Emulator> emulator = manager->GetEmulator(id);
+        if (!emulator)
+            continue;
+        const actions::ContextInfo info = actions::ContextState::Instance().Get(id, emulator.get());
+        _service->Router().SetContext(id, info.context, info.set);
+    }
+    Emulator* bound = _binding->emulator();
+    // A surface entering a debug context (`debug`, `debug.disasm`: the deck's DEBUG menu, a debug layer) opens the
+    // debugger once; the GUI's own panes set those too, and a debugger closed while the deck stays there stays closed
+    if (bound != nullptr)
+    {
+        const actions::ContextInfo info = actions::ContextState::Instance().Get(bound->GetId(), bound);
+        const bool debug = info.context == "debug" || info.context.rfind("debug.", 0) == 0;
+        const bool surface = info.by.rfind("companion", 0) == 0 || info.by.rfind("host-device", 0) == 0;
+        if (debug && _debugContextOf != bound->GetId() && surface && _openDebugger)
+            _openDebugger();
+        _debugContextOf = debug ? bound->GetId() : std::string();
+    }
+    const bool follow = bound != nullptr && _service->Router().PlayersFollow(bound->GetId());
+    if (follow == _playersFollow)
+        return;
+    _playersFollow = follow;
+    if (!_debugLayer)
+        Reapply();  // the pads' debug profiles: applied while the context has them in the debugger
+    const std::vector<HostDeviceInfo> devices = _service->Router().Devices();
+    const bool pads = std::any_of(devices.begin(), devices.end(), [this](const HostDeviceInfo& device) {
+        return device.family != "keyboard" && device.family != "mouse" &&
+               _service->Router().Role(device.id) == DeviceRole::Player;
+    });
+    if (pads)
+        emit notice(follow ? tr("Game pads drive the debugger") : tr("Game pads drive the game"));
+#endif
+}
+
+void HostControllers::PlayMarks(const std::string& device, const std::vector<std::string>& marks)
+{
+#ifdef ENABLE_CONTROLLERS
+    _service->PlayMarks(device, marks);
+#else
+    (void)device;
+    (void)marks;
+#endif
+}
+
+std::string HostControllers::KeyControlOf(const QKeyEvent* event)
+{
+#ifdef ENABLE_CONTROLLERS
+    const PcKey key = KeyboardManager::mapQtEventToPcKey(event);
+    switch (key)
+    {
+        case PcKey::None:
+        case PcKey::LeftShift:
+        case PcKey::RightShift:
+        case PcKey::LeftCtrl:
+        case PcKey::RightCtrl:
+        case PcKey::LeftAlt:
+        case PcKey::RightAlt:
+        case PcKey::LeftGui:
+        case PcKey::RightGui:
+            return {};
+        default:
+            break;
+    }
+    const Qt::KeyboardModifiers modifiers = event->modifiers();
+    uint8_t held = 0;
+    if (modifiers.testFlag(Qt::ControlModifier))
+        held |= kKeyCtrl;
+    if (modifiers.testFlag(Qt::AltModifier))
+        held |= kKeyAlt;
+    if (modifiers.testFlag(Qt::ShiftModifier))
+        held |= kKeyShift;
+    if (modifiers.testFlag(Qt::MetaModifier))
+        held |= kKeyMeta;
+    return KeyControl(pckey::Name(key), held);
+#else
+    (void)event;
+    return {};
+#endif
+}
+
+bool HostControllers::eventFilter(QObject* watched, QEvent* event)
+{
+    const QEvent::Type type = event->type();
+    if (type != QEvent::KeyPress && type != QEvent::KeyRelease && type != QEvent::ShortcutOverride)
+        return QObject::eventFilter(watched, event);
+    // The debugger window always, the main window with global shortcuts on; a dialog never
+    QWidget* window = QApplication::activeWindow();
+    if (window == nullptr || !(window == _debuggerWindow || (_globalShortcuts && window == _mainWindow)))
+        return QObject::eventFilter(watched, event);
+    auto* key = static_cast<QKeyEvent*>(event);
+    if (type == QEvent::ShortcutOverride)
+    {
+        // A bound key comes as a key press, not as a menu shortcut of the window
+#ifdef ENABLE_CONTROLLERS
+        const std::string control = KeyControlOf(key);
+        if (!control.empty() && _service->Router().Consumes(kKeyboard, control))
+            event->accept();
+#endif
+        return QObject::eventFilter(watched, event);
+    }
+    return shortcutKey(key, type == QEvent::KeyPress) || QObject::eventFilter(watched, event);
+}
+
+bool HostControllers::shortcutKey(const QKeyEvent* event, bool pressed)
+{
+#ifdef ENABLE_CONTROLLERS
+    const int code = static_cast<int>(KeyboardManager::mapQtEventToPcKey(event));
+    auto held = _heldKeys.find(code);
+    if (!pressed)
+    {
+        // An event that propagates to the parent comes again: the first one released it
+        if (held == _heldKeys.end() || event->isAutoRepeat())
+            return held != _heldKeys.end() && held->second.taken;
+        const HeldKey key = held->second;
+        _heldKeys.erase(held);
+        _service->OnControl({kKeyboard, key.control, 0, 0});
+        return key.taken;
+    }
+    if (held != _heldKeys.end())
+        return held->second.taken;  // the auto-repeat, or the same press seen by a parent
+    const std::string control = KeyControlOf(event);
+    if (control.empty())
+        return false;
+    // A text field keeps its keys: there only the function keys are shortcuts
+    QWidget* focus = QApplication::focusWidget();
+    const auto* line = qobject_cast<QLineEdit*>(focus);
+    const auto* text = qobject_cast<QTextEdit*>(focus);
+    const auto* plain = qobject_cast<QPlainTextEdit*>(focus);
+    const bool editing = (line != nullptr && !line->isReadOnly()) || (text != nullptr && !text->isReadOnly()) ||
+                         (plain != nullptr && !plain->isReadOnly()) || qobject_cast<QAbstractSpinBox*>(focus);
+    const PcKey key = static_cast<PcKey>(code);
+    if (editing && !(key >= PcKey::Function1 && key <= PcKey::Function12))
+        return false;
+    const bool taken = _service->Router().Consumes(kKeyboard, control);
+    _heldKeys[code] = {control, taken};
+    _service->OnControl({kKeyboard, control, 1, 0});
+    return taken;
+#else
+    (void)event;
+    (void)pressed;
+    return false;
+#endif
+}
+
+void HostControllers::SetManualProfile(const std::string& id)
+{
+    if (id == _manualProfile)
+        return;
+    _manualProfile = id;
+    Reapply();
+}
+
+void HostControllers::SetDebugLayer(bool on)
+{
+    if (on == _debugLayer)
+        return;
+    _debugLayer = on;
+    QSettings().setValue("Controllers/DebugLayer", on);
+    Reapply();
+}
+
+Emulator* HostControllers::BoundEmulator() const
+{
+    return _binding->emulator();
+}
+
+EmulatorContext* HostControllers::BoundContext() const
+{
+    return _binding->context();
+}
+
+void HostControllers::onBound()
+{
+#ifdef ENABLE_CONTROLLERS
+    onUnbound();
+    std::shared_ptr<Emulator> emulator = _binding->emulatorShared();
+    EmulatorContext* context = _binding->context();
+    if (!emulator || context == nullptr || context->pControllerManager == nullptr)
+        return;
+    _attached = emulator;
+    context->pControllerManager->SetHostInputSource(_service->SourceFor(emulator->GetId()));
+    _service->Router().SetFocus(emulator->GetId());
+    followContext();
+    Reapply();
+#endif
+}
+
+void HostControllers::onUnbound()
+{
+#ifdef ENABLE_CONTROLLERS
+    if (!_attached)
+        return;
+    EmulatorContext* context = _attached->GetContext();  // lifetime-ok: _attached holds the emulator
+    if (context != nullptr && context->pControllerManager != nullptr)
+    {
+        context->pControllerManager->SetHostInputSource(nullptr);
+        context->pControllerManager->SetHapticFeed(nullptr);
+    }
+    _hapticFeed.reset();
+    _hapticsKey.clear();
+    _attached.reset();
+    _service->Router().SetFocus({});  // a following device drives no machine now: its actions say so
+#endif
+}
+
+#ifdef ENABLE_CONTROLLERS
+namespace
+{
+bool ClientAlive(int64_t pid)
+{
+    return pid > 0 && pid <= UINT32_MAX && platform::IsProcessAlive(static_cast<uint32_t>(pid));
+}
+
+/// Edit the owners file under its lock; false when the lock or the write failed
+bool EditOwners(const QString& path, const std::function<void(std::vector<int64_t>&)>& edit)
+{
+    QLockFile lock(path + ".lock");
+    if (!lock.tryLock(500))
+        return false;
+    std::vector<int64_t> pids;
+    QFile in(path);
+    if (in.open(QIODevice::ReadOnly))
+        pids = ClientQueue::Parse(in.readAll().toStdString());
+    in.close();
+    edit(pids);
+    QSaveFile out(path);  // a reader without the lock sees the old list or the new one, never half of it
+    if (!out.open(QIODevice::WriteOnly))
+        return false;
+    out.write(QByteArray::fromStdString(ClientQueue::Format(pids)));
+    return out.commit();
+}
+}  // namespace
+
+void HostControllers::claimControllers()
+{
+    if (_ownersPath.isEmpty())
+        return;
+    const int64_t self = platform::CurrentProcessId();
+    if (!EditOwners(_ownersPath, [self](std::vector<int64_t>& pids) { ClientQueue::Claim(pids, self, ClientAlive); }))
+        qWarning("controllers: cannot write %s", qPrintable(_ownersPath));
+    updateOwner();
+}
+
+void HostControllers::leaveControllers()
+{
+    if (_ownersPath.isEmpty())
+        return;
+    const int64_t self = platform::CurrentProcessId();
+    EditOwners(_ownersPath, [self](std::vector<int64_t>& pids) { ClientQueue::Leave(pids, self); });
+}
+
+void HostControllers::updateOwner()
+{
+    if (_ownersPath.isEmpty())
+        return;
+    QFile file(_ownersPath);
+    std::vector<int64_t> pids;
+    if (file.open(QIODevice::ReadOnly))
+        pids = ClientQueue::Parse(file.readAll().toStdString());
+    const int64_t self = platform::CurrentProcessId();
+    int64_t owner = ClientQueue::Owner(pids, ClientAlive);
+    if (owner == 0)
+    {
+        // Nobody lives in the queue (the owner quit or crashed and nobody was active before it): the first to see it
+        // takes the devices
+        EditOwners(_ownersPath, [self](std::vector<int64_t>& list) {
+            if (ClientQueue::Owner(list, ClientAlive) == 0)
+                ClientQueue::Claim(list, self, ClientAlive);
+        });
+        QFile again(_ownersPath);
+        if (again.open(QIODevice::ReadOnly))
+            owner = ClientQueue::Owner(ClientQueue::Parse(again.readAll().toStdString()), ClientAlive);
+    }
+    const bool owns = owner == self && !_steamOverlayUp;
+    if (owns == _service->Owner())
+        return;
+    qInfo("controllers: %s",
+          owns              ? "this window owns the controllers again"
+          : _steamOverlayUp ? "Steam's menu is over the window, the controllers are Steam's"
+                            : qPrintable(QString("another unreal-ng (pid %1) owns the controllers").arg(owner)));
+    _service->SetOwner(owns);
+    emit changed();
+}
+
+void HostControllers::checkSteamOverlay()
+{
+#ifdef __linux__
+    const bool up = _steamOverlay != nullptr && _steamOverlay->Up();
+    if (up == _steamOverlayUp)
+        return;
+    _steamOverlayUp = up;
+    updateOwner();
+#endif
+}
+#endif
+
+void HostControllers::poll()
+{
+#ifdef ENABLE_CONTROLLERS
+    uint64_t machine = 0;
+    if (EmulatorContext* context = _binding->context())
+        if (context->pControllerManager != nullptr)
+            machine = context->pControllerManager->Revision();
+    updateOwner();
+    checkAuto();
+    updateHapticsGate();
+    followContext();
+    updateWheelMenu();  // a window may have got its native handle
+    if (_service->Revision() == _revision && machine == _machineRevision)
+    {
+        publishDevices();
+        return;
+    }
+    _revision = _service->Revision();
+    _machineRevision = machine;
+    const auto promotions = _service->TakePromotions();
+    for (const auto& [from, to] : promotions)
+        _profiles.AddAlias(from, to);
+    if (!promotions.empty())
+    {
+        std::string error;
+        if (!_profiles.SaveAliases(UserProfileDir().toStdString(), error))
+            qWarning("controllers: %s", error.c_str());
+    }
+
+    const std::vector<HostDeviceInfo> devices = _service->Router().Devices();
+    std::vector<HostDeviceInfo> arrived;
+    for (const HostDeviceInfo& device : devices)
+        if (device.id != kKeyboard && std::find(_known.begin(), _known.end(), device.id) == _known.end())
+            arrived.push_back(device);
+    std::vector<std::pair<std::string, bool>> gone;  // name, a player
+    for (const HostDeviceId& id : _known)
+        if (std::none_of(devices.begin(), devices.end(), [&id](const HostDeviceInfo& device) { return device.id == id; }))
+        {
+            const auto it = _knownNames.find(id);
+            if (it != _knownNames.end())
+                gone.push_back(it->second);
+        }
+    _known.clear();
+    _knownNames.clear();
+    const auto player = [](const HostDeviceInfo& device) {
+        return device.family != "keyboard" && device.family != "mouse" &&
+               DeviceDatabase::Active()->ForFamily(device.family, device.layout).player;
+    };
+    for (const HostDeviceInfo& device : devices)
+    {
+        _known.push_back(device.id);
+        _knownNames[device.id] = {device.name, player(device)};
+    }
+    _wheelConnected = WheelClaim::AnyWheel(devices, *DeviceDatabase::Active());
+    updateWheelMenu();
+    Reapply();  // the arrived pads have their player connectors now
+
+    // ui-ux.md §8: the first connection of a pad on this computer gets the toast, a known one the status line
+    QStringList seen = QSettings().value("Controllers/SeenDevices").toStringList();
+    for (const HostDeviceInfo& device : arrived)
+    {
+        const QString name = QString::fromStdString(device.name);
+        if (!player(device))
+        {
+            emit notice(tr("%1 connected").arg(name));
+            continue;
+        }
+        // Seen by family and name, not by id: a Bluetooth pad gets a new id on another adapter
+        const QString key = QString::fromStdString(device.family + "|" + device.name);
+        const bool first = !seen.contains(key);
+        if (first)
+            seen << key;
+        QString connector;
+        const std::string plugged = _service->Router().PlayerConnector(device.id);
+        if (EmulatorContext* context = _binding->context(); context != nullptr && !plugged.empty() &&
+                                                           context->pControllerManager != nullptr)
+        {
+            const int index = context->pControllerManager->Find(plugged);
+            if (index >= 0)
+                connector = connectorview::DisplayName(context->pControllerManager->At(static_cast<size_t>(index)));
+        }
+        // A pad the database does not know and nobody taught yet: the toast offers the learn wizard
+        const bool unknown = device.family == "generic" && _service->ControlMap(device.id).empty();
+        if (first && unknown)
+            emit unknownDeviceConnected(name, QString::fromStdString(device.id));
+        emit deviceConnected(name, connector, first && !unknown);
+        emit notice(connector.isEmpty() ? tr("%1 connected").arg(name) : tr("%1 connected → %2").arg(name, connector));
+    }
+    if (!arrived.empty())
+        QSettings().setValue("Controllers/SeenDevices", seen);
+
+    // A pad gone while the machine runs: said at once, and the machine paused when the option asks for it
+    Emulator* emulator = _binding->emulator();
+    for (const auto& [name, isPlayer] : gone)
+    {
+        if (!isPlayer)
+            continue;
+        const bool running = emulator != nullptr && !emulator->IsPaused();
+        bool paused = false;
+        if (running && _pauseOnDisconnect)
+        {
+            // Applied, or queued behind a running command (it applies when that ends)
+            const execution::Outcome outcome =
+                emulator->Pause(execution::Requester{execution::Origin::Gui, {}}, "controller disconnected").outcome;
+            paused = outcome == execution::Outcome::Applied || outcome == execution::Outcome::Pending;
+        }
+        if (running)
+            emit deviceDisconnected(QString::fromStdString(name), paused);
+        emit notice(tr("%1 disconnected").arg(QString::fromStdString(name)));
+    }
+    publishDevices();  // after Reapply: the context holds the arrived devices
+#endif
+}
+
+#ifdef ENABLE_CONTROLLERS
+namespace
+{
+StateNode ToStateNode(const JsonValue& value)
+{
+    switch (value.GetType())
+    {
+        case JsonValue::Type::Null:
+            return {};
+        case JsonValue::Type::Bool:
+            return StateNode(value.AsBool());
+        case JsonValue::Type::Number:
+        {
+            const double number = value.AsNumber();
+            const auto whole = static_cast<int64_t>(number);
+            return static_cast<double>(whole) == number ? StateNode(whole) : StateNode(number);
+        }
+        case JsonValue::Type::String:
+            return StateNode(value.AsString());
+        case JsonValue::Type::Array:
+        {
+            StateNode node = StateNode::Array();
+            for (const JsonValue& item : value.Items())
+                node.push(ToStateNode(item));
+            return node;
+        }
+        case JsonValue::Type::Object:
+        {
+            StateNode node = StateNode::Object();
+            for (const auto& [key, member] : value.GetMembers())
+                node.members.emplace_back(key, ToStateNode(member));
+            return node;
+        }
+    }
+    return {};
+}
+}  // namespace
+
+void HostControllers::publishDevices()
+{
+    // The `controllers.devices` topic (monitoring/hostdevices.h): built again only when a device, a host verb or the
+    // status period says so, published only when it changed
+    if (_controlOwner == nullptr ||
+        !_devicesFeed.Poll(*_controlOwner, _service->Revision(), DevicesFeed::Clock::now()))
+        return;
+    const JsonValue* devices = _devicesFeed.Value().Find("devices");
+    monitoring::HostDevices::Instance().Publish(devices != nullptr ? ToStateNode(*devices) : StateNode::Array(),
+                                                _devicesFeed.Revision());
+}
+#endif
+
+connectorview::Led HostControllers::ConnectorLed() const
+{
+#ifdef ENABLE_CONTROLLERS
+    if (!_service || _binding == nullptr)
+        return {};
+    EmulatorContext* context = _binding->context();
+    ControllerManager* manager = context != nullptr ? context->pControllerManager : nullptr;
+    if (manager == nullptr)
+        return {};
+    const std::vector<Connector> connectors = manager->Connectors();
+    std::vector<uint16_t> states;
+    for (size_t i = 0; i < connectors.size(); ++i)
+        states.push_back(manager->State(i));
+    std::map<std::string, QStringList> drivers;
+    for (const HostDeviceInfo& device : _service->Router().Devices())
+        for (const std::string& connector : _service->Router().Connectors(device.id))
+            drivers[connector] << QString::fromStdString(device.name);
+    return connectorview::DescribeLed(connectors, states, drivers);
+#else
+    return {};
+#endif
+}
+
+bool HostControllers::DebugLayerHeld() const
+{
+#ifdef ENABLE_CONTROLLERS
+    if (!_service)
+        return false;
+    if (_playersFollow)
+        return false;  // the context has the pads in the debugger: no key is held for it
+    for (const HostDeviceInfo& device : _service->Router().Devices())
+    {
+        if (device.id == kKeyboard || _service->Router().Role(device.id) != DeviceRole::Player)
+            continue;
+        const std::vector<std::string> layers = _service->Router().Layers(device.id);
+        if (std::find(layers.begin(), layers.end(), "debug") != layers.end())
+            return true;
+    }
+#endif
+    return false;
+}
+
+void HostControllers::Reapply()
+{
+#ifdef ENABLE_CONTROLLERS
+    ProfileContext context;
+    context.devices = _service->Router().Devices();
+    if (EmulatorContext* ctx = _binding->context())
+        if (const TMemModel* model = Config::FindModelByEnum(ctx->config.mem_model))
+            context.machine = model->ShortName ? model->ShortName : "";
+    std::transform(context.machine.begin(), context.machine.end(), context.machine.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    context.signatures = _program.signatures;
+    context.fileSha256 = _program.fileSha256;
+    context.fileSet = _program.fileSet;
+    if (!_manualProfile.empty())
+        context.manual = {_manualProfile};
+    context.debugLayer = _debugLayer || _playersFollow;
+    assignPlayers(context.devices);
+    _resolved = _profiles.Apply(_service->Router(), context);
+    // The session trial lies over the game haptics of its own program only: another one drops it
+    _hapticsUnderTrial = _resolved.haptics;
+    const std::string sha = context.fileSha256.empty() ? std::string() : context.fileSha256.front();
+    if (!_trial.IsNull() && sha != _trialSha)
+        _trial = JsonValue();
+    if (!_trial.IsNull())
+    {
+        JsonValue haptics = OverlayHaptics(_resolved.haptics, _trial);
+        HapticProfile check;
+        std::string error;
+        if (ParseHapticProfile(haptics, check, error))
+        {
+            _resolved.haptics = std::move(haptics);
+            _resolved.hapticsProfile = _resolved.hapticsProfile.empty() ? std::string("session/trial")
+                                                                        : _resolved.hapticsProfile + "+trial";
+            _resolved.hapticsReason += (_resolved.hapticsReason.empty() ? "" : "; ") + std::string("session trial");
+        }
+        else
+        {
+            _trialError = error;
+            _trial = JsonValue();
+        }
+    }
+    // The user's drag and drop (the player verb) wins over the machine default and a profile's pin
+    for (const HostDeviceInfo& device : context.devices)
+        if (const auto choice = _playerChoice.find(device.id); choice != _playerChoice.end())
+            _service->Router().SetPlayerConnector(device.id, choice->second);
+    _context = context;
+    applyConnectorPlans();
+    attachHaptics();
+    const std::string videoKey = _resolved.video.IsNull() ? std::string()
+                                                          : _resolved.videoProfile + ":" + _resolved.video.Dump();
+    if (videoKey != _videoKey)
+    {
+        _videoKey = videoKey;
+        emit gameVideoChanged();
+    }
+    applyMemoryProfile();
+    for (const std::string& warning : _resolved.warnings)
+        qWarning("controllers: %s", warning.c_str());
+    emit changed();
+#endif
+}
+
+#ifdef ENABLE_CONTROLLERS
+void HostControllers::updateWheelMenu()
+{
+#ifdef Q_OS_WIN
+    // Only the Windows platform's window ids are HWNDs (offscreen hands out its own); a window without a native
+    // handle yet is skipped (internalWinId does not create one) and taken once it has one
+    std::vector<WheelClaim::Window> windows;
+    if (QGuiApplication::platformName() == QLatin1String("windows"))
+        for (QWidget* widget : {_mainWindow, _debuggerWindow})
+            if (widget != nullptr)
+                windows.push_back(static_cast<WheelClaim::Window>(widget->window()->internalWinId()));
+    const WheelClaim::Changes changes = _wheelClaim.Update(_wheelConnected, windows);
+    for (WheelClaim::Window window : changes.release)
+    {
+        WheelMenuWindows::Release(_wheelHolds[window]);
+        _wheelHolds.erase(window);
+    }
+    for (WheelClaim::Window window : changes.take)
+        _wheelHolds[window] = WheelMenuWindows::Take(reinterpret_cast<void*>(window));
+#endif
+}
+
+void HostControllers::releaseWheelMenu()
+{
+    for (WheelClaim::Window window : _wheelClaim.ReleaseAll().release)
+        WheelMenuWindows::Release(_wheelHolds[window]);
+    _wheelHolds.clear();
+}
+
+void HostControllers::applyMemoryProfile()
+{
+    if (!_attached)
+        return;
+    EmulatorContext* context = _attached->GetContext();  // lifetime-ok: _attached holds the emulator
+    DebugManager* debug = context ? context->pDebugManager : nullptr;
+    markup::MemoryMarkup* markup = debug ? debug->GetMemoryMarkup() : nullptr;
+    if (markup == nullptr)
+        return;
+    const std::string id = _resolved.gameMatches.empty() ? std::string() : _resolved.gameMatches.front().first;
+    std::string& applied = _memoryProfiles[_attached->GetId()];
+    if (id == applied)
+        return;
+    if (!applied.empty())
+        ClearMemoryProfile(applied, *markup, debug->GetLabelManager());
+    applied = id;
+    const Profile* profile = id.empty() ? nullptr : _profiles.Find(id);
+    if (profile == nullptr || profile->memory.IsNull())
+        return;
+    MemoryProfile memory;
+    std::string error;
+    if (!ParseMemoryProfile(profile->memory, memory, error))
+    {
+        qWarning("controllers: %s: %s", id.c_str(), error.c_str());
+        return;
+    }
+    std::vector<std::string> warnings;
+    const std::string folder = std::filesystem::path(profile->path).parent_path().string();
+    ApplyMemoryProfile(memory, id, profile->label, folder, *markup, debug->GetLabelManager(), warnings);
+    for (const std::string& warning : warnings)
+        qWarning("controllers: %s", warning.c_str());
+}
+
+markup::Reply HostControllers::saveMarkup(Emulator& emulator, const markup::SaveRequest& request)
+{
+    markup::Reply reply;
+    auto refuse = [&reply](markup::Error error, const std::string& message) {
+        reply.error = error;
+        reply.message = message;
+        return reply;
+    };
+    if (!_attached || _attached.get() != &emulator)
+        return refuse(markup::Error::Conflict, "the software profiles follow the machine the window shows; this one "
+                                               "is not it (select it in the window first)");
+    std::string id = request.profile;
+    if (id.empty())
+        id = _memoryProfiles[emulator.GetId()];
+    Profile profile;
+    bool created = false;
+    if (!id.empty())
+    {
+        if (_profiles.Find(id) == nullptr)
+        {
+            // A shipped game profile is parsed when something names it
+            ProfileContext named;
+            named.manual = {id};
+            std::vector<std::string> errors;
+            _profiles.LoadGamesFor(named, errors);
+        }
+        const Profile* found = _profiles.Find(id);
+        if (found == nullptr)
+            return refuse(markup::Error::NotFound, "no software profile '" + id + "'");
+        profile = *found;
+    }
+    else
+    {
+        if (_program.fileSha256.empty())
+            return refuse(markup::Error::Conflict, "no profile matches and no program was loaded from a file to key a "
+                                                   "new one: name a profile (profile=<id>)");
+        // Keyed as KeepAutoDecision keys a kept choice: the content signature, else the file hash
+        std::string content;
+        for (const std::string& signature : _program.signatures)
+            if (signature.rfind("file:", 0) != 0)
+                content = signature;
+        const std::string& sha = _program.fileSha256.front();
+        const std::string key = content.empty() ? sha : content.substr(content.rfind(':') + 1);
+        id = "user/game-" + key.substr(0, 16);
+        if (const Profile* found = _profiles.Find(id))
+            profile = *found;
+        else
+        {
+            profile.kind = ProfileKind::Play;
+            profile.id = id;
+            profile.label = _fileName.toStdString();
+            profile.fileSha256 = {sha};
+            if (!content.empty())
+                profile.signatures = {content};
+            profile.fileSet = _program.fileSet;
+            profile.options = JsonValue::Object();
+            created = true;
+        }
+    }
+    MemoryProfile memory;
+    std::string error;
+    if (!profile.memory.IsNull() && !ParseMemoryProfile(profile.memory, memory, error))
+        return refuse(markup::Error::Conflict, id + ": its memory section does not read (" + error + "): fix the "
+                                               "file first");
+    const MemoryProfileMerge merge = MergeIntoMemoryProfile(request.user, request.analysis, memory);
+    profile.memory = MemoryProfileToJson(memory);
+    profile.scope = ProfileScope::User;
+    // Laid over again from the file written, even when the same profile was the applied one
+    _memoryProfiles[emulator.GetId()].clear();
+    if (EmulatorContext* context = emulator.GetContext())  // lifetime-ok: _attached holds the emulator
+        if (DebugManager* debug = context->pDebugManager)
+            if (markup::MemoryMarkup* markup = debug->GetMemoryMarkup())
+                markup->ClearLayer(markup::Layer::Profile);
+    QString why;
+    if (!saveUserProfile(profile, why))
+        return refuse(markup::Error::Conflict, id + ": " + why.toStdString());
+    const Profile* saved = _profiles.Find(id);
+    reply.body["profile"] = id;
+    const std::string path =
+        saved != nullptr && !saved->path.empty() ? saved->path : ProfileStore::SavePath(profile, UserProfileDir().toStdString());
+    reply.body["path"] = path;
+    reply.body["created"] = created;
+    reply.body["regions"] = static_cast<uint64_t>(memory.regions.size());
+    reply.body["comments"] = static_cast<uint64_t>(memory.comments.size());
+    reply.body["added_regions"] = static_cast<uint64_t>(merge.regions);
+    reply.body["added_comments"] = static_cast<uint64_t>(merge.comments);
+    reply.body["skipped"] = static_cast<uint64_t>(merge.skipped);
+    reply.body["applied"] = _memoryProfiles[emulator.GetId()] == id;
+    std::string text = (created ? "Created " : "Saved to ") + id + " (" + path + "): " +
+                       std::to_string(merge.regions) + " region(s), " + std::to_string(merge.comments) +
+                       " comment(s) added; the section holds " + std::to_string(memory.regions.size()) +
+                       " region(s), " + std::to_string(memory.comments.size()) + " comment(s)";
+    if (merge.skipped > 0)
+        text += "; " + std::to_string(merge.skipped) + " on a cache page skipped (a profile names RAM, ROM or the CPU)";
+    if (_memoryProfiles[emulator.GetId()] != id)
+        text += "; another profile matches this program more strongly, so " + id + " does not lie over the machine";
+    reply.text = text;
+    return reply;
+}
+
+void HostControllers::attachHaptics()
+{
+    if (!_attached)
+        return;
+    EmulatorContext* context = _attached->GetContext();  // lifetime-ok: _attached holds the emulator
+    if (context == nullptr || context->pControllerManager == nullptr)
+        return;
+    HapticProfile profile;
+    std::string error;
+    const bool game = !_resolved.haptics.IsNull() && ParseHapticProfile(_resolved.haptics, profile, error);
+    if (!error.empty())
+        qWarning("controllers: %s: %s", _resolved.hapticsProfile.c_str(), error.c_str());
+    const std::string key = game ? "profile:" + _resolved.hapticsProfile + ":" + _resolved.haptics.Dump()
+                                 : (_soundHaptics ? std::string(_soundHapticsDsp ? "sound+dsp" : "sound")
+                                                  : std::string());
+    if (key == _hapticsKey && (key.empty() || _hapticFeed))
+        return;
+    _hapticsKey = key;
+    if (game)
+        _hapticFeed = _service->HapticFeedFor(_attached->GetId(), profile, _resolved.hapticsProfile);
+    else if (_soundHaptics)
+        _hapticFeed = _service->HapticFeedFor(_attached->GetId());
+    else
+        _hapticFeed.reset();
+    context->pControllerManager->SetHapticFeed(_hapticFeed);
+}
+
+QString HostControllers::HapticsStatus(const std::string& device) const
+{
+    QString text;
+    if (auto* game = dynamic_cast<const ProfileHaptics*>(_hapticFeed.get()))
+    {
+        text = tr("Profile %1").arg(QString::fromStdString(game->Name()));
+        QStringList sources;
+        for (const auto& [name, level] : game->SourceLevels())
+            sources << QString("%1 %2").arg(QString::fromStdString(name)).arg(level, 0, 'f', 2);
+        if (!sources.isEmpty())
+            text += "\n" + tr("Sources: %1").arg(sources.join(", "));
+    }
+    else if (_hapticFeed)
+        text = tr("From the sound (AY noise / envelope, beeper)");
+    else
+        text = tr("Off");
+    text += "\n" + (_service->Haptics().GateOpen() ? tr("Gate open") : tr("Gate closed (paused, turbo, replay or "
+                                                                            "no focus)"));
+    if (!device.empty() && _service->HasRumble(device))
+    {
+        const RumbleLevels levels = _service->Haptics().Written(device);
+        text += "\n" + tr("Motors: low %1, high %2, triggers %3 / %4")
+                           .arg(levels.low, 0, 'f', 2)
+                           .arg(levels.high, 0, 'f', 2)
+                           .arg(levels.leftTrigger, 0, 'f', 2)
+                           .arg(levels.rightTrigger, 0, 'f', 2);
+    }
+    return text;
+}
+
+QString HostControllers::UserControllersDir()
+{
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation))
+        .filePath("unreal-ng/controllers");
+}
+
+QString HostControllers::UserProfileDir()
+{
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation))
+        .filePath("unreal-ng/controllers/profiles");
+}
+
+/// retro-devices.md §4, the machine default: the n-th pad takes the n-th of next.left, next.right, kempston,
+/// sinclair-1, sinclair-2 the machine has with a device; none of them: a cursor joystick on a free keyboard socket
+void HostControllers::assignPlayers(const std::vector<HostDeviceInfo>& devices)
+{
+    EmulatorContext* context = _binding->context();
+    ControllerManager* manager = context != nullptr ? context->pControllerManager : nullptr;
+    if (manager == nullptr)
+        return;
+    std::vector<std::string> order;
+    if (!_autoConnector.empty() && manager->Find(_autoConnector) >= 0)
+        order.push_back(_autoConnector);  // the program's choice (port reads) before the machine default
+    const std::vector<Connector> connectors = manager->Connectors();
+    for (const char* id : {"next.left", "next.right", "kempston", "sinclair-1", "sinclair-2"})
+        for (const Connector& connector : connectors)
+            if (connector.id == id && connector.device != RetroDeviceKind::None &&
+                std::find(order.begin(), order.end(), connector.id) == order.end())
+                order.push_back(connector.id);
+    for (const Connector& connector : connectors)
+        if (connector.kind == ConnectorKind::KeyboardJoystick && connector.device != RetroDeviceKind::None &&
+            std::find(order.begin(), order.end(), connector.id) == order.end())
+            order.push_back(connector.id);
+
+    // A keyboard, a mouse and a control surface (the Surface Dial, `"player": false` in the device database) take
+    // no player connector
+    const auto player = [](const HostDeviceInfo& device) {
+        return device.family != "keyboard" && device.family != "mouse" &&
+               DeviceDatabase::Active()->ForFamily(device.family, device.layout).player;
+    };
+    const size_t pads = static_cast<size_t>(std::count_if(devices.begin(), devices.end(), player));
+    if (order.empty() && pads > 0)
+    {
+        ControllerControl control(context);
+        ControllerRequest request{"plug", "auto", "cursor-joystick", {{"async", ""}}};
+        const ControllerReply reply = control.Execute(request);
+        if (reply.result.Ok())
+            order.push_back(reply.connector);
+    }
+    size_t n = 0;
+    for (const HostDeviceInfo& device : devices)
+    {
+        // A control surface starts as a debugger remote by its family's role (HostInputService, the device
+        // database's `role`): its debug profile acts with no layer key
+        if (!player(device))
+            continue;
+        _service->Router().SetPlayerConnector(device.id, n < order.size() ? order[n] : std::string{});
+        ++n;
+    }
+}
+
+std::string HostControllers::ChoosePlayerConnector(const std::string& device, const std::string& connector,
+                                                   std::string& message)
+{
+    const std::vector<HostDeviceInfo> devices = _service->Router().Devices();
+    const auto info = std::find_if(devices.begin(), devices.end(),
+                                   [&device](const HostDeviceInfo& known) { return known.id == device; });
+    if (info == devices.end())
+    {
+        message = "no connected host device '" + device + "' (devices lists them)";
+        return "unknown-device";
+    }
+    if (info->family == "keyboard" || info->family == "mouse" ||
+        !DeviceDatabase::Active()->ForFamily(info->family, info->layout).player)
+    {
+        message = info->name + " takes no player connector: its bindings name their targets";
+        return "bad-request";
+    }
+    if (connector.empty())
+    {
+        _playerChoice.erase(device);
+        Reapply();
+        return {};
+    }
+    if (connector == "none")
+    {
+        // Unplugged by hand (a cord dragged off its connector): the device drives no player connector
+        _playerChoice[device].clear();
+        Reapply();
+        return {};
+    }
+    EmulatorContext* context = _binding->context();
+    ControllerManager* manager = context != nullptr ? context->pControllerManager : nullptr;
+    if (manager == nullptr)
+    {
+        message = "no machine is bound: start one first";
+        return "unavailable";
+    }
+    const int index = manager->Find(connector);
+    if (index < 0)
+    {
+        message = "no connector '" + connector + "' on this machine (list names them)";
+        return "bad-request";
+    }
+    const Connector found = manager->At(static_cast<size_t>(index));
+    if (found.device == RetroDeviceKind::None)
+    {
+        message = found.id + " holds no device: plug one first (plug " + found.id + " kempston-joystick)";
+        return "bad-request";
+    }
+    _playerChoice[device] = found.id;
+    Reapply();
+    return {};
+}
+
+void HostControllers::ResetPlayerChoices()
+{
+    _playerChoice.clear();
+    Reapply();
+}
+
+std::string HostControllers::PlayerChoice(const std::string& device) const
+{
+    const auto it = _playerChoice.find(device);
+    if (it == _playerChoice.end())
+        return {};
+    return it->second.empty() ? std::string("none") : it->second;
+}
+
+HostReply HostControllers::Host(const HostRequest& request)
+{
+    return HostInputControl(*_controlOwner).Execute(request);
+}
+
+bool HostControllers::saveUserProfile(Profile profile, QString& error)
+{
+    // Validate through the same reader the files go through
+    Profile checked;
+    std::string why;
+    const std::string text = ProfileStore::Dump(profile);
+    if (!ParseProfile(text, checked, why) || !ProfileStore::Save(checked, UserProfileDir().toStdString(), why))
+    {
+        error = QString::fromStdString(why);
+        return false;
+    }
+    checked.scope = ProfileScope::User;
+    if (!_profiles.Add(checked, why))
+    {
+        error = QString::fromStdString(why);
+        return false;
+    }
+    Reapply();
+    return true;
+}
+
+bool HostControllers::KeepAutoDecision(QString& error)
+{
+    if (_program.fileSha256.empty() || _autoConnector.empty())
+    {
+        error = tr("Nothing to keep: no program loaded from a file, or no automatic choice");
+        return false;
+    }
+    // Keyed by the signatures (D7): the content one finds the program re-packed or renamed, the file set after saves,
+    // the file hash as before (and as the profiles of older versions did)
+    std::string content;
+    for (const std::string& signature : _program.signatures)
+        if (signature.rfind("file:", 0) != 0)
+            content = signature;
+    const std::string& sha = _program.fileSha256.front();
+    const std::string key = content.empty() ? sha : content.substr(content.rfind(':') + 1);
+    Profile profile;
+    profile.kind = ProfileKind::Play;
+    profile.scope = ProfileScope::User;
+    profile.id = "user/game-" + key.substr(0, 16);
+    profile.label = _fileName.toStdString();
+    profile.fileSha256 = {sha};
+    if (!content.empty())
+        profile.signatures = {content};
+    profile.fileSet = _program.fileSet;
+    profile.options = JsonValue::Object();
+    ConnectorPlan plan;
+    plan.device = _decision.device;
+    plan.options = JsonValue::Object();
+    if (!_decision.option.empty())
+        plan.options.Set(_decision.option, JsonValue::String(_decision.optionValue));
+    profile.connectors[_autoConnector] = plan;
+    profile.players = {{"auto:1", _autoConnector}};
+    return saveUserProfile(std::move(profile), error);
+}
+
+std::string HostControllers::SetHapticsTrial(const JsonValue& overlay, std::string& message)
+{
+    if (!_attached)
+    {
+        message = "no emulator instance to try the haptics on";
+        return "unavailable";
+    }
+    const JsonValue previous = _trial;
+    const std::string previousSha = _trialSha;
+    _trial = overlay;
+    _trialSha = _program.fileSha256.empty() ? std::string() : _program.fileSha256.front();
+    _trialError.clear();
+    Reapply();
+    if (_trialError.empty())
+        return {};
+    message = _trialError;
+    _trial = previous;
+    _trialSha = previousSha;
+    Reapply();
+    return "bad-request";
+}
+
+void HostControllers::updateHapticsGate()
+{
+    Emulator* emulator = _binding->emulator();
+    EmulatorContext* context = _binding->context();
+    bool open = emulator != nullptr && context != nullptr && emulator->IsRunning() && !emulator->IsPaused() &&
+                !emulator->IsTurboMode() && QGuiApplication::applicationState() == Qt::ApplicationActive;
+    if (open && (context->rzxPlayer != nullptr ||
+                 (context->pTimeTravelHooks != nullptr && context->pTimeTravelHooks->OwnsInput())))
+        open = false;  // history and RZX replay what was, the haptics stay quiet
+    _service->SetHapticsGate(open);
+}
+
+void HostControllers::onBreakpointHit(const QString& emulatorId)
+{
+    Emulator* emulator = _binding->emulator();
+    if (!_debugLayer || emulator == nullptr || QString::fromStdString(emulator->GetId()) != emulatorId)
+        return;
+    constexpr uint32_t kPulseMs = 80;
+    for (const HostDeviceInfo& device : _service->Router().Devices())
+        if (_service->HasRumble(device.id))
+            _service->PlayEffect(device.id, {{0.5f, 0.5f, 0.0f, 0.0f}, kPulseMs, true});
+}
+
+void HostControllers::onFileLoaded(const QString& emulatorId, const QString& path)
+{
+    Emulator* emulator = _binding->emulator();
+    if (emulator == nullptr || QString::fromStdString(emulator->GetId()) != emulatorId)
+        return;
+    _fileName = QFileInfo(path).fileName();
+    std::string error;
+    if (!ProgramSignatures(path.toStdString(), _program, error))
+        qWarning("controllers: signatures of %s: %s", qUtf8Printable(path), error.c_str());
+    _autoDone = false;
+    _keyboardNoticed = false;
+    _cardNoticed = false;
+    _autoConnector.clear();
+    _decision = {};
+    Reapply();
+}
+
+void HostControllers::onGuestProgram(const QString& emulatorId, const QString& path, const QByteArray& data)
+{
+    Emulator* emulator = _binding->emulator();
+    if (emulator == nullptr || QString::fromStdString(emulator->GetId()) != emulatorId)
+        return;
+    _fileName = QFileInfo(path).fileName();
+    std::string error;
+    if (!ProgramSignatures(reinterpret_cast<const uint8_t*>(data.constData()), static_cast<size_t>(data.size()),
+                           _fileName.toStdString(), _program, error))
+        qWarning("controllers: signatures of %s (read by the guest): %s", qUtf8Printable(path), error.c_str());
+    _autoDone = false;
+    _keyboardNoticed = false;
+    _cardNoticed = false;
+    _autoConnector.clear();
+    _decision = {};
+    Reapply();
+}
+
+void HostControllers::applyConnectorPlans()
+{
+    EmulatorContext* context = _binding->context();
+    if (context == nullptr || context->pControllerManager == nullptr || _resolved.connectors.empty())
+        return;
+    ControllerManager* manager = context->pControllerManager;
+    for (const auto& [id, plan] : _resolved.connectors)
+    {
+        const int index = manager->Find(id);
+        if (index < 0)
+            continue;
+        if (RetroDeviceKindName(manager->At(static_cast<size_t>(index)).device) != plan.device)
+        {
+            ControllerRequest request{"plug", id, plan.device, {{"async", ""}}};
+            for (const auto& [name, value] : plan.options.GetMembers())
+                request.options[name] = value.IsString() ? value.AsString()
+                                        : value.IsBool() ? std::string(value.AsBool() ? "true" : "false")
+                                                         : std::to_string(static_cast<long long>(value.AsNumber()));
+            const ControllerReply reply = ControllerControl(context).Execute(request);
+            if (!reply.result.Ok())
+                qWarning("controllers: %s: %s", id.c_str(), reply.result.message.c_str());
+        }
+    }
+    // A kept game profile holds the connectors: the port reads decide nothing more for this program
+    if (!_autoDone)
+    {
+        _autoDone = true;
+        manager->WatchPortReads(false);
+    }
+}
+
+void HostControllers::checkAuto()
+{
+    if (_autoDone)
+        return;
+    EmulatorContext* context = _binding->context();
+    if (context == nullptr || context->pControllerManager == nullptr)
+        return;
+    const DeviceAccessEvidence evidence = context->pControllerManager->PortReads();
+    if (!evidence.active)
+        return;
+    const AutoDecision decision = DecideAuto(evidence);
+    if (decision.keyboard)
+    {
+        // A menu or a text prompt reads every key: say so once and keep watching, the joystick comes later
+        if (!_keyboardNoticed)
+        {
+            _keyboardNoticed = true;
+            emit notice(tr("This program reads the whole keyboard"));
+        }
+        return;
+    }
+    if (!decision.decisive)
+    {
+        // Reads of a port nothing on the machine answers (#1F on a bare 48K): name the card once, fit nothing (a
+        // card restarts the machine) and keep watching
+        if (!decision.card.empty() && !_cardNoticed)
+        {
+            _cardNoticed = true;
+            emit notice(QString::fromStdString(decision.hint));
+        }
+        return;
+    }
+    applyAuto(decision);
+}
+
+void HostControllers::applyAuto(const AutoDecision& chosen)
+{
+    EmulatorContext* context = _binding->context();
+    ControllerManager* manager = context != nullptr ? context->pControllerManager : nullptr;
+    if (manager == nullptr)
+        return;
+    AutoDecision decision = chosen;
+    // The game's profile knows the keys of its QAOP-style joystick (its fire key may be M)
+    if (decision.device == "keys-joystick" && !_resolved.joystickKeys.empty())
+        decision.optionValue = _resolved.joystickKeys;
+    _autoDone = true;
+    manager->WatchPortReads(false);
+    if (decision.device == "kempston-mouse" || decision.device == "amx-mouse")
+    {
+        emit notice(tr("This program reads the %1 (%2)")
+                        .arg(QString::fromStdString(decision.label), QString::fromStdString(decision.reason)));
+        return;
+    }
+    std::string connector = decision.connector;
+    if (connector.empty())
+    {
+        // The machine's connector for the reads the decision rests on: `kempston` on a Pentagon, `next.left` on a
+        // Next; a fixed one carries the board's device (the Next's MD pad), which the profile then binds
+        if (const int found = manager->FindForInput(decision.input, decision.source); found >= 0)
+        {
+            const Connector fitted = manager->At(static_cast<size_t>(found));
+            connector = fitted.id;
+            if (fitted.fixed)
+                decision.device = RetroDeviceKindName(fitted.device);
+        }
+    }
+    else if (manager->Find(connector) < 0)
+    {
+        return;  // the machine has no such connector: the default stays
+    }
+    if (connector.empty())
+    {
+        // No connector of the machine answers those reads: plug the device where one takes it (the refusal names
+        // what is missing, such as a Kempston card on a bare 48K)
+        ControllerRequest request{"plug", "auto", decision.device, {{"async", ""}}};
+        if (!decision.option.empty())
+            request.options[decision.option] = decision.optionValue;
+        const ControllerReply reply = ControllerControl(context).Execute(request);
+        if (!reply.result.Ok())
+        {
+            emit notice(tr("%1: %2").arg(QString::fromStdString(decision.label),
+                                          QString::fromStdString(reply.result.message)));
+            return;
+        }
+        connector = reply.connector;
+    }
+    _decision = decision;
+    _autoConnector = connector;
+    Reapply();
+    emit autoDecided(tr("%1 on %2 (port reads: %3)")
+                         .arg(QString::fromStdString(decision.label), QString::fromStdString(connector),
+                              QString::fromStdString(decision.reason)));
+}
+#endif

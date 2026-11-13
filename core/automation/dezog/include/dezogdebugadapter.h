@@ -14,6 +14,8 @@
 // notification in response to its own CMD_PAUSE / CMD_CONTINUE.
 
 #include "dzrpserver.h"
+#include "emulator/execution/executionarbiter.h"
+#include "common/uuid.h"
 #include "3rdparty/message-center/eventqueue.h"
 
 #include <cstdint>
@@ -27,7 +29,9 @@
 #include <vector>
 
 class Emulator;
-namespace ttd { class TimeTravelManager; }
+class Memory;
+class NextMemory;
+struct BreakpointSpec;
 
 class DezogDebugAdapter : public dzrp::IDebugInterface, public Observer
 {
@@ -47,6 +51,10 @@ public:
 
     // Notification sink (server.notifyPause in production, lambda in tests)
     void setPauseNotifier(PauseNotifier notifier);
+    /// The text of the last stop the notifier was told ("" for DeZog's own breakpoints, a step, a pause): the NTF_PAUSE
+    /// reason string of a stop DeZog has no breakpoint for (a port, NextREG, copper, beam, magic, chip register, DMA,
+    /// keyboard or event breakpoint, or another CPU's)
+    std::string stopText() const;
 
     // --- IDebugInterface ---
     void pause() override;
@@ -62,6 +70,15 @@ public:
     std::vector<uint8_t> getSlots() const override;
     void setSlot(uint8_t slot, uint8_t bank) override;
     void writeBank(uint8_t bank, const std::vector<uint8_t>& data) override;
+    std::vector<uint8_t> readBankMemory(uint8_t bank, uint16_t offset, uint16_t size) const override;
+    void writeBankMemory(uint8_t bank, uint16_t offset, const std::vector<uint8_t>& data) override;
+    std::vector<uint8_t> getSpritesPalette(uint8_t which) const override;
+    std::vector<uint8_t> getSprites(uint8_t index, uint8_t count) const override;
+    std::vector<uint8_t> getSpritePatterns(uint8_t index, uint8_t count) const override;
+    std::vector<uint8_t> getSpritesClipWindowAndControl() const override;
+    uint8_t readNextReg(uint8_t reg) const override;
+    uint8_t nextRomSelect() const override;
+    void writeNextReg(uint8_t reg, uint8_t value) override;
 
     uint16_t addBreakpoint(uint16_t addr, uint8_t bank = 0, const std::string& condition = "",
                            bool temporary = false) override;
@@ -79,6 +96,9 @@ public:
 
     uint8_t readPort(uint16_t port) const override;
     void writePort(uint16_t port, uint8_t value) override;
+    void setInterrupts(bool enabled) override;
+    std::string saveSnapshotFile(const std::string& path) override;
+    std::string loadSnapshotFile(const std::string& path) override;
 
     // --- ZRCP transport capabilities ---
     bool stepOnce() override;
@@ -96,9 +116,16 @@ public:
     // (CLI / GUI / analyzers) are preserved.
     void onSessionClosed() override;
 
+    // Automation session (execution arbiter design §6a): the connected DeZog holds the emulator's run control - the
+    // GUI shows "dezog (DeZog) from <peer>" and locks; the user can take it back (controlTakenBack)
+    void onClientConnected(const std::string& peer) override;
+    bool controlTakenBack() const override;
+    /// The protocol the session came over, shown to the user with it ("DeZog (DZRP)", "DeZog (ZRCP)")
+    void setSessionClientName(std::string name) { _sessionClientName = std::move(name); }
+
     // --- Instruction history over TTD ---
     // Entries are served from the TTD per-frame decode cache
-    // (TimeTravelManager::GetFrameCache): a DeZog index is mapped to
+    // (TimeTravelController::GetFrameCache): a DeZog index is mapped to
     // (frame, entry-in-frame) via lazily-built frame segments, and the decoded
     // record (registers, slots, opcodes at PC, word at SP) is read straight
     // from the cache. Browsing is read-only under the TTD DebuggerLive mode
@@ -131,11 +158,31 @@ public:
     size_t getWatchpointCount() const;
     bool isBreakpointTemporary(uint16_t id) const;
 
-    // DZRP bank numbering (DeZog ZX128 memory model): RAM pages 0..7 map 1:1,
-    // ROM0 = 8, ROM1 = 9. CMD_SET_SLOT additionally accepts the 0xFE/0xFF aliases.
+    // DZRP bank numbering, one mapping for slots, SET_SLOT, breakpoints, watchpoints and history:
+    // - 128K-style machines (DeZog MemoryModelZx128k): RAM pages map 1:1 (0..0x7F); ROM0 = 8 is the 128 editor ROM
+    //   (Memory::base_128_rom, whichever physical page the model keeps it in), ROM1 = 9 the 48 BASIC ROM
+    //   (base_sos_rom); any other ROM page (TR-DOS, a service ROM) is 0x80 + page. CMD_SET_SLOT additionally takes
+    //   the 0xFE / 0xFF aliases of 8 / 9 (ROM pages 0x7E / 0x7F have no bank of their own for it).
+    // - 48K (MemoryModelZx48k): bank 0 the ROM at 0000-3FFF, bank 1 the RAM at 4000-FFFF.
+    // - ZX Next (MemoryModelZxNextOneROM): 8K banks 0..223 (half of a 16K page), 0xFC-0xFF the ROM an MMU value of
+    //   #FF shows (DeZog names it 0xFE in slot 0, 0xFF in slot 1; a breakpoint takes bank & 1 as the half).
     static constexpr uint8_t ROM_BANK_BASE = 8;
+    static constexpr uint8_t OTHER_ROM_BANK_BASE = 0x80;
     static constexpr uint8_t ROM0_ALIAS = 0xFE;
     static constexpr uint8_t ROM1_ALIAS = 0xFF;
+    static constexpr uint8_t NEXT_ROM_BANK_FIRST = 0xFC;
+    static constexpr uint8_t NEXT_ROM_LOWER = 0xFE;
+
+    /// The DZRP bank of ROM page `page` on a 128K-style machine
+    static uint8_t bankForRomPage(Memory& memory, uint16_t page);
+    /// The ROM page of a DZRP slot-0 bank (8 / 0xFE, 9 / 0xFF, 0x80 + page); MEMORY_UNMAPPABLE: not a ROM bank
+    static uint16_t romPageForBank(Memory& memory, uint8_t bank);
+    /// The physical target of a breakpoint at CPU address `addr` in DZRP bank `bank` (not the wire's bank + 1):
+    /// fills the page, its type, the slot-only flag and on the Next the offset in the 16K page. False: the machine
+    /// has no such bank at that address (a 48K bank 1 at 0000-3FFF, a Next bank above 223 below the ROM ones)
+    bool physicalForBank(uint8_t bank, uint16_t addr, BreakpointSpec& spec) const;
+    /// The byte at `offset` of Next 8K bank `bank` (RAM 0..223; the ROM banks: the 16K ROM shown, wrapping). Null: none
+    static uint8_t* nextBankByte(NextMemory& memory, uint8_t bank, uint16_t offset);
 
     static constexpr const char* BREAKPOINT_OWNER = "dezog";
 
@@ -160,22 +207,28 @@ private:
     void leaveHistory(Emulator& emulator);
     void leaveHistoryIfBrowsing();
     // Out-of-band mutation (register/memory/slot/bank write from the debugger).
-    // The engine (backend engine) records it as an event with what it changed,
-    // so replay reproduces it and no history is lost (D9). v1 reconstructs
-    // history by deterministic replay, which such edits break: it records the
-    // marker, then restarts recording from the edited state (history before
-    // the edit is dropped; marker-only handling is UNSOUND there, §6.4).
+    // The engine records it as an event with what it changed, so replay
+    // reproduces it and no history is lost (D9). Without the controller
+    // (no session) the edit is applied as it comes.
     void editMachine(Emulator& emulator, const char* what, const std::function<void()>& edit);
     void subscribe();
     void unsubscribe();
-    void notify(dzrp::BreakReason reason, uint16_t addr);
+    void notify(dzrp::BreakReason reason, uint16_t addr, const std::string& text = "");
+    /// The wire bank (bank + 1, 0 none) of the slot `addr` is in, as NTF_PAUSE carries it
+    uint8_t wireBankAt(uint16_t addr) const;
 
     // MessageCenter observer callback (Observer-method signature)
     void onBreakpointMessage(int id, Message* message);
 
     mutable std::mutex _mutex;
+    std::string _peer;              // where the connected DeZog is ("host:port")
+    std::string _sessionClientName = "DeZog";
+    unreal::UUID _sessionOwner;     // the run-control claim of the session (nil: none, another surface held it)
+    /// Who asks, for the execution arbiter: this session when it holds run control, else DeZog alone
+    execution::Requester sessionRequester() const;
     std::shared_ptr<Emulator> _emulator;              // Explicit binding (nullptr = dynamic)
     PauseNotifier _notifier;
+    std::string _stopText;
 
     std::set<uint16_t> _temporaryBreakpoints;         // BreakpointManager IDs
     size_t _maxTemporaryBreakpoints = 0;              // High-water mark (tests)
@@ -187,7 +240,7 @@ private:
     //
     // STRATEGY (see docs/inprogress/2026-08-27-dezog-integration/reverse-debugging.md
     // §5 "Best strategy for DeZog"): a DeZog history index is served from the TTD
-    // per-frame decode cache (TimeTravelManager::GetFrameCache), not by a live
+    // per-frame decode cache (TimeTravelController::GetFrameCache), not by a live
     // seek per read. Instructions are grouped by frame; we map a global DeZog
     // index → (frame, entry-in-frame) via `_historySegs` (built lazily from the
     // present backward) and read the decoded record straight from the cache.

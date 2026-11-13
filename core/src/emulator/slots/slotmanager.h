@@ -43,7 +43,9 @@
 #include <vector>
 
 #include "emulator/slots/slotconfig.h"
+#include "debugger/ttd/ttdserializable.h"   // TTDDeviceKey, TTDDeviceStates
 #include "emulator/slots/slotplanner.h"
+#include "debugger/ttd/ttdperipheralmask.h"
 
 struct CONFIG;
 enum class GSTypeKind : uint8_t;
@@ -56,6 +58,7 @@ class IClaimSignals;
 namespace ttd
 {
 class TTDPeripheralRegistry;
+class TTDDeviceTable;
 struct TTDConfigFingerprint;
 }
 
@@ -119,6 +122,21 @@ public:
         std::string reason;     ///< the planner's sentence and what the rule says
     };
 
+    /// A slot of the machine's own design, filled by the machine's own configuration (SL-8: the Sprinter's ISA-8
+    /// slots, `[ISA] SlotN`): reported with the slot set, not planned (the cards in it are the board's). A ZX-bus
+    /// adapter in it hosts a ZX-bus of its own: the slot of the same id in [SLOTS] (`isa.1 = neogs`, behind the
+    /// adapter `sprinter-isa-zxbus`) is that bus's card
+    struct MachineSlot
+    {
+        std::string slot;       ///< "isa.1"
+        std::string bus;        ///< the machine's bus id: "isa"
+        std::string card;       ///< the board's card key ("zxbus", "ne2000", "none")
+        std::string name;       ///< "ISA to ZX-bus adapter"
+        std::string source;     ///< "[ISA] Slot1"
+        std::string hosts;      ///< the bus kind a ZX-bus adapter hosts ("zxbus"); "" when none
+        std::string details;    ///< the card's resources ("RTL8019AS, #300, IRQ 3"); "" when none
+    };
+
     struct Result
     {
         MEM_MODEL model{};
@@ -129,6 +147,7 @@ public:
         std::vector<std::string> log;                 ///< deprecation and refusal lines (logged as warnings)
         std::vector<std::string> info;                ///< cards fitted with the fit override (logged as info)
         std::vector<Conflict> conflicts;              ///< configured entries in conflict: the machine is not created
+        std::vector<MachineSlot> machineSlots;        ///< the machine's own slots (Sprinter ISA), SL-8
 
         /// Why the machine is not created: every conflicting pair with its rule; "" when the set is creatable
         std::string Refusal() const;
@@ -139,7 +158,12 @@ public:
         const Slot* FindSlot(const std::string& slot) const;
         const Slot* FindGroup(SlotCardGroup group) const;
         const BuiltIn* FindBuiltIn(const std::string& id) const;
+        const MachineSlot* FindMachineSlot(const std::string& slot) const;
     };
+
+    /// The machine's own slots of a config (SL-8): the Sprinter's ISA slots from `[ISA]`; empty for a machine
+    /// without them
+    static std::vector<MachineSlot> MachineSlotsOf(const CONFIG& config, const slots::MachineDef* machine);
 
     /// The legacy card fields of a config as slots (every group, or only `groups`), for the machine of the config:
     /// TurboSound -> ay-socket, GSType -> a GS card, MoonSound, SD / CovoxFB -> soundrive / covox-fb or the board
@@ -302,15 +326,24 @@ public:
 
     // region <TTD (SL-5, slotttd.cpp; architecture.md §8)>
 
-    /// The devices of a TTD checkpoint: the blob ids it holds and the devices fitted but deliberately not recorded
-    /// (TTDPeripheralRegistry::MarkNotRecorded, the lightweight General Sound). Ids are ttd::PeripheralId values
+    /// The devices of a TTD checkpoint: the devices it holds a state for and the devices fitted but deliberately not
+    /// recorded (TTDPeripheralRegistry::MarkNotRecorded, the lightweight General Sound). The AY socket's `ay` and
+    /// `ts` boards are one type (TurboSound); `socketCard` tells them apart where the device's engine instance names
+    /// the socket's card (`ay-socket.ts`): the live registry and the engine's device table do ("" = not known,
+    /// either board)
     struct TtdDeviceSet
     {
-        std::vector<uint8_t> ids;
-        uint64_t notRecorded = 0;   ///< bit per PeripheralId
+        std::vector<ttd::TTDDeviceKey> devices;
+        std::vector<ttd::TTDDeviceKey> notRecorded;
+        std::string socketCard;     ///< "ay" / "ts" / "tsfm" from the socket device's instance; "" when not known
 
-        static TtdDeviceSet Of(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs, uint64_t notRecorded);
+        /// A device of @p type held or fitted
+        bool Holds(ttd::TTDDeviceType type) const;
+
         static TtdDeviceSet Of(const ttd::TTDPeripheralRegistry& registry);
+        /// A session file of the engine: every device of its device table, the not-recorded devices from the
+        /// controller's facts
+        static TtdDeviceSet Of(const ttd::TTDDeviceTable& devices, const std::vector<ttd::TTDDeviceKey>& notRecorded);
     };
 
     /// The slot set as configuration fingerprint fields (R-NF-2), `affectsRestore` (a checkpoint holds the devices of
@@ -321,9 +354,11 @@ public:
     /// bank, once they are built) to a fingerprint
     void AddTtdFingerprint(ttd::TTDConfigFingerprint& fingerprint) const;
 
-    /// The TTD device instance of a slot card's device: "<slot>.<module>" ("zxbus.1.neogs", "ay-socket.tsfm"), so
-    /// two cards carrying one module type get two device keys; "" when the plan fits no card of the group there (the
-    /// device keeps its own name). Socket, General Sound and MoonSound: the groups with a device of their own
+    /// The TTD device instance of a slot card's device: "<slot>.<module>" ("zxbus.1.neogs"), so two cards carrying
+    /// one module type get two device keys; the AY socket's device is named by the socket's card ("ay-socket.ay",
+    /// "ay-socket.ts", "ay-socket.tsfm": the `ay` and `ts` boards are one module under one id). "" when the plan fits
+    /// no card of the group there (the device keeps its own name). Socket, General Sound and MoonSound: the groups
+    /// with a device of their own
     static std::string TtdInstance(const Result& result, SlotCardGroup group, const std::string& module);
     std::string TtdInstance(SlotCardGroup group, const std::string& module) const
     {
@@ -339,13 +374,21 @@ public:
     /// The slot-set guard on a session load: the cards the recording held (its baseline checkpoint) against the
     /// cards of this machine, per slot (AY socket, General Sound card, MoonSound card). False with every difference
     /// listed in `why` ("ay-socket: recorded tsfm, this machine ay / ts; zxbus.1: ..."). The AY socket's `ay` and
-    /// `ts` share one blob id: a v1 file cannot tell them apart (the configuration fingerprint can)
+    /// `ts` share one type: a set without the socket's instance cannot tell them apart (the configuration
+    /// fingerprint can)
     static bool TtdSlotSetMatches(const Result& result, const TtdDeviceSet& recorded, const TtdDeviceSet& live,
                                   std::string& why);
-    /// The same for this machine, then its machine slots (the Sprinter's ISA slots, the port decoder's
-    /// TtdSessionMatches until SL-8 puts them in the slot set). `blobs` as stored (the baseline checkpoint's)
-    bool TtdSessionMatches(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs, uint64_t notRecordedMask,
+    /// The same for this machine, then each slot-built card's own check (the MultiSound's MIDI bank), then its
+    /// machine slots (the Sprinter's ISA population, the port decoder's TtdSessionMatches). `recorded`: the
+    /// session's device set (an engine file names its devices in its device table, the socket's board included);
+    /// `states`: the baseline checkpoint's device states, raw
+    bool TtdSessionMatches(const TtdDeviceSet& recorded, const ttd::TTDDeviceStates& states,
                            const ttd::TTDPeripheralRegistry& live, std::string& why) const;
+    /// The guard for a machine without a slot manager (no plan: the positions keep their names), then its port
+    /// decoder's own check
+    static bool TtdSessionMatchesWithoutSlots(EmulatorContext* context, const TtdDeviceSet& recorded,
+                                              const ttd::TTDDeviceStates& states,
+                                              const ttd::TTDPeripheralRegistry& live, std::string& why);
 
     /// R-OP-7: why a slot change is refused now, naming the recording session; "" when allowed. The device set is
     /// fixed for a TTD session (D38): no slot change while a user recording runs (a debugger's live history is

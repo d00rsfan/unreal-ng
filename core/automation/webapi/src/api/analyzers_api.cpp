@@ -1,6 +1,7 @@
 // WebAPI Analyzer Management Implementation
 // Implements /analyzers endpoints - 2026-01-21
 
+#include <optional>
 #include <emulator/sound/audiomixer.h>
 #include <drogon/HttpResponse.h>
 #include <emulator/emulator.h>
@@ -11,6 +12,9 @@
 #include <debugger/analyzers/audiocapture/audiocaptureanalyzer.h>
 #include <debugger/analyzers/aylog/ayloganalyzer.h>
 #include <debugger/analyzers/coverage/coverageanalyzer.h>
+#include <debugger/analyzers/coverage/coverageexport.h>
+#include <debugger/analyzers/osaware/osaware_event.h>
+#include <debugger/analyzers/sectiontimer/sectiontimeranalyzer.h>
 #include <debugger/analyzers/trdos/trdosanalyzer.h>
 #include <emulator/sound/soundmanager.h>
 #include <json/json.h>
@@ -421,6 +425,133 @@ void EmulatorAPI::getAnalyzerEvents(const HttpRequestPtr& req, std::function<voi
             ret["showing"] = static_cast<Json::UInt64>(eventsJson.size());
         }
     }
+    else if (IOSAnalyzer* osAnalyzer = dynamic_cast<IOSAnalyzer*>(analyzerManager->getAnalyzer(name)))
+    {
+        // OS-aware analyzers (nedoos, dss): one branch for every OS
+        auto events = osAnalyzer->getOsEvents();
+        Json::Value eventsJson(Json::arrayValue);
+
+        size_t start = (events.size() > limit) ? events.size() - limit : 0;
+        for (size_t i = start; i < events.size(); i++)
+        {
+            Json::Value ev;
+            ev["timestamp"] = static_cast<Json::UInt64>(events[i].timestamp);
+            ev["frame_number"] = static_cast<Json::UInt64>(events[i].frameNumber);
+            ev["kind"] = OsEventKindName(events[i].kind);
+            ev["severity"] = OsSeverityName(events[i].severity);
+            ev["formatted"] = events[i].format();
+            ev["pc"] = events[i].pc;
+            if (events[i].caller != 0)
+            {
+                ev["caller"] = events[i].caller;
+            }
+            if (events[i].taskId != 0)
+            {
+                ev["task_id"] = events[i].taskId;
+            }
+            if (events[i].syscall != 0)
+            {
+                ev["syscall"] = events[i].syscall;
+            }
+            if (events[i].arg16 != 0)
+            {
+                ev["arg16"] = events[i].arg16;
+            }
+            if (!events[i].message.empty())
+            {
+                ev["message"] = events[i].message;
+            }
+            if (!events[i].detail.empty())
+            {
+                ev["detail"] = events[i].detail;
+            }
+            eventsJson.append(ev);
+        }
+
+        ret["events"] = eventsJson;
+        ret["total_events"] = static_cast<Json::UInt64>(events.size());
+        ret["showing"] = static_cast<Json::UInt64>(eventsJson.size());
+
+        OsSnapshot snapshot = osAnalyzer->getOsSnapshot();
+        ret["os"] = snapshot.os;
+        ret["detected"] = snapshot.detected;
+        ret["profile"] = snapshot.profile;
+
+        if (req->getParameter("include") == "snapshot")
+        {
+            Json::Value snapJson;
+            snapJson["os"] = snapshot.os;
+            snapJson["detected"] = snapshot.detected;
+            snapJson["profile"] = snapshot.profile;
+
+            Json::Value tasksJson(Json::arrayValue);
+            for (const auto& task : snapshot.tasks)
+            {
+                Json::Value t;
+                t["id"] = task.id;
+                t["parent"] = task.parent;
+                t["flags"] = task.flags;
+                t["mainpg"] = task.mainpg;
+                if (!task.name.empty())
+                {
+                    t["name"] = task.name;
+                }
+                if (task.stdinFd != 0)
+                {
+                    t["stdin"] = task.stdinFd;
+                    t["stdout"] = task.stdoutFd;
+                    t["stderr"] = task.stderrFd;
+                }
+                t["last_time"] = task.lastTime;
+                tasksJson.append(t);
+            }
+            snapJson["tasks"] = tasksJson;
+
+            Json::Value blocksJson(Json::arrayValue);
+            for (const auto& block : snapshot.blocks)
+            {
+                Json::Value b;
+                b["index"] = block.index;
+                b["owner"] = block.owner;
+                blocksJson.append(b);
+            }
+            snapJson["blocks"] = blocksJson;
+
+            Json::Value handlesJson(Json::arrayValue);
+            for (const auto& handle : snapshot.handles)
+            {
+                Json::Value h;
+                h["index"] = handle.index;
+                h["owner"] = handle.owner;
+                if (!handle.name.empty())
+                {
+                    h["name"] = handle.name;
+                }
+                if (handle.size != 0)
+                {
+                    h["position"] = static_cast<Json::UInt64>(handle.position);
+                    h["size"] = static_cast<Json::UInt64>(handle.size);
+                }
+                handlesJson.append(h);
+            }
+            snapJson["handles"] = handlesJson;
+
+            Json::Value pipesJson(Json::arrayValue);
+            for (const auto& pipe : snapshot.pipes)
+            {
+                Json::Value p;
+                p["handle"] = pipe.handle;
+                p["open_sides"] = pipe.openSides;
+                p["reader"] = pipe.reader;
+                p["lines"] = pipe.lines;
+                p["queued"] = pipe.queued;
+                pipesJson.append(p);
+            }
+            snapJson["pipes"] = pipesJson;
+
+            ret["snapshot"] = snapJson;
+        }
+    }
     else
     {
         ret["events"] = Json::Value(Json::arrayValue);
@@ -478,6 +609,10 @@ void EmulatorAPI::clearAnalyzerEvents(const HttpRequestPtr& req, std::function<v
         {
             trdos->clear();
         }
+    }
+    else if (IOSAnalyzer* osAnalyzer = dynamic_cast<IOSAnalyzer*>(analyzerManager->getAnalyzer(name)))
+    {
+        osAnalyzer->clearOsEvents();
     }
 
     Json::Value ret;
@@ -932,26 +1067,17 @@ bool parseAddressParam(const std::string& value, uint16_t& out)
     }
 }
 
-/// Pause the emulator around subscription mutations (race-free activation)
+/// Hold the CPU around subscription mutations (race-free activation)
 struct ScopedPause
 {
     Emulator* emulator;
-    bool wasRunning;
+    std::optional<Emulator::CpuHold> hold;
 
-    explicit ScopedPause(Emulator* emu)
-        : emulator(emu), wasRunning(emu && emu->IsRunning() && !emu->IsPaused())
+    // The CPU held for the analyzer change (Emulator::CpuHold); the pause is left as it was
+    explicit ScopedPause(Emulator* emu) : emulator(emu)
     {
-        if (wasRunning)
-        {
-            emulator->Pause(false);
-            emulator->WaitForPauseConfirmation(1000);
-        }
-    }
-
-    ~ScopedPause()
-    {
-        if (wasRunning)
-            emulator->Resume(false);
+        if (emulator)
+            hold.emplace(*emulator, "analyzer");
     }
 };
 }  // namespace
@@ -1339,6 +1465,82 @@ void EmulatorAPI::getCoverageGaps(const HttpRequestPtr& req, std::function<void(
     callback(resp);
 }
 
+/// @brief POST /api/v1/emulator/{id}/coverage/export
+/// @brief The coverage as a file another tool reads (coverageexport.h): body {"format": "skoolkit-map", "start",
+/// "end" (integer or "0x..." string), "path" (write the file; else the map comes back in "map"), "merge" (add the
+/// addresses of the file at path)}
+void EmulatorAPI::exportCoverage(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+                                 const std::string& id) const
+{
+    auto emulator = EmulatorManager::GetInstance()->GetEmulator(id);
+    const auto reply = [&](HttpStatusCode status, const Json::Value& body) {
+        auto resp = HttpResponse::newHttpJsonResponse(body);
+        resp->setStatusCode(status);
+        addCorsHeaders(resp);
+        callback(resp);
+    };
+    if (!emulator)
+    {
+        Json::Value error;
+        error["error"] = "Not Found";
+        error["message"] = "Emulator with specified ID not found";
+        reply(HttpStatusCode::k404NotFound, error);
+        return;
+    }
+
+    // The body's members as the options of coverageexport::Export (numbers and booleans as their text)
+    coverageexport::Options options;
+    auto json = req->getJsonObject();
+    if (json && json->isObject())
+    {
+        for (const std::string& name : json->getMemberNames())
+        {
+            const Json::Value& value = (*json)[name];
+            if (value.isBool())
+                options[name] = value.asBool() ? "true" : "false";
+            else if (value.isIntegral())
+                options[name] = std::to_string(value.asInt64());
+            else if (value.isString())
+                options[name] = value.asString();
+            else if (!value.isNull())
+            {
+                Json::Value error;
+                error["error"] = "Bad Request";
+                error["message"] = name + " is no string, number or boolean";
+                reply(HttpStatusCode::k400BadRequest, error);
+                return;
+            }
+        }
+    }
+
+    const coverageexport::Result result = coverageexport::Export(findCoverageAnalyzer(emulator.get()), options);
+    if (!result.Ok())
+    {
+        Json::Value error;
+        const bool missing = result.error == coverageexport::Error::NotAvailable;
+        error["error"] = missing ? "Internal Error" : "Bad Request";
+        error["message"] = result.message;
+        reply(missing ? HttpStatusCode::k500InternalServerError : HttpStatusCode::k400BadRequest, error);
+        return;
+    }
+    Json::Value ret;
+    ret["emulator_id"] = id;
+    ret["success"] = true;
+    ret["format"] = result.format;
+    ret["start"] = StringHelper::Format("0x%04X", result.start);
+    ret["end"] = StringHelper::Format("0x%04X", result.end);
+    ret["count"] = static_cast<Json::UInt64>(result.count);
+    if (result.path.empty())
+        ret["map"] = result.text;
+    else
+    {
+        ret["path"] = result.path;
+        ret["merged"] = static_cast<Json::UInt64>(result.merged);
+    }
+    ret["message"] = result.message;
+    reply(HttpStatusCode::k200OK, ret);
+}
+
 /// endregion </Coverage analyzer endpoints>
 
 /// region <AY log endpoints (MCP automation)>
@@ -1392,10 +1594,8 @@ size_t audioCoreRate(Emulator* emulator)
     return context && context->pSoundManager ? context->pSoundManager->getCoreRate() : 44100;
 }
 
-/// Write an interleaved int16 stereo capture to a timestamped WAV under the
-/// OS temp dir (unreal-mcp/). Returns the written path or "" on failure.
-std::string writeCaptureWav(const std::string& emulatorId, const std::vector<int16_t>& buffer, size_t frames,
-                            uint32_t rate)
+/// A fresh timestamped WAV path under the OS temp dir (unreal-mcp/). "" on failure.
+std::string newCaptureWavPath(const std::string& emulatorId)
 {
     namespace fs = std::filesystem;
 
@@ -1418,7 +1618,18 @@ std::string writeCaptureWav(const std::string& emulatorId, const std::vector<int
 
     static std::atomic<uint64_t> counter{0};
     const uint64_t stamp = static_cast<uint64_t>(std::time(nullptr)) * 1000 + counter++;
-    fs::path path = directory / ("audio-" + safeId + "-" + std::to_string(stamp) + ".wav");
+    return (directory / ("audio-" + safeId + "-" + std::to_string(stamp) + ".wav")).string();
+}
+
+/// Write an interleaved int16 stereo capture to a timestamped WAV under the
+/// OS temp dir (unreal-mcp/). Returns the written path or "" on failure.
+std::string writeCaptureWav(const std::string& emulatorId, const std::vector<int16_t>& buffer, size_t frames,
+                            uint32_t rate)
+{
+    namespace fs = std::filesystem;
+    fs::path path = newCaptureWavPath(emulatorId);
+    if (path.empty())
+        return "";
 
     TinyWav wav{};
     if (tinywav_open_write(&wav, 2, static_cast<int32_t>(rate), TW_INT16, TW_INTERLEAVED, path.string().c_str()) != 0)
@@ -1735,11 +1946,15 @@ void EmulatorAPI::audioCapture(const HttpRequestPtr& req, std::function<void(con
         {
             seconds = (*json)["seconds"].asDouble();
         }
-        if (seconds < 0.01 || seconds > 30.0)
+        // "to_file": the samples go to a WAV file while they come (no memory ceiling, only the disk)
+        const bool toFile = json && json->isMember("to_file") && (*json)["to_file"].asBool();
+        const double maxSeconds = toFile ? AudioCaptureAnalyzer::MAX_STREAM_SECONDS : 30.0;
+        if (seconds < 0.01 || seconds > maxSeconds)
         {
             Json::Value error;
             error["error"] = "Bad Request";
-            error["message"] = "'seconds' must be within [0.01, 30.0]";
+            error["message"] = toFile ? "'seconds' must be within [0.01, 86400] with 'to_file'"
+                                      : "'seconds' must be within [0.01, 30.0] (use 'to_file' for longer)";
 
             auto resp = HttpResponse::newHttpJsonResponse(error);
             resp->setStatusCode(HttpStatusCode::k400BadRequest);
@@ -1770,9 +1985,30 @@ void EmulatorAPI::audioCapture(const HttpRequestPtr& req, std::function<void(con
         // Mutate analyzer subscriptions only while the emulation thread is parked
         ScopedPause pause(emulator.get());
         analyzerManager->activate("audiocapture");
-        capture->startCapture(target, source);
+        std::string streamPath;
+        if (toFile)
+        {
+            streamPath = json->isMember("path") ? (*json)["path"].asString() : newCaptureWavPath(id);
+            std::string streamError;
+            if (streamPath.empty() ||
+                !capture->startStreamCapture(streamPath, static_cast<uint32_t>(rate), target, source, streamError))
+            {
+                Json::Value error;
+                error["error"] = "Conflict";
+                error["message"] = streamError.empty() ? "cannot create the capture file" : streamError;
+                auto resp = HttpResponse::newHttpJsonResponse(error);
+                resp->setStatusCode(HttpStatusCode::k409Conflict);
+                addCorsHeaders(resp);
+                callback(resp);
+                return;
+            }
+        }
+        else
+            capture->startCapture(target, source);
 
         Json::Value ret;
+        if (toFile)
+            ret["wav_path"] = streamPath;
         ret["emulator_id"] = id;
         ret["success"] = capture->isCaptureArmed();
         ret["armed"] = capture->isCaptureArmed();
@@ -1801,7 +2037,10 @@ void EmulatorAPI::audioCapture(const HttpRequestPtr& req, std::function<void(con
         ret["complete"] = capture->isCaptureComplete();
         ret["captured_samples"] = static_cast<Json::UInt64>(capture->getCapturedSamples());
         ret["target_samples"] = static_cast<Json::UInt64>(capture->getTargetSamples());
-        ret["message"] = "Audio capture stopped (buffer retained)";
+        if (capture->isStreaming())
+            ret["wav_path"] = capture->getStreamPath();
+        ret["message"] = capture->isStreaming() ? "Audio capture stopped (file closed)"
+                                                : "Audio capture stopped (buffer retained)";
 
         auto resp = HttpResponse::newHttpJsonResponse(ret);
         addCorsHeaders(resp);
@@ -1882,6 +2121,13 @@ void EmulatorAPI::audioCaptureStatus(const HttpRequestPtr& req,
     ret["progress"] = target > 0 ? static_cast<double>(captured) / target : 0.0;
     ret["sample_rate"] = static_cast<Json::UInt64>(audioCoreRate(emulator.get()));
     ret["channels"] = 2;
+    ret["to_file"] = capture->isStreaming();
+    if (capture->isStreaming())
+    {
+        ret["wav_path"] = capture->getStreamPath();
+        ret["file_closed"] = capture->isStreamClosed();
+        ret["file_failed"] = capture->hasStreamFailed();
+    }
 
     auto resp = HttpResponse::newHttpJsonResponse(ret);
     addCorsHeaders(resp);
@@ -1939,8 +2185,45 @@ void EmulatorAPI::audioCaptureResult(const HttpRequestPtr& req,
         return;
     }
 
+    if (capture->isStreaming())
+    {
+        // File mode: the audio is in the WAV, nothing is held in memory to analyze. A capture that reached its
+        // target closes the file by itself a moment later
+        if (capture->isCaptureComplete())
+            capture->waitStreamClosed(3000);
+        if (!capture->isStreamClosed())
+        {
+            Json::Value error;
+            error["error"] = "Conflict";
+            error["message"] = "The capture file is still being written - POST action=stop first";
+            auto resp = HttpResponse::newHttpJsonResponse(error);
+            resp->setStatusCode(HttpStatusCode::k409Conflict);
+            addCorsHeaders(resp);
+            callback(resp);
+            return;
+        }
+        const size_t rate = audioCoreRate(emulator.get());
+        const size_t frames = capture->getCapturedSamples() / 2;
+        Json::Value ret;
+        ret["emulator_id"] = id;
+        ret["sample_rate"] = static_cast<Json::UInt64>(rate);
+        ret["channels"] = 2;
+        ret["frames"] = static_cast<Json::UInt64>(frames);
+        ret["duration_seconds"] = static_cast<double>(frames) / static_cast<double>(rate);
+        ret["complete"] = capture->isCaptureComplete();
+        ret["wav_path"] = capture->getStreamPath();
+        ret["file_failed"] = capture->hasStreamFailed();
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(capture->getStreamPath(), ec);
+        ret["wav_bytes"] = ec ? 0 : static_cast<Json::UInt64>(size);
+        auto resp = HttpResponse::newHttpJsonResponse(ret);
+        addCorsHeaders(resp);
+        callback(resp);
+        return;
+    }
+
     const auto& buffer = capture->getBuffer();
-    const size_t frames = buffer.size() / 2;
+    const size_t frames = std::min(buffer.size(), capture->getCapturedSamples()) / 2;
     if (frames == 0)
     {
         Json::Value error;
@@ -2032,6 +2315,152 @@ void EmulatorAPI::audioCaptureResult(const HttpRequestPtr& req,
 }
 
 /// endregion </Audio capture endpoints>
+
+/// region <Section timer endpoints>
+
+namespace
+{
+HttpResponsePtr SectionTimerError(HttpStatusCode code, const std::string& error, const std::string& message)
+{
+    Json::Value body;
+    body["error"] = error;
+    body["message"] = message;
+    auto resp = HttpResponse::newHttpJsonResponse(body);
+    resp->setStatusCode(code);
+    addCorsHeaders(resp);
+    return resp;
+}
+
+std::vector<std::string> SectionTimerStrings(const Json::Value& json, const char* key)
+{
+    std::vector<std::string> out;
+    if (!json.isMember(key))
+        return out;
+    const Json::Value& v = json[key];
+    if (v.isArray())
+    {
+        for (const Json::Value& one : v)
+            out.push_back(one.isString() ? one.asString() : one.isNumeric() ? std::to_string(one.asUInt()) : std::string());
+    }
+    else if (v.isString())
+        out.push_back(v.asString());
+    else if (v.isNumeric())
+        out.push_back(std::to_string(v.asUInt()));
+    return out;
+}
+
+Json::Value SectionTimerJson(SectionTimerAnalyzer* timer, size_t offset, size_t limit, bool text)
+{
+    const SectionTimerAnalyzer::Result result = timer->GetResult(offset, limit);
+    Json::Value ret;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    const std::string json = SectionTimerAnalyzer::ToJson(result);
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    reader->parse(json.data(), json.data() + json.size(), &ret, &errors);
+    if (text)
+        ret["text"] = SectionTimerAnalyzer::ToText(result);
+    return ret;
+}
+}  // namespace
+
+/// @brief POST /api/v1/emulator/{id}/section-timer - {"action": "start|stop|clear", "sections": [...], "extra": [...],
+/// "break_if": [...], "recursive": false, "frame_t": 0, "capacity": 100000}
+void EmulatorAPI::sectionTimer(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+                               const std::string& id) const
+{
+    auto emulator = EmulatorManager::GetInstance()->GetEmulator(id);
+    if (!emulator)
+    {
+        callback(SectionTimerError(HttpStatusCode::k404NotFound, "Not Found", "Emulator with specified ID not found"));
+        return;
+    }
+    SectionTimerAnalyzer* timer = SectionTimerAnalyzer::Find(emulator->GetContext());
+    if (!timer)
+    {
+        callback(SectionTimerError(HttpStatusCode::k500InternalServerError, "Internal Error",
+                                   "Section timer not available"));
+        return;
+    }
+
+    auto json = req->getJsonObject();
+    const Json::Value body = json ? *json : Json::Value(Json::objectValue);
+    const std::string action = body.get("action", "start").asString();
+    if (action == "start")
+    {
+        SectionTimerAnalyzer::Spec spec;
+        spec.sections = SectionTimerStrings(body, "sections");
+        spec.extra = SectionTimerStrings(body, "extra");
+        spec.breakIf = SectionTimerStrings(body, "break_if");
+        spec.recursive = body.get("recursive", false).asBool();
+        spec.frameT = body.get("frame_t", 0).asUInt();
+        spec.capacity = static_cast<size_t>(
+            body.get("capacity", static_cast<Json::UInt64>(SectionTimerAnalyzer::kDefaultCapacity)).asUInt64());
+        std::string error;
+        if (!timer->Start(spec, error))
+        {
+            callback(SectionTimerError(HttpStatusCode::k400BadRequest, "Bad Request", error));
+            return;
+        }
+    }
+    else if (action == "stop")
+        timer->Stop();
+    else if (action == "clear")
+        timer->Clear();
+    else
+    {
+        callback(SectionTimerError(HttpStatusCode::k400BadRequest, "Bad Request",
+                                   "action is start, stop or clear: " + action));
+        return;
+    }
+
+    Json::Value ret = SectionTimerJson(timer, 0, 0, true);
+    ret["emulator_id"] = id;
+    ret["action"] = action;
+    auto resp = HttpResponse::newHttpJsonResponse(ret);
+    addCorsHeaders(resp);
+    callback(resp);
+}
+
+/// @brief GET /api/v1/emulator/{id}/section-timer?offset=0&limit=1000&text=true
+void EmulatorAPI::getSectionTimer(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback,
+                                  const std::string& id) const
+{
+    auto emulator = EmulatorManager::GetInstance()->GetEmulator(id);
+    if (!emulator)
+    {
+        callback(SectionTimerError(HttpStatusCode::k404NotFound, "Not Found", "Emulator with specified ID not found"));
+        return;
+    }
+    SectionTimerAnalyzer* timer = SectionTimerAnalyzer::Find(emulator->GetContext());
+    if (!timer)
+    {
+        callback(SectionTimerError(HttpStatusCode::k500InternalServerError, "Internal Error",
+                                   "Section timer not available"));
+        return;
+    }
+    auto number = [&](const char* name, size_t fallback) -> size_t {
+        const std::string text = req->getParameter(name);
+        if (text.empty())
+            return fallback;
+        try
+        {
+            return static_cast<size_t>(std::stoull(text));
+        }
+        catch (...)
+        {
+            return fallback;
+        }
+    };
+    const std::string text = req->getParameter("text");
+    Json::Value ret = SectionTimerJson(timer, number("offset", 0), number("limit", 1000), text == "true" || text == "1");
+    ret["emulator_id"] = id;
+    auto resp = HttpResponse::newHttpJsonResponse(ret);
+    addCorsHeaders(resp);
+    callback(resp);
+}
+
+/// endregion </Section timer endpoints>
 
 }  // namespace v1
 }  // namespace api

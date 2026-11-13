@@ -11,6 +11,7 @@
 #include "debugger/ttd/ttdserializable.h"
 #include "emulator/ports/portdecoder.h"
 #include "emulator/sound/audio.h"
+#include "emulator/sound/chips/chipwritehistory.h"
 #include "debugger/ttd/engine/ttdregiontracker.h"
 
 class EmulatorContext;
@@ -107,6 +108,8 @@ public:
     // the UI reaches the 18 FM + 24 PCM taps through these accessors.
     size_t channelCount(opl4::ChannelGroup group) const;
     void setChannelMute(opl4::ChannelGroup group, size_t index, bool mute);
+    /// The mixer's channel volume as a Q15 gain (MixerChannelGainQ15): the render path only, never chip state
+    void setChannelGain(opl4::ChannelGroup group, size_t index, int32_t gainQ15);
     float channelPeak(opl4::ChannelGroup group, size_t index) const;
 
     // Frame lifecycle
@@ -242,6 +245,7 @@ private:
     void loadWaveRom();
 
     EmulatorContext* _context;
+    ChipWriteHistory _history;  ///< the OPL4 FM and wave register writes (chipwritehistory.h)
     ModuleLogger* _logger = nullptr;
 
     // Bus attachment state (attachToPorts/detachFromPorts)

@@ -38,7 +38,7 @@ definition (bit 6), the last ends the label (bit 7). `LD HL,#5FFF` is just `3E 8
 | `#2F` text `00` | a comment (`;`); `#01`-`#1F` in it = that many blanks (a single blank too), CP866 |
 | `#C0`-`#DB` with bit 6 on the next byte | a label definition at the line start |
 | `#06` | the command starts in column 0 (shown as `_`, used by 40-character lines) |
-| `#07 n` | a local label `.n` |
+| `#07 n` | `.n` in the label field: the line is assembled n times (0 = 256; STORM 1.3's help) |
 | `#09`-`#2E`, `#41`-`#43`, `#4A`-`#6E` | commands (`ORG` … `RETN`, `DEFB DEFW DEFS`, `LD` … `DS`); `#49 n` = `INCL` … `ENDM` |
 | `#2A`-`#2E` after operands | `:` with five spacings (`:`, ` :`, ` : `, ` :  `, `  : `) |
 | `#30`-`#3F`, `#44`-`#48`, `#6F`-`#7F` | registers and conditions |
@@ -58,7 +58,7 @@ definition (bit 6), the last ends the label (bit 7). `LD HL,#5FFF` is just `3E 8
 | `AF`, `(SP)` | `EX` |
 | `(C)` | `OUT` |
 | `NZ Z NC`, a label, an unbracketed expression, a digit, `$±n` | `JR` |
-| `PO PE P M` | `CALL` |
+| `PO PE P M` | `JP` (STORM 1.3's binary has `JP` in the 15 places its own source has these, and its editor shows `JP`; the reference decoders show `CALL`) |
 
 The corpus shows STORM always uses the implied form when one exists, with one quirk: `C` is written as the register
 `#31` everywhere except as `JR`'s first operand, where it is the condition `#7B`, and `JR C,…` is still written with
@@ -96,10 +96,14 @@ same text, so only the kept bytes reproduce them.
 ### 6.1 Checked in the emulator
 
 `EMUL` with five lines added (`TEST    LD A,(IX+13),B,5,DE,-33`, `JR NZ,$-3:JR C,$+2:CP C`, `TBUF    DS (TEST+1)*2`, a
-Russian comment, `DB "ПРИВЕТ",#0D,0`), written entirely by the codec's rules with `zxasm encode` (type C, start
+Russian comment, `DB "ПРИВЕТ",#0D,0`, "hello"), written entirely by the codec's rules with `zxasm encode` (type C, start
 #C00B), loads in STORM 1.3 (BREAK, L, the name) and shows the text line for line, the leading empty line included
 (STORM shows `EX AF,AF` for the token pair `AF AF`, as the codec does). Own emulator instance, TTD recorded;
 screenshots kept with the research materials.
+
+A STORM 1.0beta file (2026-10-07): five lines typed into STORM 1.0beta in unreal-ng, saved with BREAK S: type `C`,
+start `#C003` (1.3 saves at `#C00B`); the codec reads it as version `1.0`, writes it back byte for byte, and its rules
+give every stored line (`testdata/storm/typed-storm10b__ST1BETA`).
 
 ## 7. Open items
 

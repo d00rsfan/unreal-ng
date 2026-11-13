@@ -1,6 +1,7 @@
 #include "soundchip_gs.h"
 
 #include "emulator/sound/chips/gs/gscpuregisters.h"
+#include "debugger/targets/gscardtarget.h"
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include "emulator/cpu/core.h"
 #include "emulator/notifications.h"
 #include "emulator/platform.h"
+#include "emulator/sound/mixerchannel.h"
 #include "emulator/slots/cards/multisound/multisoundlogic.h"
 
 /// region <Constructors / destructors>
@@ -51,14 +53,7 @@ SoundChip_GeneralSound::SoundChip_GeneralSound(EmulatorContext* context, size_t 
     // Dedicated coprocessor wired to the static trampolines below - never the
     // main emulator Z80 (design §4.3: context hardwiring, debug traps)
     _cpu = Z80CpuCreate();
-    Z80CpuSetMemoryBus(_cpu, &SoundChip_GeneralSound::gsMemRead, this, &SoundChip_GeneralSound::gsMemWrite, this);
-    // Interface selection: each port rule set has its own handlers (the
-    // classic path stays the pre-profile code, no per-access profile test)
-    if (_profile.portRules == GSPortRules::MultiSound)
-        Z80CpuSetPortBus(_cpu, &SoundChip_GeneralSound::gsPortReadMultiSound, this,
-                         &SoundChip_GeneralSound::gsPortWriteMultiSound, this);
-    else
-        Z80CpuSetPortBus(_cpu, &SoundChip_GeneralSound::gsPortRead, this, &SoundChip_GeneralSound::gsPortWrite, this);
+    bindBus();
     Z80CpuSetIntVectorFn(_cpu, &SoundChip_GeneralSound::gsIntRead, this);
     _runner.bind(_cpu, this);
 
@@ -118,6 +113,8 @@ void SoundChip_GeneralSound::resetCard()
 {
     if (_cpu)
         Z80CpuReset(_cpu);
+    if (_debugHooks) [[unlikely]]
+        _debugHooks->onEvent(GSCardEvent::Reset, 0, 0);
 
     _mpag = 0;
     applyBanking();
@@ -327,6 +324,22 @@ void SoundChip_GeneralSound::runEvents(int64_t /*now*/)
     scheduleNextPeriod();
 }
 
+// Inside an idle-loop sleep (GSCardRunner): every period boundary before `end` at once. The CPU cannot take the
+// INT, so each boundary only counts and keeps the request asserted, exactly as runEvents one by one
+bool SoundChip_GeneralSound::sleepQuietEventsBefore(int64_t end)
+{
+    const int64_t next = _runner.nextEvent();
+    if (next >= end)
+        return true;
+    const int64_t periods = (end - 1 - next) / _intPeriodUnits + 1;
+    _activityCounters.interruptPeriods += static_cast<uint64_t>(periods);
+    _activityCounters.interruptsCoalesced += static_cast<uint64_t>(_intPending ? periods : periods - 1);
+    _intPending = true;
+    _gsCyclesAbs += periods * _intPeriodUnits;
+    scheduleNextPeriod();
+    return true;
+}
+
 /// endregion </Lazy sync core>
 
 /// region <Diagnostics>
@@ -353,6 +366,17 @@ void SoundChip_GeneralSound::traceEvent(GSTraceSide side, uint16_t port, uint8_t
     _portTrace.record(event);
 }
 
+void SoundChip_GeneralSound::traceIdle(uint16_t head, int64_t start, uint64_t iterations)
+{
+    GSTraceEvent event;
+    event.timestamp = start;
+    event.frameNumber = currentFrameNumber();
+    event.pc = head;
+    event.side = GSTraceSide::Idle;
+    event.iterations = static_cast<uint32_t>(std::min<uint64_t>(iterations, UINT32_MAX));
+    _portTrace.record(event);
+}
+
 /// endregion </Diagnostics>
 
 /// region <Frame lifecycle>
@@ -374,6 +398,12 @@ void SoundChip_GeneralSound::handleFrameStart()
                                                      _unitsPerZxTact);
     _frameStartZxTacts = hostNow;
     _frameGsCycles = frameGsLength();
+    // A channel volume changed (the mixer's channel layer): the level steps at the frame's start
+    if (_hostGainDirty)
+    {
+        _hostGainDirty = false;
+        emitSample();
+    }
 }
 
 void SoundChip_GeneralSound::handleFrameEnd(size_t expectedSamples)
@@ -382,7 +412,9 @@ void SoundChip_GeneralSound::handleFrameEnd(size_t expectedSamples)
         return;
 
     // Catch-up: run the GS CPU to the end of the ZX frame
+    _frameEndCatchUp = true;
     runTo(_frameStartGsCycles + _frameGsCycles);
+    _frameEndCatchUp = false;
 
     // Actual samples for this frame - must match what SoundManager mixes
     // (accumulator count preferred, local rounding as fallback)
@@ -424,6 +456,9 @@ void SoundChip_GeneralSound::computeStereo(int32_t& outL, int32_t& outR) const
     {
         int32_t centered = static_cast<int8_t>(static_cast<uint8_t>(_channelData[ch] - 0x80));
         v[ch] = centered * static_cast<int32_t>(_vfx[_channelVol[ch]]) / 256;
+        // The mixer's channel volume (host-side; the level itself at unity)
+        if (!_hostGainUnity)
+            v[ch] = ApplyMixerGainQ15(v[ch], _hostGain[ch]);
     }
 
     // Channels 1,2 -> left; 3,4 -> right, with 50% cross-feed
@@ -504,6 +539,7 @@ uint8_t SoundChip_GeneralSound::portDeviceInMethod(uint16_t port)
             _mb.status &= 0x7F;  // Original Unreal: clear bit7 directly
             _activityCounters.hostDataRead++;
             traceEvent(GSTraceSide::Host, PORT_DATA, _mb.dataToHost, false);
+            GSReportHostEvent(_context, GSCardEvent::HostReplyRead, _mb.dataToHost);
             return _mb.dataToHost;
         case 0xBB: // GSCOM read: status, bits 1-6 read as 1 (pull-ups)
             flush();
@@ -544,11 +580,13 @@ void SoundChip_GeneralSound::portDeviceOutMethod(uint16_t port, uint8_t value)
             flush();
             traceEvent(GSTraceSide::Host, PORT_DATA, value, true);
             onHostDataWrite(value);
+            GSReportHostEvent(_context, GSCardEvent::HostDataWrite, value);
             return;
         case 0xBB: // GSCOM write: latch command, raise bit0
             flush();
             traceEvent(GSTraceSide::Host, PORT_COMMAND, value, true);
             onHostCommandWrite(value);
+            GSReportHostEvent(_context, GSCardEvent::HostCommandWrite, value);
             return;
         default:
             return;
@@ -681,7 +719,17 @@ void SoundChip_GeneralSound::replayModuleUpload(const std::vector<uint8_t>& byte
 
 uint8_t SoundChip_GeneralSound::gsIn(uint16_t port)
 {
-    traceEvent(GSTraceSide::GsInternal, port & 0x00FF, 0, false);
+    // FLAGS and COMRG reads change nothing: the only reads an idle loop may repeat
+    if ((port & 0x00FF) != 0x04 && (port & 0x00FF) != 0x01)
+        _busEffects++;
+    // The trace holds the byte the card CPU got (COMRG: the host's command), so it is recorded after the decode
+    const uint8_t value = gsInDecode(port);
+    traceEvent(GSTraceSide::GsInternal, port & 0x00FF, value, false);
+    return value;
+}
+
+uint8_t SoundChip_GeneralSound::gsInDecode(uint16_t port)
+{
     switch (port & 0x00FF)
     {
         // Exact original semantics (Unreal gsz80.cpp z80gs::in / ZXMAK2):
@@ -700,6 +748,7 @@ uint8_t SoundChip_GeneralSound::gsIn(uint16_t port)
 void SoundChip_GeneralSound::gsOut(uint16_t port, uint8_t value)
 {
     traceEvent(GSTraceSide::GsInternal, port & 0x00FF, value, true);
+    _busEffects++;
     switch (port & 0x00FF)
     {
         case 0x00: // MPAG - firmware/Xpeccy encoding (design §2.3)
@@ -727,7 +776,17 @@ void SoundChip_GeneralSound::gsOut(uint16_t port, uint8_t value)
 // of gsIn / gsOut at construction, so the classic card's port path is untouched
 uint8_t SoundChip_GeneralSound::gsInMultiSound(uint16_t port)
 {
-    traceEvent(GSTraceSide::GsInternal, port & 0x00FF, 0, false);
+    if ((port & 0x0F) != 0x04 && (port & 0x0F) != 0x01)
+        _busEffects++;
+    const uint8_t value = gsInMultiSoundDecode(port);
+    traceEvent(GSTraceSide::GsInternal, port & 0x00FF, value, false);
+    if (_busObserver) [[unlikely]]
+        _busObserver->GsPortCycle(hostTimeNow(), static_cast<uint8_t>(port), value, false);
+    return value;
+}
+
+uint8_t SoundChip_GeneralSound::gsInMultiSoundDecode(uint16_t port)
+{
     const uint8_t undecoded = _profile.undecodedPortRead;
     switch (port & 0x0F)
     {
@@ -745,6 +804,9 @@ uint8_t SoundChip_GeneralSound::gsInMultiSound(uint16_t port)
 void SoundChip_GeneralSound::gsOutMultiSound(uint16_t port, uint8_t value)
 {
     traceEvent(GSTraceSide::GsInternal, port & 0x00FF, value, true);
+    _busEffects++;
+    if (_busObserver) [[unlikely]]
+        _busObserver->GsPortCycle(hostTimeNow(), static_cast<uint8_t>(port), value, true);
     switch (port & 0x0F)
     {
         case 0x00: _mpag = value; applyBanking(); return;
@@ -876,6 +938,7 @@ uint8_t SoundChip_GeneralSound::readMem(uint16_t addr)
 
 void SoundChip_GeneralSound::writeMem(uint16_t addr, uint8_t value)
 {
+    _busEffects++;
     uint8_t* bank = _bankW[(addr >> 14) & 3];
     if (bank) // nullptr = ROM window: write goes nowhere
     {
@@ -891,10 +954,15 @@ void SoundChip_GeneralSound::dacFetch(uint16_t addr, uint8_t value)
     // address bits 9-8 (design §2.1) - including opcode fetches, matching
     // Unreal's rm() hook. readMem has already tested the window.
     int channel = (addr >> 8) & 3;
+    _busEffects++;
     _activityCounters.dacFetches++;
     _activityCounters.lastDacFetchGsCycle = totalGsCycles();
     _activityCounters.lastDacFetchFrame = currentFrameNumber();
     traceEvent(GSTraceSide::DacFetch, addr, value, false, static_cast<uint8_t>(channel));
+    if (_busObserver) [[unlikely]]
+        _busObserver->GsDacFetch(hostTimeNow(), addr, value);
+    if (_debugHooks) [[unlikely]]
+        _debugHooks->onEvent(GSCardEvent::DacFetch, static_cast<uint16_t>(channel), value);
     if (_profile.dacSink)
     {
         sinkSample(channel, value);
@@ -941,6 +1009,158 @@ void SoundChip_GeneralSound::gsPortWriteMultiSound(Z80CPU* /*cpu*/, uint16_t por
 uint8_t SoundChip_GeneralSound::gsIntRead(Z80CPU* /*cpu*/, void* /*userData*/)
 {
     return 0xFF; // IM2 vector: nothing drives the GS data bus during INTA
+}
+
+void SoundChip_GeneralSound::bindBus()
+{
+    if (_debugHooks)
+    {
+        Z80CpuSetMemoryBus(_cpu, &SoundChip_GeneralSound::gsMemReadDebug, this, &SoundChip_GeneralSound::gsMemWriteDebug,
+                           this);
+        Z80CpuSetPortBus(_cpu, &SoundChip_GeneralSound::gsPortReadDebug, this, &SoundChip_GeneralSound::gsPortWriteDebug,
+                         this);
+        return;
+    }
+    Z80CpuSetMemoryBus(_cpu, &SoundChip_GeneralSound::gsMemRead, this, &SoundChip_GeneralSound::gsMemWrite, this);
+    // Interface selection: each port rule set has its own handlers (the
+    // classic path stays the pre-profile code, no per-access profile test)
+    if (_profile.portRules == GSPortRules::MultiSound)
+        Z80CpuSetPortBus(_cpu, &SoundChip_GeneralSound::gsPortReadMultiSound, this,
+                         &SoundChip_GeneralSound::gsPortWriteMultiSound, this);
+    else
+        Z80CpuSetPortBus(_cpu, &SoundChip_GeneralSound::gsPortRead, this, &SoundChip_GeneralSound::gsPortWrite, this);
+}
+
+void SoundChip_GeneralSound::runToDebug(int64_t targetGsCycles)
+{
+    if (_classicTiming)
+        _runner.runToDebug<ClassicRunPolicy>(targetGsCycles, _debugHooks);
+    else
+        _runner.runToDebug(targetGsCycles, _debugHooks);
+}
+
+void SoundChip_GeneralSound::runToRecord(int64_t targetGsCycles)
+{
+    if (_classicTiming)
+        _runner.runToRecord<ClassicRunPolicy>(targetGsCycles);
+    else
+        _runner.runToRecord(targetGsCycles);
+}
+
+bool SoundChip_GeneralSound::setDebugHooks(IGSDebugHooks* hooks)
+{
+    if (!_cpu)
+        return false;
+    _debugHooks = hooks;
+    bindBus();
+    return true;
+}
+
+// Debug bus (gsdebughooks.h): the plain access, then the hooks with the instruction's PC. Opcode and operand fetches
+// are not data reads; the mailbox ports and MPAG are card events too. The MultiSound CPLD decodes A3-A0 only
+uint8_t SoundChip_GeneralSound::gsMemReadDebug(Z80CPU* cpu, uint16_t addr, int m1State, void* userData)
+{
+    auto* self = static_cast<SoundChip_GeneralSound*>(userData);
+    const uint8_t value = self->readMem(addr);
+    if (m1State)
+        return value;
+    return self->_debugHooks->onMemoryRead(Z80CpuInstructionPc(cpu), addr, value);
+}
+
+void SoundChip_GeneralSound::gsMemWriteDebug(Z80CPU* cpu, uint16_t addr, uint8_t value, void* userData)
+{
+    auto* self = static_cast<SoundChip_GeneralSound*>(userData);
+    self->writeMem(addr, value);
+    self->_debugHooks->onMemoryWrite(Z80CpuInstructionPc(cpu), addr, value);
+}
+
+uint8_t SoundChip_GeneralSound::gsPortReadDebug(Z80CPU* cpu, uint16_t port, void* userData)
+{
+    auto* self = static_cast<SoundChip_GeneralSound*>(userData);
+    const bool multiSound = self->_profile.portRules == GSPortRules::MultiSound;
+    const uint8_t read = multiSound ? self->gsInMultiSound(port) : self->gsIn(port);
+    IGSDebugHooks* hooks = self->_debugHooks;
+    const uint8_t value = hooks->onPortIn(Z80CpuInstructionPc(cpu), port, read);
+    switch (port & (multiSound ? 0x0F : 0xFF))
+    {
+        case 0x01: hooks->onEvent(GSCardEvent::CardCommandRead, port, value); break;
+        case 0x02: hooks->onEvent(GSCardEvent::CardDataRead, port, value); break;
+        default: break;
+    }
+    return value;
+}
+
+void SoundChip_GeneralSound::gsPortWriteDebug(Z80CPU* cpu, uint16_t port, uint8_t value, void* userData)
+{
+    auto* self = static_cast<SoundChip_GeneralSound*>(userData);
+    const bool multiSound = self->_profile.portRules == GSPortRules::MultiSound;
+    if (multiSound)
+        self->gsOutMultiSound(port, value);
+    else
+        self->gsOut(port, value);
+    IGSDebugHooks* hooks = self->_debugHooks;
+    hooks->onPortOut(Z80CpuInstructionPc(cpu), port, value);
+    switch (port & (multiSound ? 0x0F : 0xFF))
+    {
+        case 0x00: hooks->onEvent(GSCardEvent::PageSwitch, port, value); break;
+        case 0x03: hooks->onEvent(GSCardEvent::CardReplyWrite, port, value); break;
+        default: break;
+    }
+}
+
+GeneralSoundCard::CardPage SoundChip_GeneralSound::mapCardAddress(uint16_t addr) const
+{
+    CardPage where;
+    const uint8_t* base = _bankR[(addr >> 14) & 3];
+    where.offset = static_cast<uint16_t>(addr & (PAGE_SIZE - 1));
+    if (base >= _rom.data() && base < _rom.data() + _rom.size())
+    {
+        where.kind = CardPage::Rom;
+        where.page = static_cast<uint8_t>((base - _rom.data()) / PAGE_SIZE);
+    }
+    else if (base >= _ram.data() && base < _ram.data() + _ram.size())
+    {
+        where.kind = CardPage::Ram;
+        where.page = static_cast<uint8_t>((base - _ram.data()) / PAGE_SIZE);
+    }
+    return where;
+}
+
+uint32_t SoundChip_GeneralSound::cardPageCount(CardPage::Kind kind) const
+{
+    switch (kind)
+    {
+        case CardPage::Rom: return static_cast<uint32_t>(_rom.size() / PAGE_SIZE);
+        case CardPage::Ram: return static_cast<uint32_t>(_ram.size() / PAGE_SIZE);
+        default: return 0;
+    }
+}
+
+bool SoundChip_GeneralSound::cardRegisters(Z80CpuRegisters& out) const
+{
+    if (!_cpu)
+        return false;
+    Z80CpuGetRegisters(_cpu, &out);
+    return true;
+}
+
+bool SoundChip_GeneralSound::pokeCardMemory(uint16_t addr, uint8_t value)
+{
+    uint8_t* bank = _bankW[(addr >> 14) & 3];
+    if (!_cpu || !bank)
+        return false;
+    bank[addr & (PAGE_SIZE - 1)] = value;
+    if (_ramTrackerArmed)
+        _ramTrackerArmed->Mark(static_cast<size_t>(bank - _ram.data()) + (addr & (PAGE_SIZE - 1)));
+    return true;
+}
+
+bool SoundChip_GeneralSound::setCardRegisters(const Z80CpuRegisters& regs)
+{
+    if (!_cpu)
+        return false;
+    Z80CpuSetRegisters(_cpu, &regs);
+    return true;
 }
 
 std::string SoundChip_GeneralSound::deviceDescription() const
@@ -1205,9 +1425,8 @@ void SoundChip_GeneralSound::TTDRegions(std::vector<ttd::TTDDeviceRegion>& out)
     out.push_back(ram);
 }
 
-bool SoundChip_GeneralSound::TTDStateWithoutRegions(uint8_t& peripheralId, std::vector<uint8_t>& state) const
+bool SoundChip_GeneralSound::TTDStateWithoutRegions(std::vector<uint8_t>& state) const
 {
-    peripheralId = _profile.ttdPeripheralId;
     state.resize(TTD_FIXED_STATE_SIZE);
     serializeFixedState(state.data());
     return true;

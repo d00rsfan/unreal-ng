@@ -16,6 +16,9 @@
 #include "emulator/io/serial/uart16550.h"
 #include "emulator/io/fdc/fdc.h"
 #include "emulator/io/ide/ideadapter.h"
+#include "emulator/ports/deviceaccesswatch.h"
+#include "emulator/ports/portclaimindex.h"
+#include "emulator/ports/porthistory.h"
 #include "emulator/ports/portdiagrecorder.h"
 #include "emulator/slots/portclaimtable.h"   // guards the Qt `slots` macro itself
 #include "debugger/ttd/ttdserializable.h"  // ttd::PeripheralId / TTDSerializable (leaf header)
@@ -38,7 +41,9 @@ class EvoFlash;
 namespace snapshot
 {
 class ISnapshotCommitPolicy;
+class ISnapshotCapturePolicy;
 }
+class IStateTransferHost;
 class Memory;
 class Screen;
 class Beeper;
@@ -226,7 +231,8 @@ enum class PagingLatch : uint8_t
     AFE, AFB,                       // ATM 4.50 system ports (atm branch)
     PFFF7Window0, PFFF7Window1,     // ATM 7.10/ATM3 per-window latches
     PFFF7Window2, PFFF7Window3,     // (reserved until the decoders land)
-    PFE                             // the ULA port #FE as last written: border, MIC, EAR
+    PFE,                            // the ULA port #FE as last written: border, MIC, EAR
+    PGmx00, P78FD, P7AFD, P7CFD     // Scorpion GMX: #xx00 configuration, #8000 page, scroll start low / high
     // TSConf's latches live in its own state (TsConfState, PLAN #41 phase 1):
     // its decoder reports them itself, they are not EmulatorState fields
 };
@@ -425,9 +431,13 @@ public:
     /// region <Fields>
 protected:
     EmulatorContext* _context = nullptr;
+    PortClaimIndex _claimIndex;
+    PortHistories _portHistories;
+    DeviceAccessWatch _accessWatch;
 
     EmulatorState* _state = nullptr;
     snapshot::ISnapshotCommitPolicy* _snapshotPolicy = nullptr;   ///< not owned (SetSnapshotPolicy)
+    snapshot::ISnapshotCapturePolicy* _snapshotCapturePolicy = nullptr;   ///< not owned (SetSnapshotCapturePolicy)
     Keyboard* _keyboard = nullptr;
     Mouse* _mouse = nullptr;
     Tape* _tape = nullptr;
@@ -441,6 +451,8 @@ protected:
     // Z80 floating bus logic may apply (prevents floating bus from clobbering
     // legitimate 0xFF values from devices like WD1793).
     bool _lastPortDecoded = false;
+    /// A slot card answers the Kempston joystick (SetSlotKempstonJoystick)
+    bool _slotKempstonJoystick = false;
 
     // Registered port handlers from external peripheral devices
     // (RegisterPortHandler), keyed by the DECODED port the model decoders hand
@@ -593,6 +605,8 @@ protected:
     // Frame-scoped rolling counters (debugger status panel); updated only while
     // the porttrace feature is on
     PortActivitySummary _activitySummary;
+    // Set by a switch-on (any thread), consumed by the emulator thread: only it writes the counters
+    std::atomic<bool> _activitySummaryResetPending{false};
 
     /// endregion </Port trace>
 
@@ -626,6 +640,15 @@ public:
     /// original reset(mode) model blocks: e.g. ATM installs the FF77/pFFF7
     /// memory-manager defaults when the requested mode is RM_DOS). Base: none.
     virtual void ApplyBootROMDefaults(ROMModeEnum mode) { (void)mode; }
+
+    /// The ROM mode a reset asked for @p mode really starts in (Core::Reset, before reset()). Base: @p mode. A model
+    /// whose CPU always starts in its own firmware answers that (GMX: the loader), or defers a disk autostart's
+    /// RM_DOS until the firmware has booted (IsAutostartDeferred)
+    virtual ROMModeEnum ResolveResetROMMode(ROMModeEnum mode) { return mode; }
+
+    /// A disk autostart waits for the model's firmware boot: the TR-DOS start comes later, so the autostart's
+    /// command loop hook leaves earlier TR-DOS runs alone. Base: never
+    virtual bool IsAutostartDeferred() const { return false; }
 
     /// Re-run the model-specific set_banks() RAM mapping from the model's latches.
     /// Called by Memory::UpdateZ80Banks() for every model: ATM710/ATM3/+2A/+3 own
@@ -664,9 +687,21 @@ public:
     virtual void OnDosRomFetch([[maybe_unused]] uint16_t pc) {}
     /// endregion </Board NMI hooks>
 
-    /// The model decodes a Kempston joystick (#1F; Scorpion #FF1F) and answers Joystick::Read(). Machines
-    /// without the arm stay false: the host joystick keys are not bound there, the TTD blob is not carried
-    virtual bool HasKempstonJoystick() const { return false; }
+    /// The machine answers a Kempston joystick with Joystick::Read(): its board decodes one, or a fitted slot card
+    /// provides the function (the `kempston` interface on a 48K). False: the host joystick keys are not bound, the
+    /// TTD blob is not carried, the input calls warn and name the card that fits
+    bool HasKempstonJoystick() const { return _slotKempstonJoystick || BoardHasKempstonJoystick(); }
+    /// The model's own decode (#1F; Scorpion #FF1F). Machines without the arm stay false
+    virtual bool BoardHasKempstonJoystick() const { return false; }
+    /// The register a device of this machine has selected now, by the input role of its select claims (the device
+    /// access watch's seed when it starts): AyIo = the AY data read's register (ITurboSoundDevice::getBusReadRegister),
+    /// the Next adds NextReg; -1 when not known or not a register (the TSFM status byte)
+#pragma push_macro("slots")
+#undef slots
+    virtual int SelectedIndex(slots::InputRole role) const;
+#pragma pop_macro("slots")
+    /// A slot-built card with the kempston-joystick function is fitted (SlotManager::BuildCards / ReleaseCards)
+    void SetSlotKempstonJoystick(bool fitted) { _slotKempstonJoystick = fitted; }
 
     virtual bool IsFEPort(uint16_t port);
 
@@ -674,6 +709,9 @@ public:
     /// Z80::in() uses this to decide whether to apply the floating bus override:
     /// only unmapped ports (no device responded) get the floating bus byte.
     bool WasLastPortDecoded() const { return _lastPortDecoded; }
+    /// A read of a port nothing decoded sees the ULA's floating bus on the Spectrums; a board whose bus decode says otherwise
+    /// (the Next: only #xxFF and the +3 port) overrides this to keep the idle #FF
+    virtual bool FloatingBusDrives(uint16_t port) const { return (port & 0x0001) != 0; }
 
     uint8_t Default_Port_FE_In(uint16_t port, uint16_t pc);
     void Default_Port_FE_Out(uint16_t port, uint8_t value, uint16_t pc);
@@ -704,6 +742,14 @@ public:
     /// the base class and is shared by the model decoders for session gating
     bool IsBeta128Port(uint16_t decodedPort) const;
 
+    /// A Beta 128 on a Sinclair (48K-BETA128, the 128K and +3 decoders): the interface decodes the low byte only
+    /// (FUSE beta.c; MAME beta128.cpp decodes even fewer lines) and drives the bus only while the TR-DOS ROM is
+    /// paged in (CF_TRDOS). Returns false when the low byte is not a Beta port; otherwise the cycle is the Beta's:
+    /// with TR-DOS on it reaches the WD1793 / system register, with it off a read stays undecoded (Z80::in()
+    /// serves the floating bus) and a write is dropped, both marked wasBeta128Gated
+    bool TryBeta128LowBytePortIn(uint16_t port, uint8_t& result, PortDecodeDisposition& disp);
+    bool TryBeta128LowBytePortOut(uint16_t port, uint8_t value, PortDecodeDisposition& disp);
+
     /// Whether a decoded port value belongs to the General Sound host mailbox
     /// (#33 reset/NMI, #B3 data, #BB command/status). Shared the same way as
     /// IsBeta128Port, for model decoders to gate these rows on whether a GS
@@ -720,9 +766,24 @@ public:
     /// Re-read the porttrace feature flag from FeatureManager and instantiate or
     /// release the recorder accordingly. Called from FeatureManager::onFeatureChanged.
     void UpdateFeatureCache();
+    /// The model's own features (the Next's esxDOS mode), asked at the end of UpdateFeatureCache
+    virtual void UpdateModelFeatureCache() {}
 
     /// Recorder access for transports/tests. nullptr while the feature is off.
     /// Once returned the pointer stays valid for the decoder's lifetime
+    /// The port accesses of each registry device (porthistory.h)
+    PortHistories& GetPortHistories()
+    {
+        return _portHistories;
+    }
+    /// What the program uses, attributed by the registry's claims (deviceaccesswatch.h)
+    DeviceAccessWatch& GetAccessWatch()
+    {
+        return _accessWatch;
+    }
+    /// The registry's claims of the machine's slots now, for the histories and the watch: after the cards are built
+    void BuildAccessObservers();
+
     PortDiagnosticRecorder* getPortTraceRecorder()
     {
         return _portTraceFeatureCache.load(std::memory_order_acquire) ? _portTrace.get() : nullptr;
@@ -798,6 +859,16 @@ public:
     /// automation does not offer it as a device (docs/inprogress/2026-10-03-mouse-api-routing/design.md)
     virtual bool HasMachineMouse() const { return false; }
 
+    /// Pads beyond the Kempston byte: the ZX Next's two joystick connectors, 12 buttons each. A connector's state: bit 0 right, 1 left, 2 down,
+    /// 3 up, 4 B (fire), 5 C, 6 A, 7 START, 8 Y, 9 Z, 10 X, 11 MODE (zxnext.vhd i_JOY_LEFT / i_JOY_RIGHT). Connector 0 is the left one (the
+    /// host's pad: its low byte is the Kempston device), 1 the right one. Default: no pads
+    static constexpr unsigned kPadConnectors = 2;
+    static constexpr uint16_t kPadMask = 0x0FFF;
+    virtual bool HasPads() const { return false; }
+    virtual uint16_t PadState(unsigned connector) const { (void)connector; return 0; }
+    /// Set the whole state of a connector (the journaled input event TTDInputKind::NextPad lands here); false when there is no such pad
+    virtual bool ApplyPadState(unsigned connector, uint16_t state) { (void)connector; (void)state; return false; }
+
 
     /// region <TTD model-specific state (parent TDD 6.4)>
     ///
@@ -809,7 +880,7 @@ public:
     /// The decoder owns those latches, so the decoder declares them. The
     /// declaration is deliberately split from the implementation:
     ///
-    ///   GetTTDModelStateIds()   - "I have state beyond the standard ports"
+    ///   GetTTDModelStateTypes()   - "I have state beyond the standard ports"
     ///   CreateTTDSerializers()  - "...and here is how to capture it"
     ///
     /// Declaring without implementing is a HARD ERROR at StartRecording: a
@@ -819,24 +890,14 @@ public:
     /// answer for any machine fully described by the standard 128K ports.
 
     /// Model-specific state this machine carries beyond TTDChipsetState.
-    virtual std::vector<ttd::PeripheralId> GetTTDModelStateIds() const { return {}; }
+    virtual std::vector<ttd::TTDDeviceType> GetTTDModelStateTypes() const { return {}; }
 
-    /// The TTD port journals isolate a replay when every outside input reaches the CPU through IN
-    /// (ttd-port-read-journal.md §2). Two machine traits make TTD refuse the journals by default: an
-    /// interrupt source that puts the IM2 vector on the bus, and an engine stepped with the CPU
-    /// (IMachineStepHook). A machine answers true when both are fed by recorded state only: the vector
-    /// and the engines follow the machine state in the checkpoints and the host input in the TTD input
-    /// journal, never a medium or the host directly (Sprinter: the Z84C15 daisy chain and the PLD's INT,
-    /// the PLD resets and the loader watchdog - s7-ttd-outcome.md). Then the port journals are recorded
-    /// and `/ttd/port-events` answers on the machine's recordings
-    virtual bool TtdEnginesSealed() const { return false; }
-
-    /// A TTD session's baseline blobs against this machine's fixed population (expansion slots): false with
-    /// `why` refuses the session at load, as a General Sound personality mismatch does. Blobs are as stored
-    /// (TTDPeripheralRegistry::DecodeBlob opens one). Default: no slots, nothing to compare
-    virtual bool TtdSessionMatches(const std::unordered_map<uint8_t, std::vector<uint8_t>>& blobs, std::string& why) const
+    /// A TTD session's baseline device states (raw, by device) against this machine's fixed population
+    /// (expansion slots): false with `why` refuses the session at load, as a General Sound personality mismatch
+    /// does. Default: no slots, nothing to compare
+    virtual bool TtdSessionMatches(const ttd::TTDDeviceStates& states, std::string& why) const
     {
-        (void)blobs;
+        (void)states;
         (void)why;
         return true;
     }
@@ -890,8 +951,12 @@ public:
     /// base of every real-time clock of the machine (Phase 3, Step 5)
     int64_t SessionWallMicros() const;
 
+    /// The machine's clock chip whether or not the guest can reach it now (RtcBinding may say absent); null = none.
+    /// Core::Reset rebases it: a reset zeroes the emulated time, not the battery clock
+    Ds12887* RtcChip() const { return _rtcChip; }
+
     /// Serializers for the ids above. Ownership transfers to the caller.
-    /// Every id from GetTTDModelStateIds() must be covered.
+    /// Every type from GetTTDModelStateTypes() must be covered.
     virtual std::vector<std::unique_ptr<ttd::TTDSerializable>> CreateTTDSerializers() const
     {
         return {};
@@ -918,6 +983,11 @@ public:
     /// endregion </Port trace>
 
 protected:
+    /// A model's clock chip: the machine's emulated time and the TTD session wall are its emulated time base (a TTD
+    /// recording, the tests' fixed start). Called once, from the constructor
+    void BindRtc(Ds12887& chip);
+    Ds12887* _rtcChip = nullptr;
+
     /// The IDE board decodes before the model's own ports (UnrealSpeccy io.cpp
     /// order). A model calls these first in DecodePortIn / DecodePortOut: when
     /// they return true the I/O is done, trace and breakpoints included
@@ -947,6 +1017,14 @@ protected:
     void OnPortOutComplete(uint16_t port, uint8_t value, uint16_t pc,
                            const PortDecodeDisposition& disp = {});
 
+public:
+    /// A port write the CPU makes without a port cycle: the Z80N NEXTREG instruction writes a register the way OUT #243B,reg then
+    /// OUT #253B,value would, and is reported as that pair (one call per port). Port breakpoints, the port access tracker and the port trace
+    /// (rule PortTraceRule::kNoBusCycle) see it; no hardware is written here (the caller writes the register) and nothing goes to the TTD
+    /// journals (Z80NEngine::NextReg journals the pair itself)
+    void OnPortWriteWithoutBusCycle(uint16_t port, uint8_t value, uint16_t pc);
+
+protected:
     /// Build and push one PortTraceEvent. Only called when _portTraceFeatureCache is true.
     /// Exactly ONE event is recorded per Z80 I/O operation (single-event invariant) —
     /// inline handlers must never call this directly.
@@ -1007,6 +1085,7 @@ public:
             ZiFi,     ///< TS-Conf: the TS AVR firmware's 16550 and ZiFi on #xxEF
             Atm2Kbc,  ///< ATM Turbo 2+: the keyboard controller's RS-232 (its MCU's UART, not on #xxEF)
             Profi8251,   ///< ZX Profi v5: the board's 8251 USART at #D3 / #F3 (extended port map), clocked by its 8253
+            NextUart,    ///< ZX Next: the two UARTs at #133B-#163B (ESP = UART 0 = attachSerialPeer, Pi = UART 1 = attachSecondSerialPeer)
         } serialPort = SerialPort::None;
 
         /// The serial port's firmware by config name (EvoAvr: [EVO] Avr=, Atm2Kbc: [ATM] Kbc=)
@@ -1018,6 +1097,10 @@ public:
 
         /// A port that is no 16550 on #xxEF (Atm2Kbc, Profi8251) takes its peer here; nullptr detaches
         std::function<void(ISerialPeer* peer)> attachSerialPeer;
+        /// A machine's second serial port (the Next's UART 1); empty = none
+        std::function<void(ISerialPeer* peer)> attachSecondSerialPeer;
+        /// The Next's joystick connector (NR #0B UART mode): a device plugged into it takes the UART the register selects
+        std::function<void(ISerialPeer* peer)> attachJoystickSerialPeer;
 
         /// The ATM Turbo 2+ INTERNAL I/O connector (cards on the #FB / #FA bus):
         /// plug a device in (true) or pull it (false); empty = no such connector
@@ -1086,6 +1169,24 @@ public:
     /// reads (the NeoGS ZX-DMA, neogs-zxdma-design.md) can reach the host. True on a machine's own ZX-bus; false
     /// on the Sprinter, whose ISA ZX-bus adapter passes I/O cycles only (ISA open question Q7)
     virtual bool ZxBusMemoryCycles() const { return ZxBusPresent(); }
+
+    /// What the machine's expansion connector passes of one I/O cycle to its slot-built cards (ReadSlotCardCycle /
+    /// WriteSlotCardCycle). The default: the cards see every cycle and a read combines by the bus's read rule
+    struct SlotCycleGate
+    {
+        bool connected = true;        ///< the connector carries the cycle at all (false: the cards see nothing)
+        bool iorq = true;             ///< its /IORQ reaches the cards (false: only the cards that detect RD / WR see it)
+        bool byReadRule = true;       ///< a read combines the board and the cards by the bus's read rule; else the three below
+        bool boardData = true;        ///< (a board that drives) its data counts; false: #FF in its place
+        bool cardsWithBoard = false;  ///< (a board that drives) the cards' data is ANDed into it
+        bool cardsAlone = true;       ///< (a board that does not drive) the cards' data is the value; false: #FF
+    };
+    virtual SlotCycleGate SlotCardGate(uint16_t port, bool isRead) const
+    {
+        (void)port;
+        (void)isRead;
+        return {};
+    }
 
     /// The machine's own configuration events (machineeventjournal.h: the Sprinter's PLD changes), null for
     /// machines that keep none. The video change log lists the events of its frames (/video/changes)
@@ -1303,6 +1404,19 @@ public:
     /// nothing, the machine already behaves like a 128K
     virtual void EnterSpectrum128Paging(uint16_t pc) { (void)pc; }
 
+    /// A disk autostart's TR-DOS cold start (Reset(RM_DOS)) reached the TR-DOS command loop, right before it runs the
+    /// disk's program: leave the paging the way the user's own boot of a disk would. True when it changed the machine.
+    /// Default: nothing, the cold start already is that boot
+    virtual bool FinishAutostartColdStart(uint16_t pc) { (void)pc; return false; }
+
+    /// The guest's CPU clock select (the model's hardware turbo latch bits), read before a reset that stands in for
+    /// loading a program (Core::ResetKeepingClock: disk autostart, snapshot load) and put back after it with
+    /// RestoreClockSelect. A real reset clears the latch and the firmware sets the clock again; the quick reset skips
+    /// the firmware, so the program would run at the reset clock. Xpeccy keeps the clock the same way. Default: the
+    /// model has no clock select (0, nothing to restore)
+    virtual uint16_t GetClockSelect() const { return 0; }
+    virtual void RestoreClockSelect(uint16_t select) { (void)select; }
+
     /// Whether #7FFD paging is latched off until reset. A locked #7FFD ignores
     /// every later write, screen bit included, and keeps the value that locked
     /// it (UnrealSpeccy, Fuse, Xpeccy, ZXMAK2 and the MiSTer RTL agree), so the
@@ -1317,6 +1431,15 @@ public:
     /// Give the machine a policy (a decoder does it in its constructor; tests with a fake). Not owned: the policy
     /// must outlive its use, a machine's own policy lives as long as the decoder
     void SetSnapshotPolicy(snapshot::ISnapshotCommitPolicy* policy) { _snapshotPolicy = policy; }
+
+    /// A machine that holds a Spectrum state inside a running mode of its own (a Sprinter in a ZX mode): the banks behind its own
+    /// mapping, no reset to receive a state (MachineStateTransfer). nullptr = a plain machine
+    virtual const IStateTransferHost* GetStateTransferHost() const { return nullptr; }
+
+    /// The save side (P6): how this machine shows its 128K view to a snapshot. nullptr = the default rule for the model
+    /// (snapshotcapture.cpp): the Spectrum models as they are, TS-Conf and the ATMs by their live window map
+    virtual snapshot::ISnapshotCapturePolicy* GetSnapshotCapturePolicy() { return _snapshotCapturePolicy; }
+    void SetSnapshotCapturePolicy(snapshot::ISnapshotCapturePolicy* policy) { _snapshotCapturePolicy = policy; }
 
     /// endregion </Interaction with peripherals>
 

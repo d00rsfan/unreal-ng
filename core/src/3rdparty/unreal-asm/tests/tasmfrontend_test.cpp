@@ -18,6 +18,8 @@
 #include "unrealasm/containers.h"
 #include "unrealasm/dialect.h"
 
+#include "scratchdir.h"
+
 using namespace unrealasm;
 using unrealasm::testing::ReadTestData;
 
@@ -96,7 +98,7 @@ TEST(TasmFrontend_Test, ExpressionsRunLeftToRightWithPostfixOperators)
     EXPECT_EQ(ToSjasmplus("        LD H,TAB{\n        ADD A,TAB}+1\n        DW #9C40^", "4.0"),
               (std::vector<std::string>{"LD H,high TAB", "ADD A,low TAB+1", "DW ((#9C40&#FF)<<8|(#9C40&#FFFF)>>8)"}));
     // 4.0: [ ] rotate a 16-bit word by one bit
-    EXPECT_EQ(ToSjasmplus("        DW %1[", "4.0"), std::vector<std::string>{"DW (((%1&#FFFF)<<1|(%1&#FFFF)>>>(16-1))&#FFFF)"});
+    EXPECT_EQ(ToSjasmplus("        DW %1[", "4.0"), std::vector<std::string>{"DW ((%1*#10001>>>15)&#FFFF)"});
     // 4.12: [address] reads memory while assembling
     EXPECT_EQ(ToSjasmplus("KEY     =       [#5C08]"), (std::vector<std::string>{"DEVICE ZXSPECTRUM4096", "KEY={#5C08}"}));
     EXPECT_EQ(ToSjasmplus("        LD A,40H\n        LD A,\"\"\"\"", "4.0"), (std::vector<std::string>{"LD A,#40", "LD A,'\"'"}));
@@ -106,6 +108,44 @@ TEST(TasmFrontend_Test, IfCompilesItsFirstPartWhenTheValueIsZero)
 {
     EXPECT_EQ(ToSjasmplus("        .IF     DEBUG\n        NOP\n        .ELSE\n        HALT\n        .ENDIF"),
               (std::vector<std::string>{"IF (DEBUG)==0", "NOP", "ELSE", "HALT", "ENDIF"}));
+}
+
+TEST(TasmFrontend_Test, ConditionalsDoNotNest)
+{
+    // TASM 4.12: one state that .IF sets (even inside a skipped part), .ELSE inverts and .ENDIF clears
+    // (dialects/tasm412/IFNEST, checked in the emulator)
+    EXPECT_EQ(ToSjasmplus("        .IF     DBG1\n        NOP\n        .IF     DBG2\n        HALT\n        .ENDIF\n        DI\n        .ENDIF"),
+              (std::vector<std::string>{"IF (DBG1)==0", "NOP", "ENDIF", "IF (DBG2)==0", "HALT", "ENDIF", "DI"}));
+    EXPECT_EQ(ToSjasmplus("        .ELSE\n        NOP\n        .ENDIF"), (std::vector<std::string>{"IF 0", "NOP", "ENDIF"}));
+    EXPECT_EQ(ToSjasmplus("        .IF     DBG1\n        NOP"), (std::vector<std::string>{"IF (DBG1)==0", "NOP", "ENDIF"}));
+}
+
+TEST(TasmFrontend_Test, FlatConditionalsAssembleToWhatTasm412Built)
+{
+    // IFNEST: .IF inside a skipped .IF, .ELSE inside a compiled one; IFNEST.bin is what TASM 4.12 built in unreal-ng
+    const char* sjasmplus = std::getenv("UNREAL_ASM_SJASMPLUS");
+    if (!sjasmplus)
+        GTEST_SKIP() << "set UNREAL_ASM_SJASMPLUS to the sjasmplus binary";
+    const containers::TrdosFile file = Hobeta("dialects/tasm412/IFNEST.$A");
+    const codecs::TasmCodec tasm;
+    DecodeOptions options;
+    options.catalog = file.Hints();
+    const ConvertResult r = Convert(tasm.Decode(file.data, options).document, "sjasmplus");
+    ASSERT_TRUE(r.ok);
+    const std::filesystem::path dir =
+        unreal_asm_tests::UniqueDir("unreal-asm-tests");
+    std::filesystem::create_directories(dir);
+    WriteBytes(dir / "IFNEST.asm", codecs::SjasmplusCodec().Encode(r.document, {}).bytes);
+    const std::string harness = "        DEVICE ZXSPECTRUM128\n        INCLUDE \"IFNEST.asm\"\n        SAVEBIN \"out.bin\",#7000,12\n";
+    WriteBytes(dir / "harness.asm", std::vector<uint8_t>(harness.begin(), harness.end()));
+#ifdef _WIN32
+    const std::string command = "cd /d \"" + dir.string() + "\" && \"" + sjasmplus + "\" --nologo harness.asm > out.txt 2>&1";
+#else
+    const std::string command = "cd \"" + dir.string() + "\" && \"" + sjasmplus + "\" --nologo harness.asm > out.txt 2>&1";
+#endif
+    EXPECT_EQ(std::system(command.c_str()), 0);
+    EXPECT_EQ(ReadBytes(dir / "out.bin"), ReadTestData("dialects/tasm412/IFNEST.bin"));
+    std::filesystem::remove_all(dir);
 }
 
 TEST(TasmFrontend_Test, OrgAndPhaseEndAnActivePhase)
@@ -191,9 +231,8 @@ TEST(TasmFrontend_Test, GsRomAssemblesToTheRomTasmBuilt)
     const char* sjasmplus = std::getenv("UNREAL_ASM_SJASMPLUS");
     if (!sjasmplus)
         GTEST_SKIP() << "set UNREAL_ASM_SJASMPLUS to the sjasmplus binary";
-    std::random_device random;
     const std::filesystem::path dir =
-        std::filesystem::temp_directory_path() / ("unreal-asm-tests-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(random()));
+        unreal_asm_tests::UniqueDir("unreal-asm-tests");
     std::filesystem::create_directories(dir);
     const codecs::SjasmplusCodec codec;
     for (const ProjectFile& file : GsRom().files)
@@ -237,9 +276,8 @@ TEST(TasmFrontend_Test, SinusTableAssemblesToWhatTasm412Built)
     options.catalog = file.Hints();
     const ConvertResult r = Convert(tasm.Decode(file.data, options).document, "sjasmplus");
     ASSERT_TRUE(r.ok);
-    std::random_device random;
     const std::filesystem::path dir =
-        std::filesystem::temp_directory_path() / ("unreal-asm-tests-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(random()));
+        unreal_asm_tests::UniqueDir("unreal-asm-tests");
     std::filesystem::create_directories(dir);
     WriteBytes(dir / "SIN7.asm", codecs::SjasmplusCodec().Encode(r.document, {}).bytes);
     const std::string harness = "        DEVICE ZXSPECTRUM128\n        INCLUDE \"SIN7.asm\"\n        SAVEBIN \"out.bin\",#7000,256\n";
@@ -251,6 +289,48 @@ TEST(TasmFrontend_Test, SinusTableAssemblesToWhatTasm412Built)
 #endif
     EXPECT_EQ(std::system(command.c_str()), 0);
     EXPECT_EQ(ReadBytes(dir / "out.bin"), ReadTestData("dialects/tasm412/SIN7.bin"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TasmFrontend_Test, PageAndRunAsTasm412Uses)
+{
+    // .PAGE n puts the code of the next ORGs at #C000 and up into RAM page n; .RUN sets where TASM's Run command
+    // starts (checked in TASM 4.12: R ran the .RUN address, not the last ORG). PGTEST.bin is what TASM 4.12 built:
+    // 2 bytes of page 1, 2 of page 0 (both at #C000), 5 at #7000 and 5 at #7100
+    const containers::TrdosFile file = Hobeta("dialects/tasm412/PGTEST.$A");
+    const codecs::TasmCodec tasm;
+    DecodeOptions options;
+    options.catalog = file.Hints();
+    const ConvertResult r = Convert(tasm.Decode(file.data, options).document, "sjasmplus");
+    ASSERT_TRUE(r.ok);
+    const std::string text = r.document.Text();
+    EXPECT_NE(text.find("ORG #C000,1"), std::string::npos) << text;
+    EXPECT_NE(text.find("ORG #C000,0"), std::string::npos) << text;
+    EXPECT_NE(text.find("ORG #7000\n"), std::string::npos) << text;   // below #C000 the page stays out
+    EXPECT_NE(text.find("; .RUN #7000"), std::string::npos) << text;
+    const char* sjasmplus = std::getenv("UNREAL_ASM_SJASMPLUS");
+    if (!sjasmplus)
+        GTEST_SKIP() << "set UNREAL_ASM_SJASMPLUS to the sjasmplus binary";
+    const std::filesystem::path dir =
+        unreal_asm_tests::UniqueDir("unreal-asm-tests");
+    std::filesystem::create_directories(dir);
+    WriteBytes(dir / "PGTEST.asm", codecs::SjasmplusCodec().Encode(r.document, {}).bytes);
+    const std::string harness = "        INCLUDE \"PGTEST.asm\"\n        SLOT 3\n        PAGE 1\n        SAVEBIN \"p1.bin\",#C000,2\n"
+                                "        PAGE 0\n        SAVEBIN \"p0.bin\",#C000,2\n        SAVEBIN \"r2.bin\",#7000,5\n        SAVEBIN \"r4.bin\",#7100,5\n";
+    WriteBytes(dir / "harness.asm", std::vector<uint8_t>(harness.begin(), harness.end()));
+#ifdef _WIN32
+    const std::string command = "cd /d \"" + dir.string() + "\" && \"" + sjasmplus + "\" --nologo harness.asm > out.txt 2>&1";
+#else
+    const std::string command = "cd \"" + dir.string() + "\" && \"" + sjasmplus + "\" --nologo harness.asm > out.txt 2>&1";
+#endif
+    EXPECT_EQ(std::system(command.c_str()), 0);
+    std::vector<uint8_t> built;
+    for (const char* part : {"p1.bin", "p0.bin", "r2.bin", "r4.bin"})
+    {
+        const std::vector<uint8_t> bytes = ReadBytes(dir / part);
+        built.insert(built.end(), bytes.begin(), bytes.end());
+    }
+    EXPECT_EQ(built, ReadTestData("dialects/tasm412/PGTEST.bin"));
     std::filesystem::remove_all(dir);
 }
 
@@ -279,9 +359,8 @@ TEST(TasmFrontend_Test, Tasm50ProgramAssemblesToWhatTasm50Built)
     options.catalog = file.Hints();
     const ConvertResult r = Convert(tasm.Decode(file.data, options).document, "sjasmplus");
     ASSERT_TRUE(r.ok);
-    std::random_device random;
     const std::filesystem::path dir =
-        std::filesystem::temp_directory_path() / ("unreal-asm-tests-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + std::to_string(random()));
+        unreal_asm_tests::UniqueDir("unreal-asm-tests");
     std::filesystem::create_directories(dir);
     WriteBytes(dir / "PROG.asm", codecs::SjasmplusCodec().Encode(r.document, {}).bytes);
     const std::string harness = "        DEVICE ZXSPECTRUM48\n        INCLUDE \"PROG.asm\"\n        SAVEBIN \"out.bin\",#7000,45\n";

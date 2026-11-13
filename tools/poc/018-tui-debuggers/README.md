@@ -1,5 +1,7 @@
 # 018 - TUI Debuggers (classic + TSConf fork)
 
+**2026-10-31: moved on to [debuggers/tui/](../../../debuggers/README.md) (`unreal-tui-debugger`, `unreal-tui-debugger-tsconf`, over the WebSocket by default).** This folder keeps the POC as it was concluded.
+
 Standalone recreations of the UnrealSpeccy debugger UIs as cross-platform C++20
 terminal applications, driven entirely through a swappable backend interface:
 stubbed golden data today, live emulator integration through WebAPI already
@@ -85,3 +87,12 @@ Vendored: z80ex 1.1.21 (GPLv2), FTXUI 7.1.0 (MIT) in each project's `lib/`.
   50M-tick cap; prefer breakpoints / run-to in that mode.
 - `src/ui/*` subsystem files (modals, dialogs, bp/labels UI) are scaffolded
   stubs; the underlying capabilities already exist at the backend seam.
+
+## Status (added 2026-10-10)
+
+**concluded (pre-guideline)** — both TUIs run on the mock and the live WebAPI backends and the TSConf
+fork band is cell-exact against the oracle ("Results" above). `docs/inprogress/PLAN.md` #49 and the
+feature's `TODO.md` record "Spec + POC done"; the remaining work is a real TUI front-end as one skin of
+the debugger model, plus the WebAPI additions of `webapi-gap-analysis.md`.
+
+Serves: `docs/inprogress/2026-09-24-tui-debugger/`.

@@ -14,8 +14,10 @@ A change is a slot change that **restarts the machine** (a new instance,
 the media kept): `emulator_manage {"action":"slots_plug","slot":"ay-socket",
 "card":"ts","replace_if_incompatible":true}`, CLI `slots plug ay-socket ts
 --replace`. The legacy `[SOUND] TurboSound=` key still works in an INI
-without `[SLOTS]`. `TSFM_FmTrimDb=7.4` calibrates FM loudness to the
-real TSFM board (one FM carrier at TL 0 ≈ one SSG channel at volume 15).
+without `[SLOTS]`. FM plays at the real TSFM board's measured loudness (one
+FM carrier at TL 0 ≈ one SSG channel at volume 15); `TSFM_FmLevelDb` trims it
+(0 = the board). The old key `TSFM_FmTrimDb` counted 7.4 as the board and is
+still read that way.
 
 Ground truth: config `[SOUND]` block in any
 [data/configs/*/unreal.ini](../../data/configs/pentagon128k/unreal.ini),
@@ -55,8 +57,8 @@ surface - WebAPI `settings/<name>`, CLI `setting <name>`, Lua / Python
 | Setting | Values (default first) | Notes |
 |---|---|---|
 | `ay_voicing` | `classic` (default, alias `legacy`) \| `headphones` \| `flat` \| `warm` \| `tv` \| `small_speaker` | Tonal balance of the AY / SSG output, HQ and LQ. `flat` for analysis; also `[SOUND] AYVoicing=` in `unreal.ini` |
-| `ay_punch` | `on` \| `off` | AY transient enhancement, Sound HQ only |
-| `ay_room` | `9db` \| `off` \| `15db` ... `1db` | Headphone crossfeed level, Sound HQ only |
+| `ay_punch` | `on` \| `off` | AY transient enhancement, Sound HQ only; also the ZX-MultiSound card's SSG rows |
+| `ay_room` | `9db` \| `off` \| `15db` ... `1db` | Headphone crossfeed level, Sound HQ only; also the ZX-MultiSound card's SSG rows |
 | `beeper_punch` | `off` \| `on` | Beeper attack enhancement, Sound HQ only |
 
 What each profile sounds like, its curve and when to pick it:
@@ -108,6 +110,6 @@ curl -s "$BASE/emulator/$EMU_ID/state/audio/beeper" | jq .
 - **Assert on decoded fields, not raw bytes** — the register endpoints
   already compute `frequency_hz`, envelope shape flags and mixer
   direction; recomputing them client-side just duplicates the decode math.
-- **TSFM loudness is calibrated, not neutral** — `TSFM_FmTrimDb` shifts FM
+- **TSFM loudness is calibrated, not neutral** — `TSFM_FmLevelDb` shifts FM
   relative to SSG by design; a level mismatch between FM and AY channels
   is expected calibration, not a mixer bug.

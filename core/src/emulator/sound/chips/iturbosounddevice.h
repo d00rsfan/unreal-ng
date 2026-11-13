@@ -57,6 +57,10 @@ public:
     /// (design §6.1): drain to the device's own end-of-frame position,
     /// never to AudioTstate(z80->t), which already reads into the new frame
     virtual void handleFrameEnd() = 0;
+    /// A core whose per-step sync is deferred (TSFM with its synthesis
+    /// skipped) catches up with the CPU: the machine stops being driven (a
+    /// park, the end of a direct run), so observers read it in step
+    virtual void catchUp() {}
 
     /// Output stage on/off; core unaffected. Pushed once per frame by the
     /// manager (sound feature off counts as suppressed)
@@ -74,6 +78,22 @@ public:
     virtual void setCoreSynthesisSkipped(bool skipped)
     {
         (void)skipped;
+    }
+
+    /// TTD pins the render path while the machine is bound to a timeline (recording, replay, Detached; pushed once
+    /// per frame by the manager, and set by the device itself when a recording starts or a checkpoint loads). A
+    /// device whose TTD state holds its render loop's position (TSFM: sample and decimator phases, render cursor,
+    /// frame progress) then changes its render mode (quality, synthesis suppressed by sound off or turbo) only at a
+    /// frame start, where the frame's checkpoint records it. @p followsHost (recording): the mode the host asks for
+    /// is taken at each frame start. Otherwise (replay, Detached) the device keeps the mode of the checkpoint it
+    /// loaded, whatever the host asks: a replay from a checkpoint reaches the next one on any host. A replay that
+    /// runs on across frame starts stays exact up to the first frame whose recorded mode differs (the frame's blob
+    /// says it). The host speed is locked while a history exists (Core::CanSetSpeedMultiplier). Devices without such
+    /// state ignore it
+    virtual void setTtdRenderPinned(bool pinned, bool followsHost)
+    {
+        (void)pinned;
+        (void)followsHost;
     }
     /// endregion </Lifecycle>
 
@@ -146,6 +166,9 @@ public:
     /// The chip the ports #FFFD / #BFFD talk to now (TurboSound: #FF / #FE written to #FFFD; TSFM: the CPLD's
     /// chip bit)
     virtual int getSelectedChip() const = 0;
+    /// The SSG register a data read (IN #FFFD) returns now, 0..15; -1 when it returns something else (the TSFM
+    /// status byte, #FF with an FM address latched). The device access watch asks it when it starts (its seed)
+    virtual int getBusReadRegister() const = 0;
     /// Native-rate (pre-decimation) recording tap of the AY/SSG mix
     virtual std::shared_ptr<NativeAudioTap> getNativeTap() const = 0;
     /// Native-rate FM-only tap of chip `chip` (TSFM); nullptr without FM
@@ -153,8 +176,8 @@ public:
     {
         return nullptr;
     }
-    /// Install/remove the AY port-write log tap; inert while sink == nullptr
-    virtual void setLogSink(AYLogSink sink, void* context) = 0;
+    /// The AY history the port writes go to (ayhistory.h); none: nothing recorded
+    virtual void setHistory(AYHistory* history) = 0;
     /// endregion </Chips, taps, log>
 
     /// region <Ports>
@@ -165,4 +188,33 @@ public:
     /// Identity: TTDSerializable::TTDPeripheralId() — TurboSound (0) or
     /// TSFM (4); TTD registration and session-kind guards key on it
     /// endregion </Interface methods>
+
+    /// Render-layer restarts (bumped by every TTD restore, not TTD state): the host's post-processing of the chip
+    /// buffers (SoundManager's character chains) restarts with it, so the audio after a restore does not depend on
+    /// what played before it
+    uint64_t renderEpoch() const
+    {
+        return _renderEpoch;
+    }
+
+    /// The step gate's test (handleStep) without the call, as SoundManager::handleStep makes it: a step that ends at
+    /// audio T `now` before the deadline, at 1x host speed, only notes where it ended (settleSteps books it). true:
+    /// noted, the device's handleStep is not needed for this step
+    bool noteGatedStep(uint64_t now, uint8_t hostSpeed)
+    {
+        if (now >= _stepDeadline || hostSpeed != 1)
+            return false;
+        _pendingT = now;
+        _stepPending = true;
+        return true;
+    }
+
+protected:
+    uint64_t _renderEpoch = 0;
+    // The step gate (handleStep): the audio T before which a step only notes its T (_pendingT) and settleSteps books it
+    // once - a step that completes no output sample, or any step while the device sleeps (the quiet deferral, max).
+    // 0: every step the full way. Set only by the full way; every other entry clears it first
+    uint64_t _stepDeadline = 0;
+    uint64_t _pendingT = 0;
+    bool _stepPending = false;
 };

@@ -1,5 +1,6 @@
 #include "ttdfileinfo.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -28,74 +29,6 @@ bool Read(std::istream& in, T& value, const char* what, std::string& err)
     {
         err = std::string("truncated file (") + what + ")";
         return false;
-    }
-    return true;
-}
-
-bool Skip(std::istream& in, uint64_t bytes, const char* what, std::string& err)
-{
-    in.seekg(static_cast<std::streamoff>(bytes), std::ios::cur);
-    if (!in)
-    {
-        err = std::string("truncated file (") + what + ")";
-        return false;
-    }
-    return true;
-}
-
-/// The device set of a file written before the header mask: walk the page
-/// store's slot headers (payloads skipped) to the first checkpoint and read
-/// its peripheral blob ids. The stream is positioned right after the header.
-bool ScanPeripherals(std::istream& in, const TTDFileInfo& info, uint64_t& mask, std::string& err)
-{
-    mask = 0;
-    if (info.checkpointCount == 0)
-        return true;   // an empty session records no device
-    for (uint32_t i = 0; i < info.pageStoreCount; ++i)
-    {
-        uint8_t encoding = 0;
-        uint32_t refcount = 0, prevSlot = 0, crc = 0, payloadSize = 0;
-        if (!Read(in, encoding, "page slot", err) || !Read(in, refcount, "page slot", err) ||
-            !Read(in, prevSlot, "page slot", err) || !Read(in, crc, "page slot", err) ||
-            !Read(in, payloadSize, "page slot", err))
-            return false;
-        if (payloadSize > dump::kSubPageSize * 2)
-        {
-            err = "page slot " + std::to_string(i) + ": implausible payload size " + std::to_string(payloadSize);
-            return false;
-        }
-        if (!Skip(in, payloadSize, "page slot payload", err))
-            return false;
-    }
-    // First checkpoint: frame u64, globalT u64, frame kind u8, keyframe anchor
-    // u64, CPU and chipset state, RAM page refs, then the peripheral blobs
-    const uint64_t fixed = 8 + 8 + 1 + 8 + uint64_t(info.cpuStateSize) + info.chipsetStateSize;
-    const uint64_t refs = uint64_t(info.machine.ramPageBound) * dump::kSubPagesPerEmuPage * sizeof(uint32_t);
-    if (!Skip(in, fixed + refs, "first checkpoint", err))
-        return false;
-    uint16_t blobCount = 0;
-    if (!Read(in, blobCount, "peripheral blob count", err))
-        return false;
-    if (blobCount > dump::kMaxPeripheralBlobsPerCheckpoint)
-    {
-        err = "implausible peripheral blob count " + std::to_string(blobCount);
-        return false;
-    }
-    for (uint16_t b = 0; b < blobCount; ++b)
-    {
-        uint8_t id = 0;
-        uint32_t size = 0;
-        if (!Read(in, id, "peripheral blob", err) || !Read(in, size, "peripheral blob", err))
-            return false;
-        if (size > dump::kMaxPeripheralBlobBytes)
-        {
-            err = "implausible peripheral blob size " + std::to_string(size);
-            return false;
-        }
-        if (id < 64)
-            mask |= uint64_t(1) << id;
-        if (!Skip(in, size, "peripheral blob", err))
-            return false;
     }
     return true;
 }
@@ -168,19 +101,49 @@ std::string PeripheralIdName(uint8_t id)
         case PeripheralId::Sam2695: return "sam2695";
         case PeripheralId::MultiSoundGs: return "multisound-gs";
         case PeripheralId::EvoFlash: return "evo-flash";
-        case PeripheralId::Count: break;
+        case PeripheralId::NextState: return "next-state";
+        case PeripheralId::NextSystemArea: return "next-system-area";
+        case PeripheralId::MachineSerialPeer2: return "machine-serial-peer-2";
+        case PeripheralId::JoystickSerialPeer: return "joystick-serial-peer";
+        case PeripheralId::Count:
+        case PeripheralId::None: break;
     }
     return "id" + std::to_string(id);
 }
 
-GSTypeKind GeneralSoundOf(uint64_t peripheralMask)
+bool TTDRecordedMachine::Fits(TTDDeviceType type) const
 {
-    auto has = [peripheralMask](PeripheralId id) { return (peripheralMask >> static_cast<uint8_t>(id)) & 1u; };
-    if (has(PeripheralId::GeneralSound))
+    auto ofType = [type](const TTDRecordedDevice& d) { return d.key.type == type; };
+    return std::any_of(devices.begin(), devices.end(), ofType) ||
+           std::any_of(notRecordedDevices.begin(), notRecordedDevices.end(), ofType);
+}
+
+PeripheralMask TTDRecordedMachine::V1Mask() const
+{
+    PeripheralMask mask;
+    for (const TTDRecordedDevice& d : devices)
+        if (d.legacyId != PeripheralId::None)
+            mask.Set(static_cast<uint8_t>(d.legacyId));
+    return mask;
+}
+
+std::string DeviceDisplayName(const TTDRecordedDevice& device)
+{
+    if (device.legacyId != PeripheralId::None)
+        return PeripheralIdName(static_cast<uint8_t>(device.legacyId));
+    if (static_cast<uint16_t>(device.key.type) < static_cast<uint16_t>(PeripheralId::Count))
+        return PeripheralIdName(static_cast<uint8_t>(device.key.type));
+    return device.key.instance.empty() ? "type" + std::to_string(static_cast<uint16_t>(device.key.type))
+                                       : device.key.instance;
+}
+
+GSTypeKind GeneralSoundOf(const TTDRecordedMachine& machine)
+{
+    if (machine.Fits(TTDDeviceType::GeneralSound))
         return GSTypeKind::Z80;
-    if (has(PeripheralId::GeneralSoundLightweight))
+    if (machine.Fits(TTDDeviceType::GeneralSoundLightweight))
         return GSTypeKind::LW;
-    if (has(PeripheralId::NeoGS))
+    if (machine.Fits(TTDDeviceType::NeoGS))
         return GSTypeKind::NGS;
     return GSTypeKind::NONE;
 }
@@ -204,18 +167,26 @@ void DescribeRecordedMachine(TTDRecordedMachine& machine)
     if (machine.modelId < N_MM_MODELS)
         if (const TMemModel* m = Config::FindModelByEnum(static_cast<MEM_MODEL>(machine.modelId)))
             machine.model = m->ShortName ? m->ShortName : "";
+    // Ascending legacy id (the order sessions always listed), then type, then instance
+    auto order = [](const TTDRecordedDevice& a, const TTDRecordedDevice& b) {
+        const auto la = static_cast<uint16_t>(a.legacyId), lb = static_cast<uint16_t>(b.legacyId);
+        return la != lb ? la < lb : a.key < b.key;
+    };
+    std::sort(machine.devices.begin(), machine.devices.end(), order);
+    std::sort(machine.notRecordedDevices.begin(), machine.notRecordedDevices.end(), order);
     machine.peripherals.clear();
-    for (uint8_t id = 0; id < 64; ++id)
-        if ((machine.peripheralMask >> id) & 1u)
-            machine.peripherals.push_back(PeripheralIdName(id));
+    for (const TTDRecordedDevice& d : machine.devices)
+        machine.peripherals.push_back(DeviceDisplayName(d));
     machine.notRecorded.clear();
-    for (uint8_t id = 0; id < 64; ++id)
-        if ((machine.notRecordedMask >> id) & 1u)
-            machine.notRecorded.push_back(PeripheralIdName(id));
+    for (const TTDRecordedDevice& d : machine.notRecordedDevices)
+        machine.notRecorded.push_back(DeviceDisplayName(d));
     // The General Sound slot counts a card fitted but not recorded too
-    machine.generalSound = GeneralSoundOf(machine.peripheralMask | machine.notRecordedMask);
-    auto has = [&](PeripheralId id) { return (machine.peripheralMask >> static_cast<uint8_t>(id)) & 1u; };
-    machine.turboSound = has(PeripheralId::TSFM) ? "tsfm" : has(PeripheralId::TurboSound) ? "turbosound" : "none";
+    machine.generalSound = GeneralSoundOf(machine);
+    auto has = [&](TTDDeviceType type) {
+        return std::any_of(machine.devices.begin(), machine.devices.end(),
+                           [type](const TTDRecordedDevice& d) { return d.key.type == type; });
+    };
+    machine.turboSound = has(TTDDeviceType::TSFM) ? "tsfm" : has(TTDDeviceType::TurboSound) ? "turbosound" : "none";
 }
 
 bool ReadTTDFileInfo(std::istream& in, TTDFileInfo& info, std::string& err)
@@ -238,59 +209,13 @@ bool ReadTTDFileInfo(std::istream& in, TTDFileInfo& info, std::string& err)
         const TTDMemorySource source(std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {}));
         return ReadEngineFileInfo(source, info, err);
     }
-    if (info.schemaVersion != dump::kSchemaVersion)
-    {
+    if (dump::IsReadableSchema(info.schemaVersion))
+        err = "a v1 .ttd file (schema v" + std::to_string(info.schemaVersion) +
+              "): this build reads session files in the engine's format only (record the session again)";
+    else
         err = "unsupported .ttd schema v" + std::to_string(info.schemaVersion) + " (this build reads v" +
-              std::to_string(dump::kSchemaVersion) + ")";
-        return false;
-    }
-    if (!Read(in, info.flags, "flags", err) || !Read(in, info.machine.modelId, "model", err) ||
-        !Read(in, info.machine.ramPageBound, "RAM page bound", err) ||
-        !Read(in, info.cpuStateSize, "CPU state size", err) ||
-        !Read(in, info.chipsetStateSize, "chipset state size", err) ||
-        !Read(in, info.machine.romSignature, "ROM signature", err) ||
-        !Read(in, info.capturedAtUnixMs, "capture time", err))
-        return false;
-    uint8_t idLen = 0;
-    if (!Read(in, idLen, "emulator id", err))
-        return false;
-    info.emulatorId.resize(idLen);
-    if (idLen)
-    {
-        in.read(&info.emulatorId[0], idLen);
-        if (!in)
-        {
-            err = "truncated file (emulator id)";
-            return false;
-        }
-    }
-    uint64_t reserved = 0;
-    if (!Read(in, info.sessionState, "session state", err) || !Read(in, info.startFrame, "start frame", err) ||
-        !Read(in, info.endFrame, "end frame", err) || !Read(in, info.pageStoreCount, "page store count", err) ||
-        !Read(in, info.checkpointCount, "checkpoint count", err) || !Read(in, reserved, "peripheral mask", err))
-        return false;
-    if ((info.flags & dump::kFlagsHasNotRecordedMask) && !Read(in, info.machine.notRecordedMask, "not-recorded mask", err))
-        return false;
-
-    const uint16_t f = info.flags;
-    info.hasWriteJournal = f & dump::kFlagsHasWriteJournal;
-    info.writeJournalComplete = f & dump::kFlagsWriteJournalComplete;
-    info.hasCoverageIndex = f & dump::kFlagsHasCoverageIndex;
-    info.hasBookmarks = f & dump::kFlagsHasBookmarks;
-    info.hasInputJournal = f & dump::kFlagsHasInputJournal;
-    info.hasExternalEvents = f & dump::kFlagsHasExternalEvents;
-    info.hasPortJournals = f & dump::kFlagsHasPortJournals;
-    info.topClockTime = f & dump::kFlagsTopClockTime;
-
-    if (f & dump::kFlagsHasPeripheralMask)
-    {
-        info.machine.peripheralMask = reserved;
-        info.peripheralsFromHeader = true;
-    }
-    else if (!ScanPeripherals(in, info, info.machine.peripheralMask, err))
-        return false;
-    DescribeRecordedMachine(info.machine);
-    return true;
+              std::to_string(kEngineFileSchema) + ")";
+    return false;
 }
 
 bool ReadTTDFileInfo(const std::string& path, TTDFileInfo& info, std::string& err)

@@ -212,26 +212,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     message("Binary: ${CMAKE_BINARY_DIR}/${PROJECT_NAME}")
 
-    # Copy all ROM files to /rom sub-folder
-    add_custom_command(
-        TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E
-        copy_directory ${DATA_PATH}/rom ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rom
-    )
-
-    # Copy all test ROM files to /rom sub-folder
-    add_custom_command(
-        TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E
-        copy_directory ${DATA_PATH}/testrom ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rom
-    )
-
-    # The default General MIDI bank (ZX-MultiSound synthesizer) to /midi
-    add_custom_command(
-        TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E
-        copy_directory ${DATA_PATH}/midi ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/midi
-    )
+    # ROMs, symbols and the MIDI bank are copied once by the shared runtime-data target (root CMakeLists.txt)
+    add_dependencies(${PROJECT_NAME} runtime-data)
 else()
     # Produce static library; Create unrealng::automation_python alias for the target
     add_library(${PROJECT_NAME} STATIC ${SOURCES})
@@ -242,6 +224,7 @@ else()
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE_DIR}
         ${ROOT_DIR}/core/src
+        ${ROOT_DIR}/core/src/3rdparty/unreal-disk/include   # core headers include the disk model
     )
 
     # Core layout consistency (prevents ODR violation):
@@ -255,9 +238,18 @@ else()
         target_include_directories(${PROJECT_NAME} PRIVATE ${ROOT_DIR}/core/recording/src)
     endif()
 
+    # The host controller verbs (HostInputControl in core/controllers): the define, the headers and the link order
+    if (TARGET unrealng::controllers)
+        target_link_libraries(${PROJECT_NAME} PRIVATE unrealng::controllers)
+    endif()
+
+    # The media signatures (SignatureControl in core/swsignature)
+    if (TARGET unrealng::swsignature)
+        target_link_libraries(${PROJECT_NAME} PRIVATE unrealng::swsignature)
+    endif()
+
     # zstd::libzstd is required because core's ttd_compression.h (pulled in
-    # transitively via python_emulator.h -> timetravelmanager.h ->
-    # ttd_codec_page_store.h) #includes <zstd.h>, and this target uses
+    # by the TTD headers, e.g. ttd_codec_page_store.h) #includes <zstd.h>, and this target uses
     # core/src via raw include paths rather than linking unrealng::core.
     # zstd::libzstd is an INTERFACE IMPORTED target, so this only propagates
     # zstd's include directory (same fix as automation_webapi).

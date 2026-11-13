@@ -275,7 +275,7 @@ TEST_F(DezogDebugAdapter_test, AddBreakpointRegistersWithOwner)
     ASSERT_NE(id, 0);
 
     BreakpointManager* bpManager = _emulator->GetBreakpointManager();
-    BreakpointDescriptor* desc = bpManager->GetBreakpointById(id);
+    BreakpointSnapshot desc = bpManager->GetBreakpointById(id);
     ASSERT_NE(desc, nullptr);
     EXPECT_EQ(desc->z80address, 0x8006);
     EXPECT_EQ(desc->owner, DezogDebugAdapter::BREAKPOINT_OWNER);
@@ -295,7 +295,7 @@ TEST_F(DezogDebugAdapter_test, AddBreakpointInBankUsesPageDescriptor)
     uint16_t id = _adapter->addBreakpoint(0x8010, 3);
     ASSERT_NE(id, 0);
 
-    BreakpointDescriptor* desc = _emulator->GetBreakpointManager()->GetBreakpointById(id);
+    BreakpointSnapshot desc = _emulator->GetBreakpointManager()->GetBreakpointById(id);
     ASSERT_NE(desc, nullptr);
     EXPECT_EQ(desc->z80address, 0x8010);
     _adapter->removeBreakpoint(id);
@@ -345,18 +345,18 @@ TEST_F(DezogDebugAdapter_test, RemoveUnknownBreakpointIsHarmless)
 
 /// region <Watchpoints>
 
-TEST_F(DezogDebugAdapter_test, WatchpointCreatesOneBreakpointPerByte)
+TEST_F(DezogDebugAdapter_test, WatchpointCreatesOneRangeBreakpoint)
 {
     BreakpointManager* bpManager = _emulator->GetBreakpointManager();
     size_t before = bpManager->GetBreakpointsCount();
 
     ASSERT_TRUE(_adapter->addWatchpoint(0x9000, 0, 4, dzrp::WatchAccess::WRITE));
-    EXPECT_EQ(bpManager->GetBreakpointsCount(), before + 4);
+    EXPECT_EQ(bpManager->GetBreakpointsCount(), before + 1);
     EXPECT_EQ(_adapter->getWatchpointCount(), 1u);
 
     // Idempotent re-add
     ASSERT_TRUE(_adapter->addWatchpoint(0x9000, 0, 4, dzrp::WatchAccess::WRITE));
-    EXPECT_EQ(bpManager->GetBreakpointsCount(), before + 4);
+    EXPECT_EQ(bpManager->GetBreakpointsCount(), before + 1);
 
     _adapter->removeWatchpoint(0x9000, 0, 4, dzrp::WatchAccess::WRITE);
     EXPECT_EQ(bpManager->GetBreakpointsCount(), before);
@@ -396,7 +396,12 @@ TEST_F(DezogDebugAdapter_test, WatchpointClampsAt64K)
     size_t before = bpManager->GetBreakpointsCount();
 
     ASSERT_TRUE(_adapter->addWatchpoint(0xFFFE, 0, 8, dzrp::WatchAccess::WRITE));
-    EXPECT_EQ(bpManager->GetBreakpointsCount(), before + 2);
+    ASSERT_EQ(bpManager->GetBreakpointsCount(), before + 1);
+    for (const auto& [id, desc] : bpManager->GetAllBreakpoints())
+        if (desc->z80address == 0xFFFE)
+        {
+            EXPECT_EQ(desc->z80addressEnd, 0xFFFF);
+        }
 
     _adapter->removeWatchpoint(0xFFFE, 0, 8, dzrp::WatchAccess::WRITE);
     EXPECT_EQ(bpManager->GetBreakpointsCount(), before);
@@ -479,12 +484,18 @@ TEST_F(DezogDebugAdapter_test, TemporaryBreakpointHitThenCleared)
     EXPECT_EQ(_adapter->getTemporaryBreakpointCount(), 0u);
     EXPECT_EQ(_emulator->GetBreakpointManager()->GetBreakpointById(temp), nullptr);
 
-    // Resume must now run freely (no stale temp breakpoint re-triggers). A
-    // stale temp breakpoint on this 3-instruction loop would re-fire within
-    // microseconds, so the settle window only has to outlast the loop.
+    // Resume must now run freely (no stale temp breakpoint re-triggers). A stale temp breakpoint on this
+    // 3-instruction loop would re-fire within the first frame (thousands of laps a frame), so two full frames in
+    // turbo (counted, not timed) with no stop prove it
+    _emulator->EnableTurboMode();
+    const uint64_t target = frameCounter() + 2;
     _adapter->resume();
+    EXPECT_TRUE(TestWait::For([&] { return frameCounter() >= target || _emulator->IsPaused(); },
+                              std::chrono::milliseconds(5000)));
     EXPECT_TRUE(noFurtherEvents()) << "a stale temporary breakpoint re-triggered";
     EXPECT_FALSE(_emulator->IsPaused());
+    EXPECT_GE(frameCounter(), target);
+    _emulator->DisableTurboMode();
 }
 
 TEST_F(DezogDebugAdapter_test, ResumeAfterBreakpointContinuesToNextHit)
@@ -522,7 +533,7 @@ TEST_F(DezogDebugAdapter_test, WriteWatchpointHitNotifies)
     _adapter->removeWatchpoint(WATCH_TARGET, 0, 1, dzrp::WatchAccess::WRITE);
 }
 
-TEST_F(DezogDebugAdapter_test, ReadWriteWatchpointReportsReadReason)
+TEST_F(DezogDebugAdapter_test, ReadWriteWatchpointReportsTheAccessDirection)
 {
     installProgram();
     ASSERT_TRUE(_adapter->addWatchpoint(WATCH_TARGET, 0, 1, dzrp::WatchAccess::READ_WRITE));
@@ -531,8 +542,8 @@ TEST_F(DezogDebugAdapter_test, ReadWriteWatchpointReportsReadReason)
 
     PauseEvent ev{};
     ASSERT_TRUE(waitForEvent(ev));
-    // Direction is not carried by the payload: combined watchpoints report READ
-    EXPECT_EQ(ev.reason, dzrp::BreakReason::WATCHPOINT_READ);
+    // The hit carries its direction: the program writes the target, so an 'rw' watchpoint reports a write
+    EXPECT_EQ(ev.reason, dzrp::BreakReason::WATCHPOINT_WRITE);
     EXPECT_EQ(ev.address, WATCH_TARGET);
 
     _adapter->removeWatchpoint(WATCH_TARGET, 0, 1, dzrp::WatchAccess::READ_WRITE);
@@ -649,6 +660,19 @@ TEST_F(DezogDebugAdapter_test, SessionCloseDropsDezogBreakpointsKeepsOthersAndRe
     bpManager->RemoveBreakpointByID(foreign);
 }
 
+/// Owner decision 2026-10-09 (execution arbiter, owner-only run): the session close lifts only a pause DeZog set itself.
+/// The machine paused by the user (the GUI's pause) stays paused when DeZog disconnects
+TEST_F(DezogDebugAdapter_test, SessionCloseKeepsAPauseTheUserAskedFor)
+{
+    _emulator->Resume(execution::Requester{execution::Origin::DeZog, {}});
+    ASSERT_FALSE(_emulator->IsPaused());
+    _emulator->Pause(execution::Requester{execution::Origin::Gui, {}}, "user");
+    ASSERT_TRUE(_emulator->IsPaused());
+
+    _adapter->onSessionClosed();
+    EXPECT_TRUE(_emulator->IsPaused()) << "DeZog's close lifted the user's pause";
+}
+
 TEST_F(DezogDebugAdapter_test, SessionCloseWhileRunningIsHarmless)
 {
     _adapter->resume();
@@ -726,7 +750,7 @@ TEST_F(DezogDebugAdapter_test, ReadFull64KMatchesMemory)
 /// region <Instruction history (TTD reverse debugging)>
 
 #include "debugger/ttd/timetravelcontroller.h"
-#include "debugger/ttd/timetravelmanager.h"
+#include "debugger/ttd/timetravelcontroller.h"
 
 class DezogHistory_test : public DezogEmulatorFixture
 {
@@ -747,7 +771,7 @@ protected:
         _adapter->removeBreakpoint(id);
     }
 
-    ttd::TimeTravelManager* ttd() { return _emulator->GetContext()->pTimeTravelManager; }
+    ttd::TimeTravelController* ttd() { return _emulator->GetContext()->pTimeTravelController; }
 };
 
 TEST_F(DezogHistory_test, AvailableButNotRecordingUntilSessionOpens)
@@ -903,16 +927,11 @@ TEST_F(DezogHistory_test, MemoryDuringBrowseIsPresentPerDeZogModel)
 
     // Browse back to the DI at 8000: the ENTRY carries historic registers, but
     // readMemory still reflects the present (value 1), per the DeZog model.
-    // Rare transient under full test-parallel load (20 concurrent shards):
-    // a getHistoryEntry came back empty on the first scan and the loop stopped
-    // before reaching the DI entry. Rescan once after a settle pause instead of
-    // treating the transient as end-of-history; a persistent miss still fails.
+    // A getHistoryEntry can come back empty while its cache resolves (seen under a 20-shard parallel run): a scan that
+    // misses the DI entry is repeated until it is found (the bound only ends a persistent miss, it is no pause)
     bool sawDi = false;
     uint32_t scanned = 0;
-    for (int attempt = 0; attempt < 2 && !sawDi; ++attempt)
-    {
-        if (attempt > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TestWait::For([&] {
         for (uint32_t i = 0; i < 32; ++i)
         {
             auto e = _adapter->getHistoryEntry(i);
@@ -925,7 +944,8 @@ TEST_F(DezogHistory_test, MemoryDuringBrowseIsPresentPerDeZogModel)
                 EXPECT_EQ(_adapter->readMemory(WATCH_TARGET, 1)[0], 0x01) << "memory is present, not historic";
             }
         }
-    }
+        return sawDi;
+    });
     EXPECT_TRUE(sawDi) << "DI entry not found in history; entries scanned: " << scanned;
 
     // Resume returns to the present and continues; next hit as usual.
@@ -1004,7 +1024,7 @@ TEST_F(DezogHistory_test, HistorySurvivesBrowseAndStopCycles)
     runToJp(3);  // ~9 recorded instructions before any browse
 
     ASSERT_TRUE(_adapter->getHistoryEntry(8).has_value());  // deep pre-browse entry
-    EXPECT_TRUE(ttd()->IsDebuggerLive());
+    EXPECT_TRUE(ttd()->IsBackgroundSession());
     EXPECT_TRUE(ttd()->IsRecording());  // browsing must not stop the capture
     const size_t checkpointsBefore = ttd()->GetCheckpointCount();
 
@@ -1175,15 +1195,15 @@ TEST_F(DezogHistory_test, DeepBrowseAcrossFrameBoundaryThenResumeStaysCoherent)
     // ~1.1s through zeroed RAM and BASIC before stumbling back into 8006).
     uint16_t id = _adapter->addBreakpoint(PROGRAM_JP);
     ASSERT_NE(id, 0);
-    const auto t0 = std::chrono::steady_clock::now();
+    // Counted in frames, not milliseconds: three instructions away is T-states, so at most the frame the resume began
+    // in may end before the hit; the free run of the bug went through ~55 frames of zeroed RAM and BASIC
+    const uint64_t frameAtResume = frameCounter();
     _adapter->resume();
     PauseEvent hit{};
     ASSERT_TRUE(waitForEvent(hit, std::chrono::seconds(5))) << "breakpoint did not re-hit";
-    const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count();
     EXPECT_EQ(hit.address, PROGRAM_JP);
-    EXPECT_LT(dt, 500) << "re-hit took " << dt << "ms - machine resumed in a corrupted state";
+    EXPECT_LE(frameCounter() - frameAtResume, 1u)
+        << "re-hit took " << frameCounter() - frameAtResume << " frames - machine resumed in a corrupted state";
     _adapter->removeBreakpoint(id);
 }
 
@@ -1198,15 +1218,17 @@ TEST_F(DezogHistory_test, UnrecordedGapFallsBackToFreshSession)
     runToJp(2);
 
     // runToJp executes only a handful of instructions inside ONE frame (just
-    // the baseline checkpoint); free-run while recording is still active to
-    // cross frame boundaries and accrue a multi-checkpoint timeline.
-    freeRunFrames(10);
+    // the baseline checkpoint); run while recording is still active to cross
+    // frame boundaries and accrue a multi-checkpoint timeline. Not a turbo
+    // free run: turbo ends the debugger's background recording (it steps
+    // aside for an acceleration, owner decision 2026-10-07)
+    _emulator->RunNFrames(10, /*skipBreakpoints=*/true);
 
     const size_t checkpointsBefore = ttd()->GetCheckpointCount();
     EXPECT_GT(checkpointsBefore, 1u);
 
     // Host-side resume (adapter not involved - it would auto-restart capture)
-    ttd::TimeTravelManager* mgr = ttd();
+    ttd::TimeTravelController* mgr = ttd();
     mgr->StopRecording();
     freeRunFrames(10);
 
@@ -1217,7 +1239,7 @@ TEST_F(DezogHistory_test, UnrecordedGapFallsBackToFreshSession)
     // starting fresh (baseline only) instead of appending across the gap.
     _adapter->onSessionOpened();
     EXPECT_TRUE(mgr->IsRecording());
-    EXPECT_TRUE(mgr->IsDebuggerLive());
+    EXPECT_TRUE(mgr->IsBackgroundSession());
     EXPECT_LT(mgr->GetCheckpointCount(), checkpointsBefore);
     _adapter->resume();
 }
@@ -1254,7 +1276,9 @@ TEST_F(DezogHistory_test, StateRestoreRestartsHistory)
     // A browse entry (if history already has one) is coherent; resume returns to present
     auto e = _adapter->getHistoryEntry(0);
     if (e.has_value())
+    {
         EXPECT_TRUE(isProgramPc(e->regs.pc));
+    }
     _adapter->resume();
     EXPECT_EQ(_adapter->getHistoryCursor(), -1);
 }
@@ -1300,22 +1324,7 @@ TEST_F(DezogHistory_test, DebuggerEditStartsNewHistorySegment)
 
 /// The engine (Phase 5, D9): a debugger edit is recorded as an event with what
 /// it changed, so the history before it stays browsable and recording goes on
-class DezogHistoryEngine_test : public DezogHistory_test
-{
-protected:
-    void SetUp() override
-    {
-        Emulator::SetDefaultTimeTravelBackend(Emulator::TimeTravelBackend::Engine);
-        DezogHistory_test::SetUp();
-    }
-    void TearDown() override
-    {
-        DezogHistory_test::TearDown();
-        Emulator::SetDefaultTimeTravelBackend(Emulator::TimeTravelBackend::V1);
-    }
-};
-
-TEST_F(DezogHistoryEngine_test, DebuggerEditKeepsTheHistory)
+TEST_F(DezogHistory_test, DebuggerEditKeepsTheHistory)
 {
     ttd::TimeTravelController* controller = _emulator->GetContext()->pTimeTravelController;
     ASSERT_NE(controller, nullptr);
@@ -1341,61 +1350,67 @@ TEST_F(DezogHistoryEngine_test, DebuggerEditKeepsTheHistory)
     _adapter->resume();
 }
 
-TEST_F(DezogHistory_test, LatencyReportAfterFreeRun)
+TEST_F(DezogHistory_test, HistoryEntriesAreServedAfterAFreeRun)
 {
-    // Realistic shape: the target ran freely for a while before the user
-    // pauses and starts stepping back. 10 frames of the 3-instruction loop
-    // records ~7k history entries per frame, comfortably beyond the deepest
-    // jump probed below (index 20000). Frames, not milliseconds: the entry
-    // count is what the assertions depend on.
+    // Realistic shape: the target ran freely for a while before the user pauses and starts stepping back. 10 frames of
+    // the 3-instruction loop records ~7k history entries per frame, comfortably beyond the deepest jump probed below
+    // (index 20000). Frames, not milliseconds: the entry count is what the assertions depend on. How long the entries
+    // take to serve is a speed of the host: no clock here
     _adapter->onSessionOpened();
     installProgram();
     freeRunFrames(10, /*useAdapter=*/true);
     PauseEvent ev{};
     ASSERT_TRUE(waitForEvent(ev));
 
-    using clock = std::chrono::steady_clock;
-    auto t0 = clock::now();
     for (uint32_t i = 0; i < 10; ++i)
         ASSERT_TRUE(_adapter->getHistoryEntry(i).has_value()) << i;
-    auto t1 = clock::now();
     ASSERT_TRUE(_adapter->getHistoryEntry(500).has_value());
-    auto t2 = clock::now();
     ASSERT_TRUE(_adapter->getHistoryEntry(20000).has_value());  // crosses frame checkpoints
-    auto t3 = clock::now();
     _adapter->resume();
     _emulator->Pause();
-    auto t4 = clock::now();
-
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    std::cout << "[history-latency free-run] 10 sequential entries: " << ms(t0, t1) << " ms ("
-              << ms(t0, t1) / 10 << " ms/entry), jump to 500: " << ms(t1, t2)
-              << " ms, jump to 20000: " << ms(t2, t3) << " ms, return to present + resume: " << ms(t3, t4)
-              << " ms\n";
 }
 
-TEST_F(DezogHistory_test, LatencyReport)
+TEST_F(DezogHistory_test, HistoryEntriesAreServedInTheSpotPrefetchShape)
 {
     _adapter->onSessionOpened();
     installProgram();
     runToJp(40);  // ~120 instructions of history
 
-    using clock = std::chrono::steady_clock;
-    auto t0 = clock::now();
     for (uint32_t i = 0; i < 10; ++i)
         ASSERT_TRUE(_adapter->getHistoryEntry(i).has_value()) << i;  // DeZog "spot" prefetch shape
-    auto t1 = clock::now();
     ASSERT_TRUE(_adapter->getHistoryEntry(60).has_value());           // deep jump (batched)
-    auto t2 = clock::now();
     _adapter->resume();
     _emulator->Pause();
-    auto t3 = clock::now();
-
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    std::cout << "[history-latency] 10 sequential entries: " << ms(t0, t1) << " ms ("
-              << ms(t0, t1) / 10 << " ms/entry), jump to index 60: " << ms(t1, t2)
-              << " ms, return to present + resume: " << ms(t2, t3) << " ms\n";
-    RecordProperty("ms_per_entry", ms(t0, t1) / 10);
 }
 
 /// endregion </Instruction history (TTD reverse debugging)>
+
+// A stop DeZog has no breakpoint for (here a port breakpoint another surface set): told as another reason with its
+// text, so DeZog shows it instead of finding no breakpoint at the PC and running on (platform-debugging P4)
+TEST_F(DezogDebugAdapter_test, AStopDeZogHasNoBreakpointForIsToldWithItsText)
+{
+    const std::vector<uint8_t> program = {
+        0xF3,              // DI
+        0x3E, 0x01,        // LD A,1
+        0xD3, 0xFE,        // OUT (#FE),A: port #01FE
+        0xC3, 0x01, 0x80   // JP 8001h
+    };
+    _adapter->writeMemory(PROGRAM_START, program);
+    _adapter->setRegister(dzrp::RegisterId::PC, PROGRAM_START);
+    BreakpointSpec spec;
+    spec.type = BRK_IO;
+    spec.access = BRK_IO_OUT;
+    spec.address = 0x00FE;
+    spec.portMask = 0x00FF;
+    std::string error;
+    const uint16_t id = _emulator->GetBreakpointManager()->AddBreakpoint(spec, error);
+    ASSERT_NE(id, BRK_INVALID) << error;
+
+    _adapter->resume();
+    PauseEvent ev{};
+    ASSERT_TRUE(waitForEvent(ev));
+    EXPECT_EQ(ev.reason, dzrp::BreakReason::OTHER);
+    EXPECT_EQ(ev.address, PROGRAM_START + 5) << "the PC after the OUT";
+    EXPECT_EQ(_adapter->stopText(), "Breakpoint " + std::to_string(id) + ": port_out #01FE");
+    _emulator->GetBreakpointManager()->RemoveBreakpointByID(id);
+}

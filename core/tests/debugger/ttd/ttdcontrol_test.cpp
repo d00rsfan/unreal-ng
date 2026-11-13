@@ -9,18 +9,21 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <map>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "_helpers/heapcounter.h"
 #include "_helpers/testpathhelper.h"
+#include "common/filehelper.h"
 #include "_helpers/testwaithelper.h"
 #include "debugger/ttd/timetravelcontroller.h"
-#include "debugger/ttd/timetravelmanager.h"
 #include "debugger/ttd/ttdcontrol.h"
 #include "debugger/ttd/ttdexternalevents.h"
+#include "debugger/ttd/ttdrecordingfolders.h"
+#include "base/featuremanager.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/cpu/core.h"
@@ -33,43 +36,31 @@ using ttd::TTDControl;
 using ttd::TTDControlError;
 using ttd::TTDReply;
 
-/// Every test runs on both backends (Phase 5, C5): v1's TimeTravelManager and the
-/// engine's TimeTravelController, wired the way the switch wires it (hooks, write
-/// sink, EmulatorContext::pTimeTravelController)
-class TTDControl_Test : public ::testing::TestWithParam<bool>
+/// The verbs on the engine's TimeTravelController, the machine's own (hooks, write sink,
+/// EmulatorContext::pTimeTravelController)
+class TTDControl_Test : public ::testing::Test
 {
 protected:
     Emulator* _emulator = nullptr;
     EmulatorContext* _context = nullptr;
     ttd::ITimeTravelHooks* _ttd = nullptr;
-    std::unique_ptr<ttd::TimeTravelController> _controller;
+    ttd::TimeTravelController* _controller = nullptr;
 
     void SetUp() override
     {
         _emulator = new Emulator(LoggerLevel::LogError);
         ASSERT_TRUE(_emulator->Init());
         _context = _emulator->GetContext();
-        ASSERT_NE(_context->pTimeTravelManager, nullptr);
-        if (GetParam())
-        {
-            _controller = std::make_unique<ttd::TimeTravelController>(_context);
-            _context->pTimeTravelHooks = _controller.get();
-            _context->ttdWriteSink = _controller.get();
-            _context->pTimeTravelController = _controller.get();
-        }
+        _controller = _context->pTimeTravelController;
+        ASSERT_NE(_controller, nullptr);
         _ttd = _context->pTimeTravelHooks;
+        ASSERT_EQ(_ttd, _controller);
     }
 
     void TearDown() override
     {
         if (_controller)
-        {
             _controller->StopRecording();
-            _context->pTimeTravelHooks = _context->pTimeTravelManager;
-            _context->ttdWriteSink = _context->pTimeTravelManager;
-            _context->pTimeTravelController = nullptr;
-            _controller.reset();
-        }
         if (_emulator)
         {
             _emulator->Stop();
@@ -80,7 +71,7 @@ protected:
 
     ttd::TTDSessionInfo Info() const
     {
-        return _controller ? _controller->GetSessionInfo() : _context->pTimeTravelManager->GetSessionInfo();
+        return _controller->GetSessionInfo();
     }
 
     TTDReply Run(const std::string& verb, std::map<std::string, std::string> options = {})
@@ -111,7 +102,7 @@ protected:
     }
 };
 
-TEST_P(TTDControl_Test, UnknownVerbsAndOptionsFailTheSameWayEverywhere)
+TEST_F(TTDControl_Test, UnknownVerbsAndOptionsFailTheSameWayEverywhere)
 {
     TTDReply r = Run("rewind");
     EXPECT_EQ(r.error, TTDControlError::BadRequest);
@@ -129,7 +120,7 @@ TEST_P(TTDControl_Test, UnknownVerbsAndOptionsFailTheSameWayEverywhere)
     EXPECT_TRUE(Run("STATUS").Ok());
 }
 
-TEST_P(TTDControl_Test, WithoutTimeTravelStatusAnswersIdleAndEveryOtherVerbIsNotAvailable)
+TEST_F(TTDControl_Test, WithoutTimeTravelStatusAnswersIdleAndEveryOtherVerbIsNotAvailable)
 {
     TTDControl control(nullptr);
     TTDReply status = control.Execute({"status", {}});
@@ -143,7 +134,26 @@ TEST_P(TTDControl_Test, WithoutTimeTravelStatusAnswersIdleAndEveryOtherVerbIsNot
     EXPECT_EQ(start.message, "TTD engine not available in this build");
 }
 
-TEST_P(TTDControl_Test, StartStopAndStatusReportTheSession)
+/// A start the recorder refuses says why (409 with the reason), not a quiet "started": false - a Sprinter with two
+/// UART cards was refused that way, unexplained, until 2026-10-08. Here: a configuration with no RAM page to record
+TEST_F(TTDControl_Test, ARefusedStartSaysWhy)
+{
+    const uint32_t ramsize = _context->config.ramsize;
+    _context->config.ramsize = 8;   // under one 16 KB page
+    TTDReply r = Run("start");
+    _context->config.ramsize = ramsize;
+    EXPECT_FALSE(r.Ok());
+    EXPECT_EQ(r.HttpStatus(), 409);
+    EXPECT_NE(r.message.find("the recording did not start: the machine reports no RAM pages to record"), std::string::npos)
+        << r.message;
+    EXPECT_FALSE(Bool(r, "started"));
+
+    r = Run("start");   // the next start that succeeds clears the reason
+    ASSERT_TRUE(r.Ok()) << r.message;
+    EXPECT_TRUE(Bool(r, "started"));
+}
+
+TEST_F(TTDControl_Test, StartStopAndStatusReportTheSession)
 {
     TTDReply r = Run("start", {{"journal", "true"}, {"history_limit_frames", "500"}});
     ASSERT_TRUE(r.Ok()) << r.message;
@@ -152,10 +162,8 @@ TEST_P(TTDControl_Test, StartStopAndStatusReportTheSession)
     EXPECT_EQ(Str(r, "state"), "recording");
     EXPECT_TRUE(Bool(r, "write_journal_enabled"));
     EXPECT_EQ(Int(r, "history_limit_frames"), 500);
-    // The verbs drove this instance's session: the controller's in the Controller run
+    // The verbs drove this instance's session
     EXPECT_TRUE(_ttd->IsRecording());
-    if (_controller)
-        EXPECT_FALSE(_context->pTimeTravelManager->IsRecording()) << "v1 stays idle";
 
     r = Run("start");
     ASSERT_TRUE(r.Ok());
@@ -181,10 +189,12 @@ TEST_P(TTDControl_Test, StartStopAndStatusReportTheSession)
     const StateNode* earliest = status.body.find("earliest");
     ASSERT_NE(earliest, nullptr);
     if (Int(status, "checkpoint_count") > 0)
+    {
         EXPECT_EQ(earliest->find("frame")->i, Int(status, "session_start_frame"));
+    }
 }
 
-TEST_P(TTDControl_Test, StartWithoutTheJournalOptionKeepsTheChoice)
+TEST_F(TTDControl_Test, StartWithoutTheJournalOptionKeepsTheChoice)
 {
     ASSERT_TRUE(Run("journal", {{"enabled", "true"}}).Ok());
     TTDReply r = Run("start");
@@ -196,7 +206,7 @@ TEST_P(TTDControl_Test, StartWithoutTheJournalOptionKeepsTheChoice)
     EXPECT_FALSE(Bool(r, "write_journal_enabled"));
 }
 
-TEST_P(TTDControl_Test, ValuesThatDoNotParseAreBadRequests)
+TEST_F(TTDControl_Test, ValuesThatDoNotParseAreBadRequests)
 {
     EXPECT_EQ(Run("start", {{"journal", "maybe"}}).error, TTDControlError::BadRequest);
     EXPECT_EQ(Run("start", {{"history_limit_bytes", "-1"}}).error, TTDControlError::BadRequest);
@@ -218,7 +228,7 @@ TEST_P(TTDControl_Test, ValuesThatDoNotParseAreBadRequests)
     EXPECT_FALSE(Bool(r, "write_journal_enabled"));  // nothing records it without a session
 }
 
-TEST_P(TTDControl_Test, InvalidateIsRefusedWhileRecordingAndKeepsItsReasonOtherwise)
+TEST_F(TTDControl_Test, InvalidateIsRefusedWhileRecordingAndKeepsItsReasonOtherwise)
 {
     Record(2);
     TTDReply r = Run("invalidate", {{"reason", "test"}});
@@ -234,7 +244,7 @@ TEST_P(TTDControl_Test, InvalidateIsRefusedWhileRecordingAndKeepsItsReasonOtherw
     EXPECT_EQ(Info().lastDropReason, "test");
 }
 
-TEST_P(TTDControl_Test, JournalBuildIsRefusedWhileRecordingWithTheStateInTheEnvelope)
+TEST_F(TTDControl_Test, JournalBuildIsRefusedWhileRecordingWithTheStateInTheEnvelope)
 {
     Record(2);
     const TTDReply r = Run("journal-build");
@@ -248,7 +258,7 @@ TEST_P(TTDControl_Test, JournalBuildIsRefusedWhileRecordingWithTheStateInTheEnve
     EXPECT_EQ(value.find("state")->s, "recording");
 }
 
-TEST_P(TTDControl_Test, ABodyThatNamesItsOwnErrorKeepsIt)
+TEST_F(TTDControl_Test, ABodyThatNamesItsOwnErrorKeepsIt)
 {
     TTDReply r;
     r.error = TTDControlError::Conflict;
@@ -265,10 +275,9 @@ TEST_P(TTDControl_Test, ABodyThatNamesItsOwnErrorKeepsIt)
 // Group 2: positions, seeks, steps, resume
 // ---------------------------------------------------------------------------
 
-/// v1 refuses to move in the timeline while it records. The engine's controller
-/// pauses the recording instead (D8): the move happens, the state is detached
+/// A move in the timeline while recording pauses the recording (D8): the move happens, the state is detached
 /// with recording_paused, and the recording is kept
-TEST_P(TTDControl_Test, MovingInTheTimelineWhileRecording)
+TEST_F(TTDControl_Test, MovingInTheTimelineWhileRecording)
 {
     for (const auto& [verb, options] : std::vector<std::pair<std::string, std::map<std::string, std::string>>>{
              {"seek", {{"frame", "1"}}},
@@ -279,28 +288,19 @@ TEST_P(TTDControl_Test, MovingInTheTimelineWhileRecording)
         SCOPED_TRACE(verb);
         Record(4);
         const TTDReply r = Run(verb, options);
-        if (!_controller)
-        {
-            EXPECT_EQ(r.error, TTDControlError::Conflict);
-            EXPECT_EQ(Str(r, "state"), "recording");
-            EXPECT_TRUE(_ttd->IsRecording());
-        }
-        else
-        {
-            EXPECT_TRUE(r.Ok()) << r.message;
-            EXPECT_FALSE(_ttd->IsRecording());
-            const TTDReply status = Run("status");
-            EXPECT_EQ(Str(status, "state"), "detached");
-            EXPECT_TRUE(Bool(status, "recording_paused"));
-            EXPECT_GT(Int(status, "checkpoint_count"), 0);
-        }
+        EXPECT_TRUE(r.Ok()) << r.message;
+        EXPECT_FALSE(_ttd->IsRecording());
+        const TTDReply status = Run("status");
+        EXPECT_EQ(Str(status, "state"), "detached");
+        EXPECT_TRUE(Bool(status, "recording_paused"));
+        EXPECT_GT(Int(status, "checkpoint_count"), 0);
         ASSERT_TRUE(Run("stop").Ok());
         EXPECT_FALSE(Bool(Run("status"), "recording_paused")) << "a stop ends the paused recording";
         ASSERT_TRUE(Run("invalidate").Ok());
     }
 }
 
-TEST_P(TTDControl_Test, SeekTargetsAreCheckedBeforeAnythingMoves)
+TEST_F(TTDControl_Test, SeekTargetsAreCheckedBeforeAnythingMoves)
 {
     Record(6);
     ASSERT_TRUE(Run("stop").Ok());
@@ -315,7 +315,30 @@ TEST_P(TTDControl_Test, SeekTargetsAreCheckedBeforeAnythingMoves)
     EXPECT_EQ(_ttd->GetState(), ttd::TTDSessionState::Idle);  // nothing moved
 }
 
-TEST_P(TTDControl_Test, SeekStepAndResumeReportWhereTheMachineIs)
+// A seek past the history's end answers out_of_range naming the end and the position the machine
+// still stands on - not arrived_at {0, 0} - and moves nothing
+TEST_F(TTDControl_Test, SeekPastTheEndMovesNothing)
+{
+    Record(6);
+    ASSERT_TRUE(Run("stop").Ok());
+    const TTDReply before = Run("position");
+    ASSERT_TRUE(before.Ok());
+    const auto current = before.body.find("current")->find("frame")->i;
+    const auto end = before.body.find("session_end")->find("frame")->i;
+
+    const TTDReply r = Run("seek", {{"frame", std::to_string(end + 1000)}});
+    ASSERT_TRUE(r.Ok()) << r.message;
+    EXPECT_FALSE(Bool(r, "reached"));
+    EXPECT_EQ(Str(r, "halt_reason"), "out_of_range");
+    EXPECT_EQ(r.body.find("arrived_at")->find("frame")->i, current) << "where the machine is, not frame 0";
+    EXPECT_EQ(r.body.find("session_end")->find("frame")->i, end);
+    EXPECT_NE(Str(r, "message").find("past the history"), std::string::npos) << Str(r, "message");
+    EXPECT_EQ(_ttd->GetState(), ttd::TTDSessionState::Idle) << "nothing moved";
+    const TTDReply after = Run("position");
+    EXPECT_EQ(after.body.find("current")->find("frame")->i, current);
+}
+
+TEST_F(TTDControl_Test, SeekStepAndResumeReportWhereTheMachineIs)
 {
     Record(6);
     ASSERT_TRUE(Run("stop").Ok());
@@ -350,7 +373,55 @@ TEST_P(TTDControl_Test, SeekStepAndResumeReportWhereTheMachineIs)
     EXPECT_EQ(Str(r, "state"), "recording");
 }
 
-TEST_P(TTDControl_Test, InstructionStepsCheckTheirArguments)
+/// Every verb that moves the machine through the history says how exactly its position came back, and status says
+/// it while detached. A replay on other settings is not bit-exact and names them
+TEST_F(TTDControl_Test, MovingVerbsAndStatusReportTheCheck)
+{
+    Record(6);
+    ASSERT_TRUE(Run("stop").Ok());
+    const uint64_t first = Info().sessionStartFrame;
+    auto statusOf = [](const TTDReply& r) {
+        const StateNode* check = r.body.find("check");
+        return check ? check->find("status")->s : std::string("<missing>");
+    };
+
+    TTDReply r = Run("seek", {{"frame", std::to_string(first + 2)}, {"tinframe", "1000"}});
+    ASSERT_TRUE(r.Ok()) << r.message;
+    ASSERT_NE(r.body.find("check"), nullptr) << "a seek says how exactly its position came back";
+    EXPECT_EQ(statusOf(r), "exact");
+    EXPECT_TRUE(r.body.find("check")->find("issues")->items.empty());
+    for (const auto& [verb, options] : std::vector<std::pair<std::string, std::map<std::string, std::string>>>{
+             {"step-forward", {}}, {"step-back", {}}, {"step-instruction", {{"dir", "back"}}},
+             {"reverse-step", {{"count", "1"}}}, {"reverse-continue", {{"pcs", "0"}}}})
+    {
+        r = Run(verb, options);
+        ASSERT_TRUE(r.Ok()) << verb << ": " << r.message;
+        EXPECT_EQ(statusOf(r), "exact") << verb;
+    }
+    EXPECT_EQ(statusOf(Run("status")), "exact") << "detached: status says it too";
+
+    {
+        // Another decimator: a replay inside a frame runs on other settings
+        CONFIG& config = _context->config;
+        config.sound.decimatorHighFidelity = !config.sound.decimatorHighFidelity;
+        r = Run("seek", {{"frame", std::to_string(first + 3)}, {"tinframe", "1000"}});
+        const TTDReply status = Run("status");
+        config.sound.decimatorHighFidelity = !config.sound.decimatorHighFidelity;
+        ASSERT_TRUE(r.Ok()) << r.message;
+        EXPECT_EQ(statusOf(r), "not_bit_exact");
+        ASSERT_NE(r.body.find("check"), nullptr);
+        const std::vector<StateNode>& issues = r.body.find("check")->find("issues")->items;
+        ASSERT_EQ(issues.size(), 1u);
+        EXPECT_EQ(issues[0].find("kind")->s, "configuration_differs");
+        EXPECT_EQ(issues[0].find("detail")->s.rfind("sound.decimator_high_fidelity", 0), 0u) << issues[0].find("detail")->s;
+        EXPECT_EQ(statusOf(status), "not_bit_exact");
+    }
+
+    ASSERT_TRUE(Run("resume").Ok());
+    EXPECT_EQ(Run("status").body.find("check"), nullptr) << "recording again: no position to judge";
+}
+
+TEST_F(TTDControl_Test, InstructionStepsCheckTheirArguments)
 {
     Record(4);
     ASSERT_TRUE(Run("stop").Ok());
@@ -375,7 +446,7 @@ TEST_P(TTDControl_Test, InstructionStepsCheckTheirArguments)
 // Group 3: markers and bookmarks
 // ---------------------------------------------------------------------------
 
-TEST_P(TTDControl_Test, MarkersListTheReplayBarriers)
+TEST_F(TTDControl_Test, MarkersListTheReplayBarriers)
 {
     Record(2);
     _ttd->RecordExternalEvent(ttd::TTDExternalEventKind::TapeControl, "play");
@@ -388,7 +459,7 @@ TEST_P(TTDControl_Test, MarkersListTheReplayBarriers)
     EXPECT_EQ(marker.find("reason")->s, "play");
 }
 
-TEST_P(TTDControl_Test, BookmarksAreAddedListedAndDeletedByLabel)
+TEST_F(TTDControl_Test, BookmarksAreAddedListedAndDeletedByLabel)
 {
     Record(4);
     ASSERT_TRUE(Run("stop").Ok());
@@ -425,7 +496,7 @@ TEST_P(TTDControl_Test, BookmarksAreAddedListedAndDeletedByLabel)
 // Group 4a: reverse queries (find-last, reverse-continue) and port events
 // ---------------------------------------------------------------------------
 
-TEST_P(TTDControl_Test, ReverseQueriesCheckTheirCriteriaAndAddresses)
+TEST_F(TTDControl_Test, ReverseQueriesCheckTheirCriteriaAndAddresses)
 {
     Record(4);
     ASSERT_TRUE(Run("stop").Ok());
@@ -435,6 +506,18 @@ TEST_P(TTDControl_Test, ReverseQueriesCheckTheirCriteriaAndAddresses)
     EXPECT_EQ(Run("find-last", {{"addr", "#5C00"}, {"access", "poke"}}).error, TTDControlError::BadRequest);
     EXPECT_EQ(Run("find-last", {{"value", "256"}}).error, TTDControlError::BadRequest);
     EXPECT_EQ(Run("find-last", {{"addr", "$5C00"}, {"phys_page", "300"}}).error, TTDControlError::BadRequest);
+    // space: ram / vram / cache; offsets in another space reach its end (256 KB) and stay inside one 16 KB page
+    EXPECT_EQ(Run("find-last", {{"addr", "0"}, {"space", "rom"}}).error, TTDControlError::BadRequest);
+    EXPECT_EQ(Run("find-last", {{"addr", "0x40000"}, {"space", "vram"}}).error, TTDControlError::BadRequest);
+    EXPECT_EQ(Run("find-last", {{"addr_from", "0x3FFF"}, {"addr_to", "0x4000"}, {"space", "cache"}}).error,
+              TTDControlError::BadRequest);
+    EXPECT_EQ(Run("find-last", {{"value", "1"}, {"space", "vram"}}).error, TTDControlError::BadRequest) << "no offset";
+    EXPECT_EQ(Run("find-last", {{"addr", "5"}, {"space", "vram"}, {"phys_page", "5"}}).error, TTDControlError::BadRequest);
+    for (const auto& [space, addr] : {std::pair{"vram", "0x3FFFF"}, std::pair{"cache", "0x4000"}, std::pair{"ram", "0xFFFF"}})
+    {
+        const TTDReply r = Run("find-last", {{"addr", addr}, {"space", space}});
+        EXPECT_TRUE(r.Ok()) << space << " " << addr << ": " << r.message;
+    }
     EXPECT_EQ(Run("reverse-continue").error, TTDControlError::BadRequest);
     EXPECT_EQ(Run("reverse-continue", {{"pcs", "0x38,"}}).error, TTDControlError::BadRequest);
 
@@ -450,23 +533,17 @@ TEST_P(TTDControl_Test, ReverseQueriesCheckTheirCriteriaAndAddresses)
     ASSERT_NE(rc.body.find("matched"), nullptr);
 }
 
-/// Reverse queries while recording: refused by v1, a pause on the controller (D8)
-TEST_P(TTDControl_Test, ReverseQueriesWhileRecording)
+/// Reverse queries while recording: a pause of the recording (D8)
+TEST_F(TTDControl_Test, ReverseQueriesWhileRecording)
 {
     Record(2);
     const TTDReply findLast = Run("find-last", {{"addr", "0x5C00"}});
-    if (!_controller)
-    {
-        EXPECT_EQ(findLast.error, TTDControlError::Conflict);
-        EXPECT_EQ(Run("reverse-continue", {{"pcs", "0x38"}}).error, TTDControlError::Conflict);
-        return;
-    }
     EXPECT_NE(findLast.error, TTDControlError::Conflict) << findLast.message;
     EXPECT_TRUE(Bool(Run("status"), "recording_paused"));
     EXPECT_NE(Run("reverse-continue", {{"pcs", "0x38"}}).error, TTDControlError::Conflict);
 }
 
-TEST_P(TTDControl_Test, PortEventsNeedAnEventAndKnownOptions)
+TEST_F(TTDControl_Test, PortEventsNeedAnEventAndKnownOptions)
 {
     Record(2);
     ASSERT_TRUE(Run("stop").Ok());
@@ -481,7 +558,7 @@ TEST_P(TTDControl_Test, PortEventsNeedAnEventAndKnownOptions)
 // Group 4b: coverage queries
 // ---------------------------------------------------------------------------
 
-TEST_P(TTDControl_Test, CoverageQueriesCheckEveryValue)
+TEST_F(TTDControl_Test, CoverageQueriesCheckEveryValue)
 {
     EXPECT_EQ(Run("coverage-probe").error, TTDControlError::BadRequest);  // frame is required
     EXPECT_EQ(Run("coverage-probe", {{"frame", "1"}, {"kind", "jumped"}}).error, TTDControlError::BadRequest);
@@ -493,7 +570,7 @@ TEST_P(TTDControl_Test, CoverageQueriesCheckEveryValue)
     EXPECT_EQ(Run("coverage-summary", {{"bucket_size", "x"}}).error, TTDControlError::BadRequest);
 }
 
-TEST_P(TTDControl_Test, CoverageQueriesAnswerWithoutTimeTravel)
+TEST_F(TTDControl_Test, CoverageQueriesAnswerWithoutTimeTravel)
 {
     TTDControl control(nullptr);
     const TTDReply probe = control.Execute({"coverage-probe", {{"frame", "5"}}});
@@ -509,7 +586,7 @@ TEST_P(TTDControl_Test, CoverageQueriesAnswerWithoutTimeTravel)
     EXPECT_EQ(Int(summary, "bucket_size"), 0);
 }
 
-TEST_P(TTDControl_Test, CoverageScanFindsTheFramesThatRanTheRom)
+TEST_F(TTDControl_Test, CoverageScanFindsTheFramesThatRanTheRom)
 {
     Record(6);
     ASSERT_TRUE(Run("stop").Ok());
@@ -525,7 +602,7 @@ TEST_P(TTDControl_Test, CoverageScanFindsTheFramesThatRanTheRom)
 // Group 5: files
 // ---------------------------------------------------------------------------
 
-TEST_P(TTDControl_Test, ASessionDumpedIsDescribedAndLoadedThroughTheVerbs)
+TEST_F(TTDControl_Test, ASessionDumpedIsDescribedAndLoadedThroughTheVerbs)
 {
     Record(3);
     ASSERT_TRUE(Run("stop").Ok());
@@ -550,7 +627,47 @@ TEST_P(TTDControl_Test, ASessionDumpedIsDescribedAndLoadedThroughTheVerbs)
     std::remove(path.c_str());
 }
 
-TEST_P(TTDControl_Test, FileVerbsReportMissingAndUnreadableFiles)
+/// Phase 5: the engine's load reads the file where its loader asks; the file is
+/// not copied into memory first. The same file loaded from a stream (read
+/// whole) and through the "load" verb: the verb's load holds at least half the file less
+TEST_F(TTDControl_Test, LoadingAFileDoesNotHoldItInMemory)
+{
+    if (!HeapCounter::Available())
+        GTEST_SKIP() << "no heap block size query on this platform";
+    Record(3);
+    ASSERT_TRUE(Run("stop").Ok());
+    const std::string path = TestPathHelper::GetUniqueTestScratchPath("ttdcontrol-load-heap.ttd");
+    TTDReply r = Run("dump", {{"path", path}});
+    ASSERT_TRUE(r.Ok()) << r.message;
+    const int64_t fileBytes = Int(r, "bytes");
+
+    auto peakOf = [&](bool fromPath) {
+        _controller->InvalidateSession("test: the next load");
+        std::string error;
+        std::ifstream in(FileHelper::ToFsPath(path), std::ios::binary);
+        HeapCounter::Start();
+        bool ok = false;
+        if (fromPath)
+        {
+            const TTDReply loaded = Run("load", {{"path", path}});   // the verb every surface uses
+            ok = loaded.Ok();
+            error = loaded.message;
+        }
+        else
+            ok = _controller->DeserializeSession(in, error);
+        HeapCounter::Stop();
+        EXPECT_TRUE(ok) << error;
+        return HeapCounter::Peak();
+    };
+    peakOf(true);   // first-use allocations out of the way
+    const int64_t whole = peakOf(false);
+    const int64_t fromPath = peakOf(true);
+    EXPECT_LT(fromPath, whole - fileBytes / 2) << "file " << fileBytes << " bytes, peak read whole " << whole
+                                               << ", from the path " << fromPath;
+    std::remove(path.c_str());
+}
+
+TEST_F(TTDControl_Test, FileVerbsReportMissingAndUnreadableFiles)
 {
     const std::string missing = TestPathHelper::GetUniqueTestScratchPath("no-such-session.ttd");
     TTDReply r = TTDControl(nullptr).Execute({"file-info", {{"path", missing}}});
@@ -566,10 +683,10 @@ TEST_P(TTDControl_Test, FileVerbsReportMissingAndUnreadableFiles)
     EXPECT_EQ(Run("export-clip", {{"from", "0"}, {"to", "1"}, {"path", missing}}).error, TTDControlError::Conflict);
 }
 
-/// D13: a seek to a frame without a T-state lands at the frame's end on the
-/// engine - the state of {N+1, 0} and the frame's final picture - and is named
-/// {N, length of N}; v1 keeps the frame's start. With a T-state nothing changes
-TEST_P(TTDControl_Test, AFrameWithoutATStateIsItsEnd)
+/// D13: a seek to a frame without a T-state lands at the frame's end - the
+/// state of {N+1, 0} and the frame's final picture - and is named
+/// {N, length of N}. With a T-state nothing changes
+TEST_F(TTDControl_Test, AFrameWithoutATStateIsItsEnd)
 {
     // A program that changes the screen all the time: DI; LD A,2; OUT (#FE),A;
     // again: LD HL,#5800; loop: INC (HL); INC L; JR NZ,loop; JR again
@@ -595,8 +712,6 @@ TEST_P(TTDControl_Test, AFrameWithoutATStateIsItsEnd)
         pictureAtEnd.push_back(picture());
     }
     _emulator->RunTStates(30000, /*skipBreakpoints=*/true);
-    if (!GetParam())
-        ASSERT_TRUE(Run("stop").Ok()) << "v1 browses a stopped session only";
     const uint64_t n = first + 4;
 
     // The frame's start, asked for explicitly: unchanged on both
@@ -609,12 +724,6 @@ TEST_P(TTDControl_Test, AFrameWithoutATStateIsItsEnd)
     ASSERT_TRUE(Bool(r, "reached")) << r.message;
     const StateNode* at = r.body.find("arrived_at");
     ASSERT_NE(at, nullptr);
-    if (!GetParam())
-    {
-        EXPECT_EQ(at->find("frame")->i, int64_t(n)) << "v1: the frame's start";
-        EXPECT_EQ(at->find("tinframe")->i, 0);
-        return;
-    }
     EXPECT_EQ(at->find("frame")->i, int64_t(n)) << "named in frame N";
     EXPECT_GT(at->find("tinframe")->i, 60000) << "at its length";
     const ttd::TTDCpuState end = cpu();
@@ -635,12 +744,10 @@ TEST_P(TTDControl_Test, AFrameWithoutATStateIsItsEnd)
 
 /// BUGS.md 2026-10-05 #4: the status of a running recording follows it - a
 /// snapshot older than the publish interval is refreshed before it is answered
-/// (the engine; v1 answers its last snapshot). Over the 50 ms budget (~300 ms):
+/// Over the 50 ms budget (~300 ms):
 /// the machine has to run on its own thread at real speed for some frames
-TEST_P(TTDControl_Test, TheStatusOfARunningRecordingFollowsIt)
+TEST_F(TTDControl_Test, TheStatusOfARunningRecordingFollowsIt)
 {
-    if (!GetParam())
-        GTEST_SKIP() << "the engine's status";
     ASSERT_TRUE(Run("start").Ok());
     const uint64_t first = _context->emulatorState.frame_counter;
     (void)Run("status");   // a first look publishes early in the recording
@@ -656,7 +763,7 @@ TEST_P(TTDControl_Test, TheStatusOfARunningRecordingFollowsIt)
 /// BUGS.md 2026-10-05 #1: a machine whose program never writes #FE shows the
 /// border its port latch holds, live and in a TTD-composed picture alike (a
 /// reset takes the renderer's border color from the latch)
-TEST_P(TTDControl_Test, TheBorderBeforeAnyOutToFEIsTheLatchs)
+TEST_F(TTDControl_Test, TheBorderBeforeAnyOutToFEIsTheLatchs)
 {
     // DI; loop: INC (HL); INC HL; JR loop - never an OUT
     const uint8_t program[] = {0xF3, 0x34, 0x23, 0x18, 0xFC};
@@ -681,5 +788,107 @@ TEST_P(TTDControl_Test, TheBorderBeforeAnyOutToFEIsTheLatchs)
     EXPECT_EQ(_context->emulatorState.border_attr, _context->emulatorState.pFE & 0x07);
 }
 
-INSTANTIATE_TEST_SUITE_P(Backends, TTDControl_Test, ::testing::Values(false, true),
-                         [](const ::testing::TestParamInfo<bool>& info) { return info.param ? "Controller" : "V1"; });
+/// Step 3 (D29): `start` with black_box arms the black box (the engine): a
+/// recording of the last `minutes`, reported in status; an explicit start
+/// disarms it
+TEST_F(TTDControl_Test, StartArmsTheBlackBox)
+{
+    TTDReply r = Run("start", {{"black_box", "true"}, {"minutes", "2"}});
+    ASSERT_TRUE(r.Ok()) << r.message;
+    EXPECT_TRUE(Bool(r, "black_box"));
+    const TTDReply status = Run("status");
+    EXPECT_TRUE(Bool(status, "black_box"));
+    EXPECT_EQ(Int(status, "history_limit_frames"), int64_t(2 * 60 * 1000000 / _context->config.frame_duration_us));
+    EXPECT_EQ(Run("start", {{"minutes", "0"}}).error, TTDControlError::BadRequest);
+
+    ASSERT_TRUE(Run("stop").Ok());
+    ASSERT_TRUE(Run("start").Ok());
+    EXPECT_FALSE(Bool(Run("status"), "black_box")) << "an explicit recording";
+}
+
+/// Step 3c (owner decision 2026-10-06): a black box that restarts - after turbo
+/// or a host speed, after a machine change - keeps its previous recording's
+/// folder on disk (a new session in memory, no linked sessions). "load" opens
+/// such a folder, given the folder or any of its segment files: its segments
+/// are joined into one session
+TEST_F(TTDControl_Test, ARestartedBlackBoxLeavesItsRecordingToLoad)
+{
+    const std::string root = TestPathHelper::GetUniqueTestScratchPath("ttd-black-box");
+    _controller->SetShadowRecordingRoot(root);
+    ASSERT_TRUE(Run("start", {{"black_box", "true"}, {"minutes", "1"}}).Ok());
+    _emulator->RunNFrames(6, /*skipBreakpoints=*/true);
+    const std::string beforeTurbo = _controller->ShadowRecordingFolder();
+    ASSERT_FALSE(beforeTurbo.empty());
+
+    // Turbo stops it; off again, a new session in a new folder, the old one kept
+    FeatureManager* features = _emulator->GetFeatureManager();
+    ASSERT_TRUE(features->setFeature(Features::kTurboMode, true));
+    ASSERT_TRUE(features->setFeature(Features::kTurboMode, false));
+    ASSERT_TRUE(_controller->IsRecording());
+    _emulator->RunNFrames(3, /*skipBreakpoints=*/true);
+    const std::string afterTurbo = _controller->ShadowRecordingFolder();
+    EXPECT_NE(afterTurbo, beforeTurbo);
+    const auto kept = ttd::TTDRecordingFolder::Open(beforeTurbo);
+    ASSERT_NE(kept, nullptr) << "the recording before the turbo stays on disk";
+    EXPECT_FALSE(kept->Segments().empty());
+
+    // A machine change the same way: the session ends, its folder stays
+    _controller->EndSessionFor(ttd::TTDChange::Machine, "test: ROM reload");
+    _emulator->RunNFrames(2, /*skipBreakpoints=*/true);
+    ASSERT_TRUE(_controller->IsRecording()) << "the black box records again after the change";
+    EXPECT_NE(ttd::TTDRecordingFolder::Open(afterTurbo), nullptr) << "the recording before the change stays";
+
+    // Load the first one by its folder, then by one of its segment files
+    ASSERT_TRUE(Run("stop").Ok());
+    TTDReply loaded = Run("load", {{"path", beforeTurbo}});
+    ASSERT_TRUE(loaded.Ok()) << loaded.message;
+    EXPECT_GE(Int(loaded, "checkpoint_count"), 6);
+    loaded = Run("load", {{"path", kept->Segments().front()}});
+    ASSERT_TRUE(loaded.Ok()) << loaded.message;
+    EXPECT_GE(Int(loaded, "checkpoint_count"), 6);
+
+    // An explicit recording started again leaves nothing behind
+    ASSERT_TRUE(Run("start").Ok());
+    _emulator->RunNFrames(2, /*skipBreakpoints=*/true);
+    const std::string explicitFolder = _controller->ShadowRecordingFolder();
+    ASSERT_TRUE(Run("stop").Ok());
+    // The next folder may take the same name (a second's resolution): a marker tells them apart
+    const std::string marker = explicitFolder + "/marker";
+    std::ofstream(FileHelper::ToFsPath(marker)) << "explicit";
+    ASSERT_TRUE(Run("start").Ok());
+    _emulator->RunNFrames(1, /*skipBreakpoints=*/true);
+    EXPECT_FALSE(FileHelper::FileExists(marker)) << "an explicit session's folder goes with it";
+}
+
+// memory-at / memory-diff: a memory at a past checkpoint and what changed between two, from the engine's store. On
+// the 128K ROM's frame interrupt FRAMES (#5C78, RAM page 5 offset #1C78) counts up every frame.
+// Boot-bound: the ROM reaches BASIC (interrupts on) in about 100 frames, run before the recording in the turbo mode
+TEST_F(TTDControl_Test, MemoryAtAndMemoryDiffReadTheStore)
+{
+    _emulator->EnableTurboMode();
+    _emulator->RunNFrames(120, /*skipBreakpoints=*/true);
+    _emulator->DisableTurboMode();
+    Record(4);
+    ASSERT_TRUE(Run("stop").Ok());
+    const std::string first = std::to_string(Info().sessionStartFrame);
+    const std::string last = std::to_string(Info().currentEndFrame);
+    const TTDReply at = Run("memory-at", {{"space", "ram5"}, {"offset", "0x1C78"}, {"length", "1"}, {"frame", first}});
+    ASSERT_TRUE(at.Ok()) << at.message;
+    EXPECT_EQ(Str(at, "space"), "ram");
+    EXPECT_EQ(at.body.find("offset")->i, 5 * 0x4000 + 0x1C78) << "page 5 of the machine RAM";
+    const TTDReply end = Run("memory-at", {{"space", "ram5"}, {"offset", "0x1C78"}, {"length", "1"}, {"frame", last}});
+    ASSERT_TRUE(end.Ok()) << end.message;
+    EXPECT_NE(Str(at, "hex"), Str(end, "hex")) << "FRAMES counted on";
+
+    const TTDReply diff = Run("memory-diff", {{"space", "ram5"}, {"from_frame", first}, {"to_frame", last}});
+    ASSERT_TRUE(diff.Ok()) << diff.message;
+    bool frames = false;
+    for (const StateNode& r : diff.body.find("ranges")->items)
+        frames = frames || (r.find("offset")->i <= 0x1C78 && r.find("offset")->i + r.find("length")->i > 0x1C78);
+    EXPECT_TRUE(frames) << "FRAMES is among the changed bytes of page 5";
+    EXPECT_EQ(Run("memory-diff", {{"space", "ram5"}, {"from_frame", first}, {"to_frame", first}}).body.find("changed_bytes")->i, 0);
+
+    EXPECT_EQ(Run("memory-at", {{"frame", first}}).error, TTDControlError::BadRequest) << "no space";
+    EXPECT_EQ(Run("memory-at", {{"space", "ram5"}, {"frame", first}, {"length", "0"}}).error, TTDControlError::BadRequest);
+    EXPECT_EQ(Run("memory-at", {{"space", "ram5"}, {"frame", first}, {"offset", "0x4000000"}}).error, TTDControlError::BadRequest);
+}

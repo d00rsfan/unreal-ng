@@ -1,0 +1,1987 @@
+{
+  "schema": 1,
+  "family": "generic-keyboard",
+  "view": "front",
+  "size": [
+    2048,
+    1536
+  ],
+  "controls": [
+    {
+      "control": "key.esc",
+      "label": "Esc",
+      "shape": {
+        "rect": [
+          124,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        162,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 0
+    },
+    {
+      "control": "key.f1",
+      "label": "F1",
+      "shape": {
+        "rect": [
+          285,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        322,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 1
+    },
+    {
+      "control": "key.f2",
+      "label": "F2",
+      "shape": {
+        "rect": [
+          365,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        403,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 2
+    },
+    {
+      "control": "key.f3",
+      "label": "F3",
+      "shape": {
+        "rect": [
+          445,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        483,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 3
+    },
+    {
+      "control": "key.f4",
+      "label": "F4",
+      "shape": {
+        "rect": [
+          525,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        563,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 4
+    },
+    {
+      "control": "key.f5",
+      "label": "F5",
+      "shape": {
+        "rect": [
+          645,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        683,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 5
+    },
+    {
+      "control": "key.f6",
+      "label": "F6",
+      "shape": {
+        "rect": [
+          726,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        763,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 6
+    },
+    {
+      "control": "key.f7",
+      "label": "F7",
+      "shape": {
+        "rect": [
+          806,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        844,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 7
+    },
+    {
+      "control": "key.f8",
+      "label": "F8",
+      "shape": {
+        "rect": [
+          886,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        924,
+        579
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 8
+    },
+    {
+      "control": "key.f9",
+      "label": "F9",
+      "shape": {
+        "rect": [
+          1006,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1044,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 9
+    },
+    {
+      "control": "key.f10",
+      "label": "F10",
+      "shape": {
+        "rect": [
+          1086,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1124,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 10
+    },
+    {
+      "control": "key.f11",
+      "label": "F11",
+      "shape": {
+        "rect": [
+          1167,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1204,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 11
+    },
+    {
+      "control": "key.f12",
+      "label": "F12",
+      "shape": {
+        "rect": [
+          1247,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1285,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 12
+    },
+    {
+      "control": "key.backquote",
+      "label": "`",
+      "shape": {
+        "rect": [
+          124,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        162,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 13
+    },
+    {
+      "control": "key.1",
+      "label": "1",
+      "shape": {
+        "rect": [
+          204,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        242,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 14
+    },
+    {
+      "control": "key.2",
+      "label": "2",
+      "shape": {
+        "rect": [
+          285,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        322,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 15
+    },
+    {
+      "control": "key.3",
+      "label": "3",
+      "shape": {
+        "rect": [
+          365,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        403,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 16
+    },
+    {
+      "control": "key.4",
+      "label": "4",
+      "shape": {
+        "rect": [
+          445,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        483,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 17
+    },
+    {
+      "control": "key.5",
+      "label": "5",
+      "shape": {
+        "rect": [
+          525,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        563,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 18
+    },
+    {
+      "control": "key.6",
+      "label": "6",
+      "shape": {
+        "rect": [
+          605,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        643,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 19
+    },
+    {
+      "control": "key.7",
+      "label": "7",
+      "shape": {
+        "rect": [
+          686,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        723,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 20
+    },
+    {
+      "control": "key.8",
+      "label": "8",
+      "shape": {
+        "rect": [
+          766,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        803,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 21
+    },
+    {
+      "control": "key.9",
+      "label": "9",
+      "shape": {
+        "rect": [
+          846,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        884,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 22
+    },
+    {
+      "control": "key.0",
+      "label": "0",
+      "shape": {
+        "rect": [
+          926,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        964,
+        699
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 23
+    },
+    {
+      "control": "key.minus",
+      "label": "-",
+      "shape": {
+        "rect": [
+          1006,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1044,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 24
+    },
+    {
+      "control": "key.equal",
+      "label": "=",
+      "shape": {
+        "rect": [
+          1086,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1124,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 25
+    },
+    {
+      "control": "key.backspace",
+      "label": "Backspace",
+      "shape": {
+        "rect": [
+          1167,
+          662,
+          156,
+          76
+        ]
+      },
+      "anchor": [
+        1245,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 26
+    },
+    {
+      "control": "key.tab",
+      "label": "Tab",
+      "shape": {
+        "rect": [
+          124,
+          742,
+          116,
+          76
+        ]
+      },
+      "anchor": [
+        182,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 27
+    },
+    {
+      "control": "key.q",
+      "label": "Q",
+      "shape": {
+        "rect": [
+          244,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        282,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 28
+    },
+    {
+      "control": "key.w",
+      "label": "W",
+      "shape": {
+        "rect": [
+          325,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        362,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 29
+    },
+    {
+      "control": "key.e",
+      "label": "E",
+      "shape": {
+        "rect": [
+          405,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        443,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 30
+    },
+    {
+      "control": "key.r",
+      "label": "R",
+      "shape": {
+        "rect": [
+          485,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        523,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 31
+    },
+    {
+      "control": "key.t",
+      "label": "T",
+      "shape": {
+        "rect": [
+          565,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        603,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 32
+    },
+    {
+      "control": "key.y",
+      "label": "Y",
+      "shape": {
+        "rect": [
+          645,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        683,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 33
+    },
+    {
+      "control": "key.u",
+      "label": "U",
+      "shape": {
+        "rect": [
+          726,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        763,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 34
+    },
+    {
+      "control": "key.i",
+      "label": "I",
+      "shape": {
+        "rect": [
+          806,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        844,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 35
+    },
+    {
+      "control": "key.o",
+      "label": "O",
+      "shape": {
+        "rect": [
+          886,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        924,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 36
+    },
+    {
+      "control": "key.p",
+      "label": "P",
+      "shape": {
+        "rect": [
+          966,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1004,
+        780
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 37
+    },
+    {
+      "control": "key.lbracket",
+      "label": "[",
+      "shape": {
+        "rect": [
+          1046,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1084,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 38
+    },
+    {
+      "control": "key.rbracket",
+      "label": "]",
+      "shape": {
+        "rect": [
+          1127,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1164,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 39
+    },
+    {
+      "control": "key.backslash",
+      "label": "\\",
+      "shape": {
+        "rect": [
+          1207,
+          742,
+          116,
+          76
+        ]
+      },
+      "anchor": [
+        1265,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 40
+    },
+    {
+      "control": "key.capslock",
+      "label": "Caps",
+      "shape": {
+        "rect": [
+          124,
+          822,
+          136,
+          76
+        ]
+      },
+      "anchor": [
+        192,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 41
+    },
+    {
+      "control": "key.a",
+      "label": "A",
+      "shape": {
+        "rect": [
+          265,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        302,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 42
+    },
+    {
+      "control": "key.s",
+      "label": "S",
+      "shape": {
+        "rect": [
+          345,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        382,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 43
+    },
+    {
+      "control": "key.d",
+      "label": "D",
+      "shape": {
+        "rect": [
+          425,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        463,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 44
+    },
+    {
+      "control": "key.f",
+      "label": "F",
+      "shape": {
+        "rect": [
+          505,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        543,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 45
+    },
+    {
+      "control": "key.g",
+      "label": "G",
+      "shape": {
+        "rect": [
+          585,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        623,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 46
+    },
+    {
+      "control": "key.h",
+      "label": "H",
+      "shape": {
+        "rect": [
+          665,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        703,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 47
+    },
+    {
+      "control": "key.j",
+      "label": "J",
+      "shape": {
+        "rect": [
+          746,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        783,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 48
+    },
+    {
+      "control": "key.k",
+      "label": "K",
+      "shape": {
+        "rect": [
+          826,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        864,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 49
+    },
+    {
+      "control": "key.l",
+      "label": "L",
+      "shape": {
+        "rect": [
+          906,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        944,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 50
+    },
+    {
+      "control": "key.semicolon",
+      "label": ";",
+      "shape": {
+        "rect": [
+          986,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1024,
+        860
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 51
+    },
+    {
+      "control": "key.quote",
+      "label": "'",
+      "shape": {
+        "rect": [
+          1066,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1104,
+        860
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 52
+    },
+    {
+      "control": "key.enter",
+      "label": "Enter",
+      "shape": {
+        "rect": [
+          1147,
+          822,
+          176,
+          76
+        ]
+      },
+      "anchor": [
+        1234,
+        860
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 53
+    },
+    {
+      "control": "key.lshift",
+      "label": "Left Shift",
+      "shape": {
+        "rect": [
+          124,
+          902,
+          176,
+          76
+        ]
+      },
+      "anchor": [
+        212,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 54
+    },
+    {
+      "control": "key.z",
+      "label": "Z",
+      "shape": {
+        "rect": [
+          305,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        342,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 55
+    },
+    {
+      "control": "key.x",
+      "label": "X",
+      "shape": {
+        "rect": [
+          385,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        423,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 56
+    },
+    {
+      "control": "key.c",
+      "label": "C",
+      "shape": {
+        "rect": [
+          465,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        503,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 57
+    },
+    {
+      "control": "key.v",
+      "label": "V",
+      "shape": {
+        "rect": [
+          545,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        583,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 58
+    },
+    {
+      "control": "key.b",
+      "label": "B",
+      "shape": {
+        "rect": [
+          625,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        663,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 59
+    },
+    {
+      "control": "key.n",
+      "label": "N",
+      "shape": {
+        "rect": [
+          706,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        743,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 60
+    },
+    {
+      "control": "key.m",
+      "label": "M",
+      "shape": {
+        "rect": [
+          786,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        824,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 61
+    },
+    {
+      "control": "key.comma",
+      "label": ",",
+      "shape": {
+        "rect": [
+          866,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        904,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 62
+    },
+    {
+      "control": "key.period",
+      "label": ".",
+      "shape": {
+        "rect": [
+          946,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        984,
+        940
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 63
+    },
+    {
+      "control": "key.slash",
+      "label": "/",
+      "shape": {
+        "rect": [
+          1026,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1064,
+        940
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 64
+    },
+    {
+      "control": "key.rshift",
+      "label": "Right Shift",
+      "shape": {
+        "rect": [
+          1107,
+          902,
+          216,
+          76
+        ]
+      },
+      "anchor": [
+        1214,
+        940
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 65
+    },
+    {
+      "control": "key.lctrl",
+      "label": "Left Ctrl",
+      "shape": {
+        "rect": [
+          124,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        172,
+        1020
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 66
+    },
+    {
+      "control": "key.lgui",
+      "label": "Left Win",
+      "shape": {
+        "rect": [
+          224,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        272,
+        1020
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 67
+    },
+    {
+      "control": "key.lalt",
+      "label": "Left Alt",
+      "shape": {
+        "rect": [
+          325,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        372,
+        1020
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 68
+    },
+    {
+      "control": "key.space",
+      "label": "Space",
+      "shape": {
+        "rect": [
+          425,
+          982,
+          497,
+          76
+        ]
+      },
+      "anchor": [
+        673,
+        1020
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 69
+    },
+    {
+      "control": "key.ralt",
+      "label": "Right Alt",
+      "shape": {
+        "rect": [
+          926,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        974,
+        1020
+      ],
+      "callout": "left",
+      "quiet": true,
+      "order": 70
+    },
+    {
+      "control": "key.rgui",
+      "label": "Right Win",
+      "shape": {
+        "rect": [
+          1026,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        1074,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 71
+    },
+    {
+      "control": "key.menu",
+      "label": "Menu",
+      "shape": {
+        "rect": [
+          1127,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        1174,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 72
+    },
+    {
+      "control": "key.rctrl",
+      "label": "Right Ctrl",
+      "shape": {
+        "rect": [
+          1227,
+          982,
+          96,
+          76
+        ]
+      },
+      "anchor": [
+        1275,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 73
+    },
+    {
+      "control": "key.printscreen",
+      "label": "PrtSc",
+      "shape": {
+        "rect": [
+          1347,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1385,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 74
+    },
+    {
+      "control": "key.scrolllock",
+      "label": "ScrLk",
+      "shape": {
+        "rect": [
+          1427,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1465,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 75
+    },
+    {
+      "control": "key.pause",
+      "label": "Pause",
+      "shape": {
+        "rect": [
+          1507,
+          541,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1545,
+        579
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 76
+    },
+    {
+      "control": "key.insert",
+      "label": "Ins",
+      "shape": {
+        "rect": [
+          1347,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1385,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 77
+    },
+    {
+      "control": "key.home",
+      "label": "Home",
+      "shape": {
+        "rect": [
+          1427,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1465,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 78
+    },
+    {
+      "control": "key.pageup",
+      "label": "PgUp",
+      "shape": {
+        "rect": [
+          1507,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1545,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 79
+    },
+    {
+      "control": "key.delete",
+      "label": "Del",
+      "shape": {
+        "rect": [
+          1347,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1385,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 80
+    },
+    {
+      "control": "key.end",
+      "label": "End",
+      "shape": {
+        "rect": [
+          1427,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1465,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 81
+    },
+    {
+      "control": "key.pagedown",
+      "label": "PgDn",
+      "shape": {
+        "rect": [
+          1507,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1545,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 82
+    },
+    {
+      "control": "key.up",
+      "label": "\u2191",
+      "shape": {
+        "rect": [
+          1427,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1465,
+        940
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 83
+    },
+    {
+      "control": "key.left",
+      "label": "\u2190",
+      "shape": {
+        "rect": [
+          1347,
+          982,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1385,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 84
+    },
+    {
+      "control": "key.down",
+      "label": "\u2193",
+      "shape": {
+        "rect": [
+          1427,
+          982,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1465,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 85
+    },
+    {
+      "control": "key.right",
+      "label": "\u2192",
+      "shape": {
+        "rect": [
+          1507,
+          982,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1545,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 86
+    },
+    {
+      "control": "key.numlock",
+      "label": "Num",
+      "shape": {
+        "rect": [
+          1608,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1645,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 87
+    },
+    {
+      "control": "key.kp_divide",
+      "label": "Num /",
+      "shape": {
+        "rect": [
+          1688,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1726,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 88
+    },
+    {
+      "control": "key.kp_multiply",
+      "label": "Num *",
+      "shape": {
+        "rect": [
+          1768,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1806,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 89
+    },
+    {
+      "control": "key.kp_minus",
+      "label": "Num -",
+      "shape": {
+        "rect": [
+          1848,
+          662,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1886,
+        699
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 90
+    },
+    {
+      "control": "key.kp_7",
+      "label": "Num 7",
+      "shape": {
+        "rect": [
+          1608,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1645,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 91
+    },
+    {
+      "control": "key.kp_8",
+      "label": "Num 8",
+      "shape": {
+        "rect": [
+          1688,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1726,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 92
+    },
+    {
+      "control": "key.kp_9",
+      "label": "Num 9",
+      "shape": {
+        "rect": [
+          1768,
+          742,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1806,
+        780
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 93
+    },
+    {
+      "control": "key.kp_plus",
+      "label": "Num +",
+      "shape": {
+        "rect": [
+          1848,
+          742,
+          76,
+          156
+        ]
+      },
+      "anchor": [
+        1886,
+        820
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 94
+    },
+    {
+      "control": "key.kp_4",
+      "label": "Num 4",
+      "shape": {
+        "rect": [
+          1608,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1645,
+        860
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 95
+    },
+    {
+      "control": "key.kp_5",
+      "label": "Num 5",
+      "shape": {
+        "rect": [
+          1688,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1726,
+        860
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 96
+    },
+    {
+      "control": "key.kp_6",
+      "label": "Num 6",
+      "shape": {
+        "rect": [
+          1768,
+          822,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1806,
+        860
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 97
+    },
+    {
+      "control": "key.kp_1",
+      "label": "Num 1",
+      "shape": {
+        "rect": [
+          1608,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1645,
+        940
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 98
+    },
+    {
+      "control": "key.kp_2",
+      "label": "Num 2",
+      "shape": {
+        "rect": [
+          1688,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1726,
+        940
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 99
+    },
+    {
+      "control": "key.kp_3",
+      "label": "Num 3",
+      "shape": {
+        "rect": [
+          1768,
+          902,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1806,
+        940
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 100
+    },
+    {
+      "control": "key.kp_enter",
+      "label": "Num Enter",
+      "shape": {
+        "rect": [
+          1848,
+          902,
+          76,
+          156
+        ]
+      },
+      "anchor": [
+        1886,
+        980
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 101
+    },
+    {
+      "control": "key.kp_0",
+      "label": "Num 0",
+      "shape": {
+        "rect": [
+          1608,
+          982,
+          156,
+          76
+        ]
+      },
+      "anchor": [
+        1686,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 102
+    },
+    {
+      "control": "key.kp_decimal",
+      "label": "Num .",
+      "shape": {
+        "rect": [
+          1768,
+          982,
+          76,
+          76
+        ]
+      },
+      "anchor": [
+        1806,
+        1020
+      ],
+      "callout": "right",
+      "quiet": true,
+      "order": 103
+    }
+  ]
+}

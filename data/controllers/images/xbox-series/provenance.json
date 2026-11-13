@@ -1,0 +1,30 @@
+{
+  "family": "xbox-series",
+  "images": [
+    {
+      "view": "front",
+      "title": "Xbox Wireless Controller (Series X|S), Carbon Black",
+      "source": "tools/poc/033-vector-controller-pictures/generate.py",
+      "author": "unreal-ng",
+      "licence": "same as the repository",
+      "terms": "vector drawing from measured dimensions; photos used as references only, nothing traced",
+      "retouch": "none; platform logos left out (D5)",
+      "references": [
+        {
+          "what": "plan 153 x 102 mm, height 61 mm (6.02 x 4.01 x 2.40 in)",
+          "source": "retail listings of the Xbox Wireless Controller (pcrichard.com QAU-00090, nfm.com 64696412)",
+          "retrieved": "2026-10-23"
+        },
+        {
+          "what": "the outline (trace.py, the half mirrored, overlap 0.999) and the control positions and sizes, scaled to 153 mm: the hybrid D-pad on its disc, the Share key under View / Menu, the trigger tips over the bumpers",
+          "source": "https://www.xbox.com/en-US/accessories/controllers/xbox-wireless-controller (111101_Gallery-0_4, Carbon Black)",
+          "author": "Microsoft",
+          "licence": "product render",
+          "use": "measured geometry only (trace.py outline, positions); no pixels shipped",
+          "retrieved": "2026-11-01",
+          "note": "measured to about 0.5 mm"
+        }
+      ]
+    }
+  ]
+}

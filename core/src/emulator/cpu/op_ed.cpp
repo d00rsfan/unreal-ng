@@ -168,6 +168,7 @@ Z80OPCODE ope_45(Z80 *cpu) { // retn
    cpu->memptr = addr;
 
    cpu->sp = sp;
+   cpu->NoteFlow(Z80::FlowEvent::Ret, addr, static_cast<uint16_t>(sp - 2), addr);
 
    // TODO: Is callback still needed?
    cpu->retn();
@@ -254,6 +255,9 @@ Z80OPCODE ope_4D(Z80 *cpu) { // reti
     // CPU-LIBRARY-MIGRATION(reti-hook): the engine's RETI callback
     if (IInterruptSource* source = cpu->GetInterruptSource()) [[unlikely]]
         source->OnReti();
+    // The daisy chain decodes ED 4D only (its mirrors ED 5D / 6D / 7D share this body: not RETI on the data bus)
+    if (cpu->opcode == 0x4D && !cpu->Im2Chain().Empty()) [[unlikely]]
+        cpu->Im2Chain().Reti(cpu->t);
 
     uint16_t sp = cpu->sp;
 
@@ -265,6 +269,7 @@ Z80OPCODE ope_4D(Z80 *cpu) { // reti
     cpu->memptr = addr;
 
     cpu->sp = sp;
+    cpu->NoteFlow(Z80::FlowEvent::Ret, addr, static_cast<uint16_t>(sp - 2), addr);
 }
 
 #define ope_4E ope_46  // im0 undocumented

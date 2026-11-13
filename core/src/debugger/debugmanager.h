@@ -6,9 +6,16 @@
 #include "debugger/disassembler/z80disasm.h"
 #include "debugger/labels/labelmanager.h"
 #include "debugger/listing/listingparser.h"
+#include "debugger/targets/debugcpuid.h"
 #include "debugger/analyzers/analyzermanager.h"
 #include "emulator/emulatorcontext.h"
+#include <atomic>
 #include <map>
+#include <utility>
+#include <vector>
+
+namespace framewatch { class Manager; }
+namespace markup { class MemoryMarkup; }
 
 class DebugManager
 {
@@ -42,6 +49,18 @@ protected:
     class EditorMonitor* _editorMonitor = nullptr;
     std::unique_ptr<class CommandTyper> _commandTyper;
     std::unique_ptr<class PcHistory> _pcHistory;
+    std::unique_ptr<class AsmSyncService> _asmSync;
+    std::unique_ptr<class ScriptCallbackManager> _scriptCallbacks;
+    std::unique_ptr<framewatch::Manager> _frameWatches;
+    std::unique_ptr<markup::MemoryMarkup> _markup;
+    // The card CPU in the General Sound slot (gs-debugger design §3.2): its breakpoints and hooks
+    std::unique_ptr<class GSCardTarget> _gsTarget;
+    // The General Sound of a MultiSound slot card (the `ms` CPU)
+    std::unique_ptr<class GSCardTarget> _msTarget;
+    std::atomic<int> _targetsMask{0};  ///< the card CPUs there at creation or the last NC_DEBUG_TARGETS_CHANGED
+    /// Posts NC_DEBUG_TARGETS_CHANGED when the card CPUs there differ from the last post
+    int TargetsMask() const;  ///< bit 0: gs, bit 1: ms
+    void PublishTargetsIfChanged();
     /// endregion </Fields>
 
     /// region <Constructors / Destructors>
@@ -58,7 +77,8 @@ public:
     LabelManager* GetLabelManager();
     ListingParser* GetListingParser();
     std::unique_ptr<Z80Disassembler>& GetDisassembler();
-    AnalyzerManager* GetAnalyzerManager();
+    /// Inline: Z80::RunInstructionStartHooks asks it at every instruction (the CPU-step subscribers)
+    AnalyzerManager* GetAnalyzerManager() { return _analyzerManager.get(); }
     DebugKeyboardManager* GetKeyboardManager();
     DebugMouseManager* GetMouseManager();
     DebugJoystickManager* GetJoystickManager();
@@ -66,6 +86,30 @@ public:
     CommandTyper* GetCommandTyper() { return _commandTyper.get(); }
     /// The PC history ring (pchistory.h): off until a debugger arms it
     PcHistory* GetPcHistory() { return _pcHistory.get(); }
+    /// The asm-synchronizer's watch (debugger/asm/sync/asmsyncservice.h): no thread until a watch starts
+    AsmSyncService* GetAsmSyncService() { return _asmSync.get(); }
+    /// Script callbacks (debugger/callbacks/scriptcallbacks.h)
+    ScriptCallbackManager* GetScriptCallbacks() { return _scriptCallbacks.get(); }
+    /// Armed frame watches (debugger/watch/framewatch.h): checked at every frame end while any is armed
+    framewatch::Manager* GetFrameWatches() { return _frameWatches.get(); }
+    /// What the main CPU's memory holds, layered (debugger/markup/memorymarkup.h): regions, entries, comments
+    markup::MemoryMarkup* GetMemoryMarkup() { return _markup.get(); }
+    /// The General Sound slot's card CPU (exists for the machine's lifetime; Available() while a card with a CPU is
+    /// fitted)
+    GSCardTarget* GetGSTarget() { return _gsTarget.get(); }
+    /// A card CPU's target (gs, ms); nullptr for the main CPU
+    GSCardTarget* GetCardTarget(DebugCpuId cpu);
+    /// The breakpoints of a CPU: the main CPU's (GetBreakpointsManager), or a card's
+    BreakpointManager* GetBreakpointsManager(DebugCpuId cpu);
+    /// The CPU of a surface name ("main", "gs", "ms"; "neogs" names the GS slot, "multisound" the MultiSound's GS);
+    /// false for an unknown name
+    static bool ParseCpuName(const std::string& name, DebugCpuId& out);
+    /// The General Sound slot's card was created or replaced (SoundManager): the card hooks follow it
+    void OnGeneralSoundCardCreated();
+    /// The slot cards were built or released (SlotManager): the MultiSound GS's hooks follow its card
+    void OnSlotCardsChanged();
+    /// Every CPU a debugger can name (main, gs, ms) and whether it is there now
+    std::vector<std::pair<std::string, bool>> DebugTargets() const;
 
     /// endregion </Properties>
 

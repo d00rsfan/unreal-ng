@@ -7,10 +7,14 @@
 #include "3rdparty/message-center/messagecenter.h"
 #include "emulator/emulator.h"
 #include "emulator/emulatormanager.h"
+#include "emulator/mainloop.h"
 #include "_helpers/soundcardscope.h"
 #include "_helpers/testpathhelper.h"
 #include "common/filehelper.h"
+#include "emulator/io/storage/sessionwritemap.h"
+#include "emulator/media/mediamanager.h"
 #include "emulator/memory/atm/evoflash.h"
+#include "emulator/ports/models/portdecoder_scorpion256.h"
 
 /// Tests share one process-wide EmulatorManager. An instance a test leaves
 /// registered outlives it and changes what later tests see (sole-instance
@@ -61,8 +65,14 @@ static void PinTimeZone()
 int main(int argc, char **argv)
 {
   PinTimeZone();
-  // v1 records here: its own tests and the reference; engine tests select the engine per test
-  Emulator::SetDefaultTimeTravelBackend(Emulator::TimeTravelBackend::V1);
+  // No wall clock in a test: the adaptive turbo render decimation measures the host's speed, so two machines under
+  // load skipped different frames. Every loop of this process uses the fixed cadence
+  MainLoop::AdaptiveDefault() = false;
+  // Session journals (<image>.usession) never land next to test data: a test that wants one says journal: replay
+  SessionWriteMap::OverrideJournalDefault(false);
+  // Nor session deltas: a composite's writes are saved by writes.save when its emulator goes (D-8); a test that
+  // checks that turns it on
+  MediaManager::SetSaveOnRelease(false);
   ::testing::InitGoogleTest(&argc, argv);
 
   // The settings folder (FileHelper::GetWritablePath) is this process's scratch folder: files a machine saves there
@@ -77,6 +87,8 @@ int main(int argc, char **argv)
   // A test that flashes a ZX-Evo ROM must not change the ROM the next test boots: the flash's persistence file is
   // off except in the tests of the persistence itself (EvoFlashPersist_Test)
   EvoFlash::SetPersistenceAllowed(false);
+  // Nor the SMUC's NVRAM ([SMUC] NvramFile of the GMX config): every GMX boot starts from the power-on contents
+  PortDecoder_Scorpion256::SetNvramPersistenceAllowed(false);
 
   // Sound devices (AY / TurboSound / TSFM, General Sound, MoonSound) are left
   // out of every machine unless a test opts in with a SoundCardScope (see

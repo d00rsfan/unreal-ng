@@ -10,26 +10,31 @@
 /// that wants to provision the right instance BEFORE the load - pick the
 /// model, fit the recorded General Sound card - reads the file's info first.
 ///
-/// Reading parses headers only:
-///   - the fixed file header (model, ROM signature, frame range, counts,
-///     section flags);
-///   - the recorded device set: the header's peripheral mask (files written
-///     since the mask exists, flag kFlagsHasPeripheralMask); older files are
-///     walked to the first checkpoint instead - page slot headers are read and
-///     their payloads skipped, nothing is decompressed.
+/// Reading parses the engine's session file index and its facts stream (model,
+/// ROM signature, frame range, counts, recorded devices); nothing else is
+/// decompressed. A v1 file is refused with a reason (v1 was deleted in Phase 6).
 ///
 /// The recorded machine of the CURRENT session (loaded or being recorded) is
-/// TimeTravelManager::GetSessionInfo().machine - the same TTDRecordedMachine.
+/// TimeTravelController::GetSessionInfo().machine - the same TTDRecordedMachine.
 
 #include <cstdint>
 #include <istream>
 #include <string>
 #include <vector>
 
+#include "debugger/ttd/ttdserializable.h"   // TTDDeviceKey, PeripheralId
 #include "emulator/platform.h"   // GSTypeKind, MEM_MODEL
+#include "ttdperipheralmask.h"
 
 namespace ttd
 {
+
+/// A device a session recorded (or names as fitted but not recorded)
+struct TTDRecordedDevice
+{
+    TTDDeviceKey key;
+    PeripheralId legacyId = PeripheralId::None;   ///< its legacy id, None when it has none (or the file does not say)
+};
 
 /// The machine a session was recorded on: what an instance must match to load it.
 struct TTDRecordedMachine
@@ -39,14 +44,19 @@ struct TTDRecordedMachine
     uint16_t ramPageBound = 0;        ///< Exclusive RAM page-index bound of the model
     uint64_t romSignature = 0;        ///< FNV-1a of the ROM region; 0 = unknown (not checked)
 
-    /// Bit i set: peripheral id i (PeripheralId) was fitted - its state is in
-    /// every checkpoint. The set the loader checks the live machine against.
-    uint64_t peripheralMask = 0;
-    std::vector<std::string> peripherals;  ///< Names of the fitted peripherals, ascending id
-    /// Bit i set: peripheral id i was fitted but is not recorded by design
-    /// (the lightweight General Sound; header flag kFlagsHasNotRecordedMask)
-    uint64_t notRecordedMask = 0;
-    std::vector<std::string> notRecorded;  ///< Their names, ascending id
+    /// The fitted devices: their state is in every checkpoint. The set the
+    /// loader checks the live machine against (the file's device table)
+    std::vector<TTDRecordedDevice> devices;
+    std::vector<std::string> peripherals;  ///< Their names (DeviceDisplayName), ascending legacy id, then type, instance
+    /// Devices fitted but not recorded by design (the lightweight General Sound)
+    std::vector<TTDRecordedDevice> notRecordedDevices;
+    std::vector<std::string> notRecorded;  ///< Their names
+
+    /// A device of @p type is fitted (recorded or not)
+    bool Fits(TTDDeviceType type) const;
+    /// The recorded devices that have a legacy id, as the set of those ids (the `peripheral_mask` of the
+    /// automation surfaces). A device without a legacy id is not in it
+    PeripheralMask V1Mask() const;
 
     /// General Sound slot: NONE, Z80 (GS with its Z80), LW (lightweight), NGS (NeoGS)
     GSTypeKind generalSound = GSTypeKind::NONE;
@@ -82,27 +92,32 @@ struct TTDFileInfo
     bool hasPortJournals = false;
     bool topClockTime = false;
 
-    /// true: the device set came from the header's mask; false: found by
-    /// walking to the first checkpoint (a file written before the mask)
+    /// The device set came from the file's own list (always, since v1 files are
+    /// no longer read; the surfaces keep the field)
     bool peripheralsFromHeader = false;
 
     TTDRecordedMachine machine;
 };
 
-/// Name of a peripheral id ("betadisk", "gs", "neogs", ...); "id<N>" for an id
-/// this build does not know.
+/// Name of a legacy peripheral id ("betadisk", "gs", "neogs", ...); "id<N>" for an
+/// id this build does not know.
 std::string PeripheralIdName(uint8_t id);
 
-/// The General Sound personality a fitted-peripheral mask records (NONE when
-/// no General Sound card was fitted).
-GSTypeKind GeneralSoundOf(uint64_t peripheralMask);
+/// The name automation shows for a recorded device: its legacy id's name (the names
+/// sessions always had), a device of a pre-freeze type without one by its
+/// type's, any other by its instance
+std::string DeviceDisplayName(const TTDRecordedDevice& device);
+
+/// The General Sound personality a recorded machine has fitted (NONE when no
+/// General Sound card was fitted).
+GSTypeKind GeneralSoundOf(const TTDRecordedMachine& machine);
 
 /// Short name of a GSTypeKind as used on the automation surfaces: "none",
 /// "z80", "lw", "ngs" ("bass" for the unused BASS kind).
 const char* GeneralSoundName(GSTypeKind kind);
 
 /// Fill the derived fields of `machine` (model name, peripheral names, General
-/// Sound kind, TurboSound device) from modelId and peripheralMask.
+/// Sound kind, TurboSound device) from modelId and its devices.
 void DescribeRecordedMachine(TTDRecordedMachine& machine);
 
 /// Read a .ttd file's info from a stream positioned at the file start.

@@ -1,5 +1,5 @@
 #include <base/featuremanager.h>
-#include <debugger/ttd/timetravelmanager.h>
+#include <optional>
 #include <emulator/emulator.h>
 #include <emulator/emulatorcontext.h>
 #include <emulator/io/tape/tapecatalog.h>
@@ -24,33 +24,23 @@
 
 namespace
 {
-/// Pause() -> op -> Resume() bracket shared by every tape handler (design
-/// §7.1). Pause only when actually running; Resume exactly then. RAII so an
-/// early return can never leave the emulator parked.
+/// The CPU held around every mutating tape / media operation of this surface (Emulator::CpuHold). RAII, so
+/// an early return cannot leave it held.
 class EmulatorPauseBracket
 {
 public:
-    explicit EmulatorPauseBracket(const std::shared_ptr<Emulator>& emulator)
-        : _emulator(emulator), _wasRunning(emulator && emulator->IsRunning() && !emulator->IsPaused())
+    // The CPU held for the operation (Emulator::CpuHold, execution arbiter): nothing executes meanwhile, the
+    // pause is left as it was, nothing is broadcast. Before: Pause() + a 10 ms sleep + Resume(), which lifted a
+    // pause somebody else asked for meanwhile
+    explicit EmulatorPauseBracket(const std::shared_ptr<Emulator>& emulator): _emulator(emulator)
     {
-        if (_wasRunning)
-        {
-            _emulator->Pause();
-            sleep_ms(10);  // Give emulator time to pause
-        }
-    }
-
-    ~EmulatorPauseBracket()
-    {
-        if (_wasRunning)
-        {
-            _emulator->Resume();
-        }
+        if (emulator)
+            _hold.emplace(*emulator, "cli");
     }
 
 private:
-    std::shared_ptr<Emulator> _emulator;
-    bool _wasRunning;
+    std::shared_ptr<Emulator> _emulator;  // keeps the machine alive for the hold
+    std::optional<Emulator::CpuHold> _hold;
 };
 
 const char* PlaybackStateName(TapePlaybackState state)
@@ -279,7 +269,7 @@ void CLIProcessor::HandleTape(const ClientSession& session, const std::vector<st
 }
 
 void CLIProcessor::HandleTapeLoad(const ClientSession& session, std::shared_ptr<Emulator> emulator,
-                                  EmulatorContext* context, const std::vector<std::string>& args)
+                                  EmulatorContext* /*context*/, const std::vector<std::string>& args)
 {
     if (args.size() < 2)
     {
@@ -289,8 +279,8 @@ void CLIProcessor::HandleTapeLoad(const ClientSession& session, std::shared_ptr<
 
     std::string filepath = args[1];
 
-    // TTD refuses a tape insert while recording (it would drop the history)
-    if (const std::string refusal = emulator->RecordingGuard(ttd::TTDGuardedAction::LoadTape); !refusal.empty())
+    // The coordinator may refuse a tape insert; a refusal is logged
+    if (const std::string refusal = emulator->AskMediaChange(Emulator::MediaChange::LoadTape, 0, filepath); !refusal.empty())
     {
         session.SendResponse("Error: " + refusal + NEWLINE);
         return;
@@ -345,24 +335,22 @@ void CLIProcessor::HandleTapePlay(const ClientSession& session, std::shared_ptr<
 
     EmulatorPauseBracket bracket(emulator);
 
-    // Parse-once (idempotent): surfaces never race the lazy image load
-    if (!context->pTape->EnsureImageLoaded())
+    // Paused -> resume the frozen position IN PLACE (FR-6); otherwise start at the consumption cursor - where a
+    // real tape head would be. A tape loaded while a TTD recording runs lands at the next frame boundary: queued
+    switch (context->pTape->Play())
     {
-        session.SendResponse(std::string("Error: Tape image has no loadable blocks") + NEWLINE);
-        return;
-    }
-
-    // Paused -> resume the frozen position IN PLACE (FR-6); otherwise start
-    // at the consumption cursor — where a real tape head would be
-    if (context->pTape->GetPlaybackState() == TapePlaybackState::Paused)
-    {
-        context->pTape->ResumePlaybackFromPause();
-        session.SendResponse(std::string("Tape playback resumed (in place)") + NEWLINE);
-    }
-    else
-    {
-        context->pTape->StartPlaybackAtCursor();
-        session.SendResponse(std::string("Tape playback started") + NEWLINE);
+        case TapePlayResult::NoBlocks:
+            session.SendResponse(std::string("Error: Tape image has no loadable blocks") + NEWLINE);
+            break;
+        case TapePlayResult::Resumed:
+            session.SendResponse(std::string("Tape playback resumed (in place)") + NEWLINE);
+            break;
+        case TapePlayResult::Queued:
+            session.SendResponse(std::string("Tape playback starts when the tape is in") + NEWLINE);
+            break;
+        case TapePlayResult::Started:
+            session.SendResponse(std::string("Tape playback started") + NEWLINE);
+            break;
     }
 }
 

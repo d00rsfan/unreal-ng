@@ -17,30 +17,45 @@ openapi/
 ├── AGENTS.md              # This file
 ├── openapi_analysis.inc   # Beam position, screen digest, frame cost
 ├── openapi_analyzers.inc  # Analyzer management, coverage, AY log
+├── openapi_analysislayers.inc # Analysis layers: start / stop / status / explain / query / export / gallery / findings / review / experiment / cover (analysis::Execute)
+├── openapi_cpuprofile.inc # CPU time profile: start / stop / reset / mark / status / report / frames / export (profile::Execute)
 ├── openapi_assembly.inc   # In-process assembler + source listings
 ├── openapi_basic.inc      # BASIC interpreter control
 ├── openapi_breakpoints.inc # Breakpoint management
+├── openapi_callbacks.inc  # Script callbacks: list, resume, remove, policy (callbacks_api.cpp)
 ├── openapi_capture.inc    # Screen/OCR/audio/video capture
 ├── openapi_debug.inc      # Memory, registers, disassembly
+├── openapi_pace.inc       # The paced run /run_pace (core RunPacer)
 ├── openapi_features.inc   # Runtime feature toggles
 ├── openapi_interpreter.inc # CLI/Lua/Python interpreters
 ├── openapi_keyboard.inc   # Keyboard injection
 ├── openapi_labels.inc     # Labels/symbols management
+├── openapi_markup.inc     # Memory markup: show, layers, mark, unmark, comment, clear, save-profile (markup::Execute)
+├── openapi_symbols.inc    # Symbol files in every format, symbol sets (SymbolControl)
+├── openapi_asm.inc        # Assembler sources: decode, encode, convert, disk files (AsmControl)
+├── openapi_signature.inc  # Media signatures: a file, the loaded media, compare (SignatureControl)
 ├── openapi_lifecycle.inc  # Emulator create/start/stop
+├── openapi_machine.inc    # Recent files, recording presets and the video record / export-clip options of the machine area
+├── openapi_operations.inc # Operation log (machine state coordinator) + openapi_operations_schemas.inc
 ├── openapi_porttrace.inc  # I/O port tracing
 ├── openapi_vdac2.inc      # TS-Conf VDAC2 card (FT812): bus capture
+├── openapi_bus.inc        # Bus analyzer: buses, trace, findings, SD card timing, VCD / JSONL export
 ├── openapi_profiler.inc   # Opcode/memory profiling
 ├── openapi_schemas.inc    # Shared JSON schemas
 ├── openapi_settings.inc   # Configuration settings
 ├── openapi_memoryregion.inc # Device memory regions (the Sprinter's video RAM): list, read, write, save, load
 ├── openapi_moonsound.inc  # MoonSound (OPL4) state reports
+├── openapi_monitoring.inc # Monitoring: host process, clients, emulator.stats, summaries, breakpoint groups
+├── openapi_next.inc       # ZX Spectrum Next debugger reports + the NextREG write (the older Next routes are in openapi_state.inc) + openapi_next_schemas.inc
 ├── openapi_rtc.inc        # CMOS clock report + cell read / write
 ├── openapi_profi.inc      # ZX Profi board chips (8255, 8253, 8251, port map)
 ├── openapi_isa.inc        # ISA slots (Sprinter): report + cycles
 ├── openapi_rzx.inc        # RZX input recording playback
 ├── openapi_state.inc      # State inspection (screen, audio)
+├── openapi_streamdeck.inc # Stream Deck daemon: supervision by unreal-qt, settings, pairing, deck brightness
 ├── openapi_stepping.inc   # Execution control (step, run)
 ├── openapi_temporal.inc   # ZX DLSS de-flicker status / switch + openapi_temporal_schemas.inc
+├── openapi_window.inc     # GUI window display settings (GPU, CRT, blending) + openapi_window_schemas.inc
 ├── openapi_ttd.inc        # Time-Travel Debug
 ├── openapi_ttdfile.inc    # TTD file info (no instance) + openapi_ttdfile_schemas.inc
 └── openapi_video.inc      # Video debug translation: layout, pixel sources, byte -> pixels, text
@@ -90,6 +105,7 @@ Includes are grouped by category:
 #include "openapi/openapi_state.inc"
 #include "openapi/openapi_analyzers.inc"
 #include "openapi/openapi_analysis.inc"
+#include "openapi/openapi_analysislayers.inc"
 
 // Debug Commands
 #include "openapi/openapi_stepping.inc"

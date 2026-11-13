@@ -100,6 +100,7 @@ Python and MCP return — [command-interface.md §3.3](./command-interface.md#33
 state audio ay          AY/SSG overview           state audio ay 0    one chip decoded
 state audio fm          TurboSound FM overview    state audio fm 1    one YM2203 FM half in full
 state audio channels    Mixer overview: per-device levels + master (mute, live core sample rate)
+state devices [all]     The reports this machine has: id, title, summary, the command; all: the absent ones and why (--json: the catalog object)
 state fdc               Beta Disk WD1793 (aliases: state disk, state wd1793)
 state ide               IDE board: scheme, latches, both units, CD sense (aliases: state hdd, state cdrom)
 state cdaudio           CD drives' audio: disc, tracks, status, head (LBA, MSF, track, index), volume, mixer row (alias: state cdda)
@@ -121,9 +122,29 @@ state screen            Screen state: video mode, active screen + RAM pages, con
 state screen verbose    + per-screen RAM page and Z80 mapping, decoded #7FFD
 state screen mode       Video mode: picture format, memory layout, #EFF7/#DFFD/#FF77
 state screen flash      FLASH phase and timing
+state next [regs|mmu|journal [regs=07,02] [sources=nextreg,port,copper,internal] [since=N] [from=F] [to=F] [limit=N] | journal on|off|clear]  ZX Spectrum Next: machine, the NextREG table, the 8K slots, the NextREG write journal (who wrote which register, when, through which door; off by default)
+state next sd [kinds=command,read,write] [card=0|1] [since=N] [from=F] [to=F] [limit=N] | sd on|off|clear  ZX Spectrum Next SD cards (type, protocol state, blocks), the SPI engine and the SD journal (every command with argument and R1, every block read / written; off by default)
+bus [list]                       Bus analyzer: every bus (zc.spi, next.spi, divmmc.spi, neogs.*, ATA ide0 / ide1), its devices, trace and checks state
+bus <id|all> on [checks|nochecks] [protocol] [capacity=N] | off | clear   trace / checks on (off by default; observes only); protocol: no single bytes, data words or status reads (a whole boot fits)
+bus <id> events [kinds=spi,sd,ata,...] [slot=N] [since=N] [from=F] [to=F] [limit=N]   the trace, one line per event (seq, frame, T, PC, source, slot, kind, data)
+bus <id> findings [rules=...] [since=N] [limit=N]   the checks' findings with severity, PC and what each means on the hardware
+bus <id> sd-timing [ideal|realistic|slow] [seed=N] [slot=N]   an SD card's timing profile (changes the machine)
+bus <id> export <vcd|jsonl> <file> [kinds=] [since=] ...   VCD (SPI wires for GTKWave / PulseView) or JSON lines
+state next divmmc [kinds=map_in,esx_call] [since=N] [from=F] [to=F] [limit=N] | divmmc on|off|clear  ZX Spectrum Next DivMMC: #E3, the automap latch and entries (NR #B8-#BB decoded), and the DivMMC journal (what paged it in and out; the esxDOS calls with their registers; off by default)
+state next nmi [kinds=int_ack,nmi_request] [since=N] [from=F] [to=F] [limit=N] | nmi on|off|clear  ZX Spectrum Next NMI sources (would fire / blocked by), NMI in service, Multiface, reset bits, interrupts pending / in service, and the interrupt / NMI / reset journal (the interrupt accepted with its source and vector, RETI, an NMI request accepted or refused with the reason, RETN, the reset; off by default). `nmi` is the bare /NMI pulse, `mni` the magic button (the DRIVE button on a Next); the M1 button is `next nextreg 02 08`
+state next audio | input  ZX Spectrum Next sound as configured (chip model, ABC / ACB, turbosound, per chip pan / registers / periods / volumes, the DAC) and joystick modes (NR #05 / #0B, which port each answers, the Kempston port #1F decoded, what is not modelled)
+state next uart                 ZX Spectrum Next UARTs (ESP, Pi): prescaler / baud, frame, RTS, the Rx / Tx FIFOs, the status byte, byte counters, NR #C6 interrupt enables and what is on each line (ComPort= / ComPort2=)
+state next dma | video | palette [palette=selected|0-7|name|all] [range=0-255] | ports [port=6B] [access=r|w] | nextreg [reg=07] [changed=true] | copper [from=0] [count=64] [raw=true] | sprites [from=0] [count=128] [all=true]  ZX Spectrum Next debugger reports; none has a side effect on the machine (`next dma` etc. are aliases)
+state next pixel <x> <y> [sx]  ZX Spectrum Next pixel inspector (last captured frame; x 0-319, y 0-255, sx the sub-pixel 0|1): which layer won the pixel, its colour, per layer why it painted or not and where its byte came from
+next layer-capture [on|off|status]  ZX Spectrum Next: switch / show the per-layer record of the screen (on by default; `state next layer-capture` is the same)
+next nextreg <reg> <value> [nextreg|port|internal]  ZX Spectrum Next: write a NextREG through the board's write choke point (the journal sees it; `nextreg` = the NEXTREG instruction, `port` = OUT #243B / #253B)
 state sprinter [ports|port <hex>|text|video|palette [k]|ring|bios [<name> ...]]  Sprinter Sp2000 reports; bios <3.04|3.06|3.07|file> selects
 memory regions          Device memory regions (the Sprinter's video RAM "vram", the TS-Conf palette "cram" and sprite table "sfile", the CMOS clock's "cmos", the ZX-Evo AVR's "eeprom"); memory region read|write|save|load <name> ...
 mixer [<source> [muted=0|1] [solo=0|1] [volume=0..1] [gain_db=..]]  Per-device audio mixer (beeper, ay1, covox, gs, ...)
+mixer <source>                                    One row and its channels (mute, solo, volume, peak where metered)
+mixer channels                                    Every row with its channels
+mixer <source>.<channel> [muted=] [solo=] [volume=] [gain_db=]  One channel: ay1.a, covox.lb, gs.3, fm1.2, moonsound_fm.7, ms_midi.10, next_dac.c (solo within its row)
+setting ay_stereo|ay_chip|fm_trim_db|neogs_stereo|covox_dc_removal|fir_filter [value]  Sound settings (also ay_voicing, ay_room, ay_punch, beeper_punch, audio_rate)
 ```
 
 The screen reports ([command-interface.md §6.6](./command-interface.md#66-screen-configuration)) are rendered from the same core reports.
@@ -142,6 +163,12 @@ Available commands:
   list             - List all emulators
   ...
 ```
+
+**The sound card CPU**: `--cpu gs` (`ms`: the MultiSound's) on `registers`, `memory`, `memory info` and `disasm`
+works on the General Sound / NeoGS card's Z80 (`registers a 0x10 --cpu gs`, `memory 0x4000 32 --cpu gs`,
+`disasm --cpu gs`; [the sound card CPU](../debugger/breakpoints-and-traces.md#8-the-sound-card-cpu)), and on
+`step [count]`, `steps <count>`, `stepover` and `stepout` steps it: the machine runs until the card's step ends
+(`stepover --cpu gs`).
 
 **Command Aliases**:
 The CLI supports command aliases for convenience:
@@ -221,7 +248,9 @@ The CLI implements the same command semantics as other interfaces (WebAPI, Pytho
 | `GET /emulator/models` | `models` | CLI shows the same list with `(not creatable on this build)` markers; the endpoint's `creatable` flags stay authoritative |
 | `POST /emulator/start` with `zxpoly` | `zxpoly start <model> [file]` | Same entry point (`EmulatorManager::CreateZXPolyMachine`) |
 | `GET /emulator/{id}/zxpoly` | `zxpoly status [id]` | Same source (`ZXPolyGroup::Status`) |
+| `GET /emulator/{id}/operations?since=&limit=` | `ops [n\|all]`, `ops since <seq> [n\|all]` | Same source (`OperationsStatus`, the machine state coordinator's log); the CLI answers one line per operation, the newest 20 by default ([command-interface.md, Operation log](./command-interface.md)) |
 | `DELETE /emulator/{id}` | `stop` | CLI uses `stop` which both stops and removes; separate remove is for advanced orchestration |
+| `POST /emulator/{id}/reset` `{"hard": true}` | `reset hard` | Soft reset by default (the reset button); `hard` (or `--hard`) is a power cycle |
 | `POST /emulator/{id}/start` | `resume` | Starting an existing (initialized but not running) emulator uses `resume` in CLI |
 
 > [!NOTE]
@@ -241,10 +270,12 @@ The CLI exposes the TTD surface with the `ttd` top-level verb and a subcommand. 
 | `ttd seek <frame> [tinframe]`, `ttd seek --bookmark <label>` | `ttd goto` | Seek to a (frame, T-state) point or a bookmark. Refused while recording; the machine stays paused at the target. | ✅ Implemented |
 | `ttd step-back` | `ttd sb`, `back` | One frame back. | ✅ Implemented |
 | `ttd step-forward` | `ttd sf`, `forward` | One frame forward. | ✅ Implemented |
-| `ttd resume [frame [tinframe]]` | — | Truncate future at the current (detached) position, or the given one, and record again; the machine runs. | ✅ Implemented |
-| `ttd position` | `ttd pos` | Current time point (frame/tstate) and session bounds. | ✅ Implemented |
+| `ttd resume [frame [tinframe]] [media=ask\|empty\|keep]` | — | Truncate future at the current (detached) position, or the given one, and record again; the machine runs. Every medium goes back there when it can; one that cannot (another medium in the slot, a write beyond its undo log): `empty` (default) takes it out, `keep` leaves it, `ask` lists them and resumes nothing. | ✅ Implemented |
+| `ttd position` | `ttd pos` | Current time point (frame/tstate), session bounds, the history's first frame, state, paused, frame rate. Never parks the machine (the TTD's published cursor). | ✅ Implemented |
+| `ttd bookmark list [--tag T]`, `add <label> [frame] [tinframe] [--note TEXT] [--tags a,b] [--watch A[:N],...] [--no-context]`, `note <label> [--note TEXT \| --append TEXT] [--tags ..] [--add-tags ..] [--remove-tags ..] [--rename NEW]`, `export [--format markdown\|profile\|json] [--tag T] [--title TEXT] [--path FILE]`, `del <label>` | `ttd bm` | Agent bookmarks with notes, tags and the moment's context (PC, instruction, registers, watched bytes, taken once at `add`); `export` writes them up as a WALKTHROUGH section, a game profile's header comment or JSON in one call. | ✅ Implemented |
+| `ttd branches [--scope all\|lineage] [--created-by P] [--tag T] [--name-prefix P] [--pinned true\|false] [--limit N] [--offset N]`, `ttd branch switch <branch> [frame] [tinframe]`, `ttd branch update <branch> [--name N] [--note TEXT] [--tags a,b] [--add-tags ..] [--remove-tags ..] [--pin \| --unpin]`, `ttd branch del <branch> [--force]` | `ttd br` | The branches of the history (a resume in the past keeps the old future as `resume N`; the trunk is id 0; `<branch>` is an id, a GUID or a name): list them (`*` the active one; a page says how many are left), continue on one, rename / note / tag / pin it, delete it with its descendants (pinned ones with `--force`). `ttd status` names the active branch when there are branches. | ✅ Implemented |
 | `ttd markers` | `ttd barriers` | List external-event markers in the timeline. | ✅ Implemented |
-| `ttd dump <path>` | `ttd save` | Serialize the session to a `.ttd` file. | ✅ Implemented |
+| `ttd dump <path> [--lineage]` | `ttd save` | Serialize the session to a `.ttd` file: every branch, or with `--lineage` only the active branch's lineage as one linear history. | ✅ Implemented |
 | `ttd load <path>` | `ttd open` | Restore a dumped session (model must match the recording). | ✅ Implemented |
 | `ttd info <path>` | `ttd file-info` | Describe a `.ttd` file without loading it (no emulator needed): frames, sections, recorded machine - model, ROM signature, General Sound card, TurboSound slot device, devices. `ttd info` without a path is `ttd status`. | ✅ Implemented |
 | `ttd export-clip <from> <to> <dir> [--chunk N]` | `ttd clip` | Write frames from..to as a lossless clip into dir (final picture, plane B with `zxdlss`, frame meta); not while recording. See command-interface.md → Exporting a clip. | ✅ Implemented |
@@ -252,7 +283,15 @@ The CLI exposes the TTD surface with the `ttd` top-level verb and a subcommand. 
 | `ttd port-events <event> [arg]` | `ttd pe` | "When did the program ..." - saw a key (`key space`), the tape signal change (`ear`), wrote an AY register (`ay-write 7`), changed the border... From the port journals, no replay ([command reference](./command-interface.md), "Port events"). | ✅ Implemented |
 | `ttd step-instruction` | `si-back` / `si-forward` | Step one Z80 instruction back or forward within recorded history. | ✅ Implemented |
 | `ttd reverse-step` | `ttd rs` | Reverse-step execution. | ✅ Implemented |
+| `ttd reverse-step-over` | `ttd rso` | Step back over a routine when the instruction before is its return; otherwise one instruction back. | ✅ Implemented |
 | `ttd reverse-continue` | `ttd rc` | Reverse-continue execution. | ✅ Implemented |
+| `ttd probe-frames` | `ttd pf` | The frames a game profile's probes fired in (a replay of the window). | ✅ Implemented |
+| `ttd timeline` | `ttd tl` | The recording cut into phases of the same activity, each with its facts (no replay). | ✅ Implemented |
+| `ttd cause <addr>[:page] \| <reg>` | `ttd cause-chain` | Where a byte or a register got its value: the chain back to constants, port reads and the initial memory, one line per link (`--frame F [--tin T]`, `--depth N`, `--links N`, `--frames N`, `--flags`). | ✅ Implemented |
+| `ttd bt [F[+T]]` | `ttd backtrace` | The call stack at moment F+T (default: the current position): each return address above SP with the CALL / RST / interrupt that pushed it, when, and the routine it entered, one line per frame (`--depth N`, `--slots N`). |
+| `ttd event <kind> ...` | `ttd find-event` | When did it happen: `mem <addr>[:page] [cond [V\|B]] [--size 2] [--exact]`, `screen [PERCENT\|cleared]`, `exec <addr>[-<to>][:page]`, `port <in\|out> <port> [value V] [--mask M]`, `border [COLOUR]`, `key [KEY] [--released]`; `--last`, `--from F`, `--to F`, `--limit N`. One line per hit: frame+t, PC, instruction, before -> after, why; then a summary. | ✅ Implemented |
+| `ttd explain [F] [--sections a,b] [--limit N]` | `ttd explain-frame` | What frame F (default: the current one) did: the time split, the routines by time, the interrupt, paging, ports per device, memory changed with its writers, the screen and border, input, markers. Sections: `time`, `routines`, `interrupt`, `paging`, `ports`, `memory`, `screen`, `input`, `markers`, `all`; `--limit` 1..100 (default 8) per list. Prints the text; the machine stays where it was. | ✅ Implemented |
+| `ttd diff F[+T] [G[+T]] [--sections a,b] [--limit N] [--no-writers]` | — | What differs between moment F (+T inside the frame; `F:T` also works) and G (default: the current position): the registers, the latches and the 8K slot mapping, the RAM changed in ranges (screen pixels, attributes, RAM per page) with the bytes of short ranges and the last CPU write in between, the screen and border, the devices whose state differs, and the frames, T, keys and markers in between. Sections: `cpu`, `paging`, `memory`, `screen`, `devices`, `between`, `all`; `--limit` 1..200 (default 16) per list; `--no-writers` skips the write search. Prints the text; the machine stays where it was. | ✅ Implemented |
 
 **Interactive session example** (post-mortem crash forensics):
 
@@ -273,7 +312,7 @@ frame=4823  tstate=14982  pc=0x4A21  value=0x07  physpage=5
 ```
 
 **Notes**:
-- All run-affecting `ttd` verbs require the emulator to be paused and the CLI session to hold the run-control claim. Read-only verbs (`status`, `timeline`, `bookmark list`) work regardless.
+- All run-affecting `ttd` verbs require the emulator to be paused and the CLI session to hold the run-control claim. Read-only verbs (`status`, `timeline`, `bookmark list`, `branches`) work regardless.
 - The `timetravel` feature flag must be ON for recording/seek/replay. `status` works regardless and returns `{recording: false}` when TTD is off.
 - Seek latency depends on tier density — typically 1–20 ms in the dense (recent) tier; see the [implementation plan](../debugger/time-travel-debug/implementation-plan.md) for targets.
 
@@ -386,6 +425,151 @@ Error: state=300 out of range 0..255
 Joystick tap: fire for 3 frames -> state=0x18 buttons=up,fire (IN #1F=0x18)
 ```
 
+### Game Controller Commands
+
+The `controllers` verb (source: `core/automation/cli/src/commands/cli-processor-controllers.cpp`): the machine's
+joystick connectors and the host's game controllers, their profiles, bindings and haptics. Full table and the other
+surfaces: [command-interface.md §15](./command-interface.md#15-game-controllers).
+
+| CLI Command | Description |
+| :--- | :--- |
+| `controllers [list]`, `get <connector>`, `plug <connector\|auto> <device> [opt=val ..]`, `unplug`, `options`, `targets <device>`, `auto [apply]` | The machine's connectors and the retro devices in them |
+| `controllers devices`, `context`, `profiles`, `profile <id>`, `save <file>`, `delete <id>`, `apply <id\|none>` | The host devices (each with its battery, whether its light can be set, and a `notice:` line of what is missing) and the profiles |
+| `controllers bindings`, `bind <control> field=val ..`, `unbind <control>`, `scheme <id\|none>` | The effective bindings and their changes in a user profile |
+| `controllers haptics [device]` | Whether the emulator drives each device's motors (or why not) and its test effects |
+| `controllers rumble <device> [effect]` | Play a test effect: `identify` (default), `low`, `high`, `clicks`, `left-trigger`, `right-trigger`, `swell`; a Surface Dial: `identify`, `click`, `clicks`, `buzz` |
+| `controllers output <device> <tick\|double\|buzz>`, `output <device> steps=N clicks=on\|off`, `output <device> marks=a,b` | A control surface's outputs (the Surface Dial): a haptic pattern; its steps per turn and clicks (until its context changes); a seek's marks as its top layer plays them |
+| `controllers haptics_trial [<file>\|clear]` | Try a play profile's `events:` / `haptics:` (a YAML or JSON file) on the loaded game for this session, never written; `clear` drops it, no argument shows it |
+| `controllers light <device> <#RRGGBB\|r,g,b\|off>` | A pad's light colour (a DualSense / DualShock 4 light bar), where the OS lets the emulator set it |
+| `controllers role <device> <player\|debugger-remote\|disabled>`, `pin <device> <follow-focus\|all\|pinned:<id>>`, `identify <device>` | What a host device is for, which instance it drives; rumble and blink it to tell two pads apart |
+| `controllers player <device> [connector\|auto\|none]` | The connector a pad's `auto:` targets drive: read, choose, back to automatic, none |
+| `controllers probe [device]`, `reports <device>` | The backends and the devices they found, a device's endpoints; its newest raw input reports in hex |
+| `controllers database [<vid:pid>\|<SDL GUID>\|<device>\|<family>] [bus=usb\|bt] [name=..] [version=..]` | The device database: what a device of those ids matches (family, layout, images, map, match step and score), and the ids of devices.user.json |
+| `controllers database_save <file>`, `database_delete <id>` | Add or replace an entry of devices.user.json (one family as JSON), remove one |
+| `controllers database_import <file> [save=false]` | A `gamecontrollerdb.txt` line or a RetroArch autoconfig `.cfg` as the user family `user-<vid><pid>` with its control map |
+| `controllers learn <device> [start\|status\|skip\|back\|finish\|cancel] [controls=..]`, `learn <device> sample <control> [value]` | The learn wizard of an unknown device: press the prompted control on it after each step; `finish` saves the map |
+| `controllers aliases`, `unalias <old id>` | The device aliases (old id -> new: a `gc:` pad matched to its HID device keeps its profiles) and forgetting one |
+| `controllers match [path] [signatures=a,b] [file_set=..]` | The game profiles a program's signatures choose and how (`signature ...`, `file sha256 ...`, `file set: every entry kept, 1 of 5 files changed, 0 added`); without options the loaded program. `context` shows the loaded program's signatures, matches and `haptics_reason` |
+| `signature <file> [--details] [--external]`, `signature media`, `signature compare <known> <candidate>` | Media signatures ([command-interface.md §18](./command-interface.md#18-media-signatures)): the exact SHA-256, the tape content / TR-DOS file set / snapshot memory signature, the file set; of the loaded media; how two files relate (`exact`, `content`, `fuzzy`, `memory`, `none`) |
+
+`--json` prints the reply every surface returns. The host verbs need the Qt client (it owns the game controllers).
+
+```
+> controllers rumble bt:045e:0b22:c6928f45 swell
+OK: Swell (attack, hold, release) on Xbox Elite Wireless Controller Series 2
+> controllers rumble usb:045e:0b00:0516:3032 identify
+Error: Xbox Elite Wireless Controller Series 2: macOS drives no motors of an Xbox pad over USB: connect the pad over Bluetooth
+> controllers output bt:045e:091b:3c1e2f4a steps=36 clicks=off
+OK: 36 steps per turn, free wheel on Surface Dial (until its context or layers change)
+> controllers devices
+Host devices:
+  usb:054c:0ce6:0100:a0b1c2d3e4f5  DualSense Wireless Controller (dualsense)
+    role player (default); layers play
+    battery charging, 40 %; light settable
+> controllers light usb:054c:0ce6:0100:a0b1c2d3e4f5 #ff8000
+OK: light #ff8000 on DualSense Wireless Controller
+```
+
+### Host Action Commands
+
+The `action` verb (source: `core/automation/cli/src/commands/cli-processor-action.cpp`): the host actions of the core
+`ActionRegistry` - the ids a pad, the Surface Dial or a Stream Deck runs. Full table and the other surfaces:
+[command-interface.md §16](./command-interface.md#16-host-actions).
+
+| CLI Command | Description |
+| :--- | :--- |
+| `action [list] [--json]` | Every action, `*` when it can run now on the selected instance, else why not |
+| `action run <id> [value] [param=val ..] [--json]` | Run one and wait for it: press (default) / `release`, signed steps, a 0..1 level or text |
+| `action context [--json]` | The selected instance's surface context (`play`, `ttd`, ...), who set it, its default; set it with `action run ctx.set <name>` |
+
+The registry applies this connection's gate: a changing action without a session opens the implicit one (it ends
+with the connection, as for any other changing command); a companion connection (`companion auth`) is checked
+against its scopes.
+
+```
+> action run run.pause_toggle
+OK: run.pause_toggle - Emulator paused
+> action run run.step_in --json
+{"ok":true,"action":"run.step_in","instance":"…","message":"Executed 1 instruction","result":{"status":"success",…}}
+> action run ttd.jog_frames -10
+Error: Conflict - no time travel history
+> action run ttd.seek_by -3 rate=18 unit=seconds
+OK: ttd.seek_by
+{"reached":true,"arrived_at":{"frame":1834,"tinframe":0},"halt_reason":"target",…,"from":1981,"frame":1834,"frames":-147,"fps":48.828125,"marks":[{"kind":"ten_seconds","frame":1954}]}
+> action run ctx.set ttd.timecode
+OK: ctx.set
+{"context":"ttd.timecode","previous":"ttd","set":true,"by":"cli:cli","default":"ttd"}
+> action context
+Context: ttd.timecode (set by cli:cli)
+```
+
+`ttd.seek_by` takes its rate and curve as parameters here (`rate=`, `unit=frames|seconds`, `min=`, `max=`,
+`rate_lo=`, `rate_hi=`); `run.step_by` steps in forward and back through the history (`action run run.step_by -4`).
+
+The `surface` verb (source: `core/automation/cli/src/commands/cli-processor-surface.cpp`): the control surfaces'
+targets, readouts and activity ([command-interface.md §16.1](./command-interface.md#161-surface-targets-readouts-activity)).
+Positional words fill the verb's arguments in order, `name=value` words name them, `--json` prints the reply.
+
+| CLI Command | Description |
+| :--- | :--- |
+| `surface [views]` | The views in focus order and the followed instance (what a WebAPI call without an id acts on) |
+| `surface target [session]` | The followed instance's target, or a session's |
+| `surface sessions` | Every surface session and its target |
+| `surface pin <session> <target>` | `follow`, `view:<id>`, `instance:<id|index>` |
+| `surface readouts [names] [instance=]` | The readout values (`run.state,media.*`; default all) |
+| `surface activity [since] [limit=] [instance=]` | The activity feed |
+| `surface view_add <name> [active=]`, `view_update <view> [active=] [activate=true]`, `view_remove <view>` | Views of the automation plane |
+| `surface session_open <name> [target=]`, `session <id>`, `session_close <id>` | Sessions of the automation plane |
+
+```
+> surface views
+Followed: #0 PENTAGON 128K (0f3a…) in v1 Main window, follow [view]
+  v1 Main window [unreal-qt] active 0f3a…
+> surface session_open "my script"
+OK: s1 my script -> #0 PENTAGON 128K (0f3a…) in v1 Main window, follow [view]
+> surface pin s1 instance:1
+OK: s1 my script -> #1 48K 48K (7c21…), instance:7c21… [none]
+```
+
+The Stream Deck daemon as unreal-qt supervises it
+([command-interface.md §16.2](./command-interface.md#162-the-stream-deck-daemon)):
+
+| CLI Command | Description |
+| :--- | :--- |
+| `streamdeck [status]` | The daemon and its supervisor: state, pid, version, decks, viewers, pairing |
+| `streamdeck start`, `stop`, `restart` | Start it (or adopt the one running), stop it, both |
+| `streamdeck settings [mode=] [activity=] [api_port=] [viewers_port=] [binary=]` | Read, or change and read |
+| `streamdeck pairing`, `pair`, `pair_cancel` | The pairing's state; ask for one (approve it at the GUI); cancel it |
+| `streamdeck revoke [id]` | Revoke the daemon's companion |
+| `streamdeck brightness [deck] [value]` | A deck's brightness (`streamdeck brightness 40`: the first deck) |
+| `streamdeck packs` | The daemon's icon packs |
+| `streamdeck pack [deck] [name\|scenario]` | A deck's icon pack (`streamdeck pack os4`: the first deck; `scenario`: its scenario's again) |
+| `streamdeck udev` | The Linux udev rule |
+
+Monitoring ([command-interface.md §17](./command-interface.md#17-monitoring)), read-only:
+
+| CLI Command | Description |
+| :--- | :--- |
+| `monitor [all] [instance=]` | Host, clients, every instance's pace and breakpoints |
+| `monitor host.stats` / `host.clients` | The process: CPU %, resident / peak memory, threads; connections and requests per plane |
+| `monitor video.present` | The GUI window's way to the screen: presenter, policy, VRR, the video sync step, refresh, smooth motion in effect, the display rate switch's state and reason |
+| `monitor controllers.devices` | The host input devices: one line per device (id, name, battery, notice); `--json` the value the topic pushes |
+| `monitor emulator.stats [instance]` | fps, real-time speed %, frame time, halted %, CPU MHz and multipliers, interrupts per frame |
+| `monitor debug.breakpoints` / `breakpoint_groups` / `media.slots` / `recording.state` / `debug.labels` / `ttd.status` / `debug.analyzers` / `debug.cpuprofile` / `controllers.state` / `game.events` / `devices.access` | The summaries (JSON) |
+| `monitor <name> --json` | The reply every plane returns |
+
+```
+> streamdeck
+Stream Deck daemon: running (mode deck, activity flash)
+  pid 51234, ours, automation 127.0.0.1:37053, viewers 37050
+  decks on USB 1, restarts 0
+  version 1.0, decks 1, viewers 0, surface connected
+  pairing paired, paired yes, companion c-5f2a91e0b7c4
+  deck A1B2C3 Stream Deck + XL brightness 70 pack magicwb (setting scenario)
+> streamdeck pack os4
+Deck A1B2C3: icon pack os4 (setting os4, its scenario's -)
+```
+
 ### Analysis, Capture & Assembly Commands
 
 The analysis, capture and assembly families are available on **all** automation
@@ -396,8 +580,20 @@ reference: [command-interface.md](./command-interface.md).
 | :--- | :--- |
 | `stepout` | Run until the current subroutine returns to its caller. |
 | `skip_until <pc>` | Fast-forward until PC reaches the target (breakpoints skipped, bounded budget). |
+| `run_until [N] key=value ...` | Whole frames until the rules hold at a frame end: `if="M(#5C3A)==1"`, `text="GAME OVER"`, `screen=changed\|stable`, `stable_frames=25`, `event=died`, `match=any\|all`, `breakpoints=true`; a bare N is `max_frames` (3000, at most 200000). One line: "met at frame 4521 after 312 frames (text, row \"GAME OVER\"), PC #0038, 41 ms; paused" or "not met after 3000 frames ...". |
+| `watch add key=value ...` / `watch list` / `watch del <id\|all>` | Frame watches on the running machine (the `run_until` rules plus `label=`, `then=pause\|notify`, `once=true\|false`; at most 16): a hit pauses at that frame end (stop reason `watch`) and is pushed as `watch_hit` on `debug.events`. `watches` = `watch list`. |
+| `pace [show\|presets\|set <preset> [ms]\|interval <ms>\|next\|prev\|start\|stop\|toggle\|step] [--json]` | The paced run ([command-interface.md §2.1](./command-interface.md#21-paced-run-and-runs-to-a-place-stream-deck-d1-d2)): `full`, `25fps`, `5fps`, `1fps`, `frame`, `100lines`, `10lines`, `1line`, `1op`; a frame, lines or an instruction per interval (1..5000 ms), stopping at a breakpoint. `pace` alone shows it. |
+| `ttd reverse-step --scanlines L`, `ttd journal build-cancel` | Back L scanlines of the machine; stop a write-journal build that runs. |
 | (run control) | `step`, `steps`, `stepover`, `stepout`, `skip_until` and every `run_*` answer "Error: Run-control held by <surface>" while another surface (a GDB client) holds the run-control claim. |
-| `find <pattern>` | Search memory for a byte pattern, `??` = any byte (`--space cpu\|ram\|ram5\|rom2\|cache0`, `--mask`, `--from`, `--to`, `--align`, `--max`). |
+| `session take [name]` / `session release` / `session` | Take run control for this connection (it takes over another client's implicit session, never an explicit one, and says whose) / end it ("holds no session here" with the holder otherwise) / who holds it, implicit or explicit, the lease left. A change refused by the gate answers `Error: held_by_other - <who holds it and how to resolve it>`. |
+| `companion auth <token>` / `companion logout` | Act as a companion client on this connection: a device acting as the user's hands; its changes open no session. It may do anything within its scopes (run, input, media, machine, rewind, debug, takeback): a scope not granted answers `companion_forbidden`, a change while a session holds the machine `held_by_session`, a step or direct run while the machine runs `not_now` ([companion clients](../../../inprogress/2026-10-16-companion-client/surfaces.md#3-cli)). |
+| `companion` / `companion list` / `companion revoke <id\|name\|all\|me>` | This connection, the machine's control state and what the companion may do now ("Available now", "Not now" with the reasons); the companions and pending pairings; revoke. Pairing is approved at the GUI only. |
+| `companion take-back` / `companion allow-again` | A companion with the `takeback` scope ends the session holding the machine (as the GUI's Take back control) / lifts the re-take cooldowns. |
+| `bpon` / `bpoff` / `bpclear` / `bptoggle <target>` | Breakpoints by selection: an id, `all`, a kind (`mem`, `port`, `read`, `write`, `exec`, `in`, `out`, `nextreg`, `nextreg_read`, `nextreg_write`, `beam`, `copper`, `magic`, `keyboard`), `group <name>` or `group:<name>`; `bptoggle` turns the target all on when one of it is off, else all off. `bpgroup on\|off\|toggle <name>` the same for a group. |
+| `bp` / `wp` / `bport ... if <condition>`, `bpcond <id> [condition]` | A conditional breakpoint: the rest of the line after `if` is the condition (`bp 0x8000 if A == 7`, `wp 0x5C78 w if VAL == 0`); `--dialect c` before `if` reads C precedence and decimal numbers. `bpcond` changes it, no condition clears it ([conditional breakpoints](../../../features/conditional-breakpoints.md)). The address is read as the CLI reads it (plain = decimal), the condition's numbers as hex. |
+| `callback [list]`, `callback resume <id>`, `callback remove <id>`, `callback policy <id> <suspend\|disable\|ignore\|unpaced>` | The Lua / Python [script callbacks](../../../features/script-callbacks.md) of the selected emulator (a script registers them: `on_tap`, `on_breakpoint`, `on_game_event`): a line each, `#3 tap write #5C78 if MDT == 0 (lua "lives") active, policy suspend, hits 6, dropped 0, pending 0, calls 6, errors 0, overruns 0, max 60 us, …` with `; reason: …` when suspended or disabled and `; last error: …` (a frame or sync hook adds its mode and `aborted N, instructions N`; with hooks a `Hooks: paced, last frame … us, …` line follows the header); resume a suspended one (fresh statistics; a disabled one is refused), remove one, change its over-budget policy. `callbacks` is an alias. The changing verbs pass the automation gate as `bpcond` does. |
+| `bkey <key\|any> [press\|release\|both]` | Keyboard breakpoint: the first keyboard read that sees the key change (`--hits`, `--group`, a note). `bpnote <id> [text]` sets a note; `--group G` on any `bp*` command puts a new breakpoint in a group. |
+| `find <pattern>` | Search memory for a byte pattern, `??` = any byte (`--space cpu\|ram\|ram5\|rom2\|cache0\|<region>`, `--mask`, `--from`, `--to`, `--align`, `--max`). |
 | `out <port> <value>` | A debugger's port write through the machine's decoder, like a CPU OUT (paging, TS-Conf registers, AY, border): no breakpoints, no device waits, a TTD tool edit; paused, stopped or running. Numbers: `0x13AF`, `#13AF`, `13AFh` or decimal. |
 | `pchist [depth]` / `pchist on\|off` | PC history: the newest instructions the CPU started, each with its window's page (`C000  ram32`), newest first; the first read starts recording; `debug-snapshot --pchist N` adds it to a snapshot. |
 | `debug-wait [since] [--timeout ms]` | Wait until something a debugger shows changes (a stop, a run start, a tool edit) or the timeout (default 10000 ms, at most 60000) passes: `Changed: seq 43, paused at breakpoint #3 (8000)` or `No change: seq 42, running`. |
@@ -412,17 +608,124 @@ reference: [command-interface.md](./command-interface.md).
 | `video text [layer]` | Exact text grid of an ATM / ZX-Evo / TS-Conf text mode, or the Sprinter's text squares. |
 | `video address vram <offset>` | Every pixel a byte of the machine's own video RAM feeds (the Sprinter). |
 | `video changes [1\|2]` | Video change log: latch changes (mode, #7FFD, border, the Sprinter's RGMOD / HOLD / PORT_Y / ALL_MODE / frame height) with T, line and PC; palette / mode table writes per frame. |
-| `capture screen [--area=full\|screen] [--format=png\|gif] [--source=presented\|live] [file]` | Screenshot of the session's emulator: the whole frame with border (default) or the working picture; PNG (default) or GIF; the presented frame (default) or `--source=live`, the frame as drawn now (a paused machine reports where the beam stopped). Prints the size, the cut rectangle, the screen window and a data URI, or saves to `file`. An unknown word is an error. |
+| `capture screen --layer=ula\|layer2\|tilemap\|sprites\|ids [--format=png\|rgba] [--alpha=false] [file]` | ZX Spectrum Next: ONE LAYER of the last completed frame (alpha 0 where the layer does not paint; `ids` = the winner of every pixel, the legend is printed); 640 x 512: the 640x512 grid of the screenshot (at (32, 32) of its 720x576 frame; (40, 48) on the Pentagon timing); prints the frame and size and a data URI, or saves to `file`. Needs the layer record (`next layer-capture on`, the default). |
+| `capture screen [--area=full\|screen] [--format=png\|gif] [--source=presented\|live\|window] [file]` | Screenshot of the session's emulator: the whole frame with border (default) or the working picture; PNG (default) or GIF; the presented frame (default) or `--source=live`, the frame as drawn now (a paused machine reports where the beam stopped), or `--source=window`, the picture as the unreal-qt window draws it (GUI only). Prints the size, the cut rectangle, the screen window and a data URI, or saves to `file`. An unknown word is an error. |
 | `capture framebuffer <file> [rgba\|index]` | The picture as raw pixels (R,G,B,A, or the Sprinter's u16 pens). |
+| `video window [status \| <key>=<value> ...]` | GUI window display settings: show them, or change any of `gpu`, `crt`, `blending`, `fullscreen`, `toolbar`, `status_bar`, `hud`, `osd_keyboard`, `next_layers` (on / off), `crt_profile` (one of `crt_profiles`: none, basic, ..., shader:<name>: a libretro preset or a custom shader, with the GPU), `blending_frames` (2..5), `blending_weights` (equal / exponential), `blending_decay` (0.1..0.9), `smooth_motion` (off / blend / interpolate / auto), `effects_device` (gpu / cpu), `present_policy` (auto / vrr / vsync), `display_rate` (keep / match), `lip_sync_offset_ms` (-200..200), `view` (full / screen / content), `scale` (1..4), `hud_theme`, `hud_notice.<id>` (on / off), `osd_keyboard_picture`, `osd_keyboard_style` (photo / schematic / hybrid), `next_layers_mode` (layers / composed / winner), `next_layer.<ula\|layer2\|tilemap\|sprites>` the way the View menu does, e.g. `video window crt_profile=basic blending=on hud_theme=retro_zx`. Headless: `Error (no-window)` (see [command-interface.md](./command-interface.md#gui-window-display-settings)). |
+| `video window crt_params [<name>=<v> \| <name>+=<steps> \| <name>-=<steps> \| reset \| reset=<name> ...]` | The active CRT profile's parameters: list them with their ranges, set, move by a dial's steps, reset; e.g. `video window crt_params CRTgamma=2.4 curvature+=2` ([command-interface.md](./command-interface.md#gui-window-display-settings)). |
+| `video viewport [status \| full \| symmetric \| standard \| screen_only \| next \| prev]` | The Pentagon overscan frame's crop (overscan itself: `feature overscan on`); a crop other than `full` needs overscan on ([command-interface.md](./command-interface.md#overscan-viewport)). |
 | `video temporal [status\|list\|off\|<algorithm>]` | ZX DLSS de-flicker: show its status (algorithm, video / audio delay it causes, timing), list the algorithms, switch it off or on (default `mod-tpgwafsd`, which shows the picture 7 frames later and delays the sound 5 more frames to match; see [command-interface.md §5.9](./command-interface.md)). |
 | `frame_cost` | Per-frame halt/run cost accounting. |
-| `coverage <start\|stop\|clear\|gaps\|status>` | Executed-address coverage analysis. |
+| `profiler memory counters [space=cpu\|phys\|ram\|ram5] [start=N] [length=N\|end=N] [addresses=A,B,C-D] [view=top\|sparse\|dense] [kinds=rwx] [min=N] [limit=N]` / `profiler memory cell <address> [space]` | Per-address read / write / execute counters of the memory profiler (`profiler memory start` first): one line a cell, `0x5C08  r=12 w=3 x=0`, in `phys` with its page (`ram5:0x1C08`); default the top 32 of `cpu` ([memory-counters.md](../debugger/memory-counters.md)). |
+| `profiler memory watch add <name> <start> <length> [callers] [values]` / `watch port <name> <port> [mask] [callers] [values]` / `watch remove <name>` / `watch clear` / `watch list` | Watches over CPU addresses or a partially decoded port (`mask 0xFF`: the low byte; Kempston `0x1F`, keyboard `0xFE`), with the PCs and the values; counts while the session captures. |
+| `coverage <start\|stop\|clear\|gaps\|status\|export>` | Executed-address coverage analysis; `export [<path>] [--start A] [--end B] [--merge]` writes the SkoolKit code execution map. |
 | `aylog <start\|stop\|clear\|dump\|status>` | AY-3-8910 register access log. |
-| `audiocapture <start\|stop\|clear\|result\|save>` | Audio capture with level stats and WAV export; `start <seconds> [source]` records one mixer device. |
-| `videorecord <start\|stop\|pause\|resume\|status>` | Screen recording (requires `ENABLE_RECORDING` build). `start` accepts `--region full\|screen` (default `full`: the whole frame with its border; `screen`: the working picture, fitted into the start window's size when the window changes), `--profile native\|1080p\|1440p\|4k` (a fixed frame, the picture scaled sharply into it with black bars; h264/h265 only), `--acceleration auto\|hardware\|software` (GPU or software encoder), `--audio-rate N\|auto` to pin the core audio rate for the whole recording (one step for fixed-rate captures; fails fast if the emulator is paused so the file cannot be mislabeled — see [command-interface.md §5.8](./command-interface.md)). |
+| `audiocapture <start\|stop\|clear\|result\|save>` | Audio capture with level stats and WAV export; `start <seconds> [source] [file <path.wav>]` records one mixer device; `file` writes the WAV while the samples come (up to 86400 s, no 30 s memory ceiling). |
+| `sectiontimer <start\|stop\|clear\|status\|result>` | Section timing at full speed ([command-interface §5.5c](command-interface.md#55c-section-timer)): `start [SECTION ...] [break-if [net:]NAME<op>T] [extra A,B] [recursive] [frame-t T] [capacity N]`, SECTION = `NAME` (labels `NAME`, `NAME.End`) or `name=ENTRY:EXIT[,EXIT]`, none = every `X` with an `X.End`; `status` a line per section (count, min, avg, max, net max, interrupted), `result [offset] [limit]` the JSON with the passes. |
+| `recent [kind] [--json]` / `recent clear [kind]` | The files opened lately, newest first, with each one's index (`kind`: all, snapshot, tape, disk, rzx, image, cd); open one with `action run media.open_recent index=N [kind=K]` ([media.md → Recent files](../../../features/media.md#recent-files)). |
+| `videorecord <start\|stop\|pause\|resume\|toggle\|status\|presets>` | Screen recording (requires `ENABLE_RECORDING` build). `presets` lists the core's presets; `start` accepts `--preset NAME` (gameplay, music, audio, gif, hq, multitrack), `--mode single\|multi\|audio`, `--container EXT`, `--region full\|screen` (default `full`: the whole frame with its border; `screen`: the working picture, fitted into the start window's size when the window changes), `--profile native\|1080p\|1440p\|4k` (a fixed frame, the picture scaled sharply into it with black bars; h264/h265 only), `--acceleration auto\|hardware\|software` (GPU or software encoder), `--audio-rate N\|auto` to pin the core audio rate for the whole recording (one step for fixed-rate captures; fails fast if the emulator is paused so the file cannot be mislabeled — see [command-interface.md §5.8](./command-interface.md)). |
 | `assemble <addr> <code>` (`asm`) | Assemble Z80 source in place (`--write` to patch RAM). |
 | `label resolve <name\|addr>` | Resolve a label by name or an address to labels + context. |
 | `listing <load\|clear\|info\|source_at\|step_line\|run_to_line>` | Source-level debugging via assembler listings. |
+
+### Analysis layers
+
+The L0 access facts, the L1 code behaviour and the L2 structure of the [analysis layers](../../analysis/analysis-layers.md): one command, the same core handler
+as every other plane (`analysis::Execute`), so the lines below are also the `text` of the REST and MCP answers.
+
+| CLI Command | Description |
+| :--- | :--- |
+| `analysis start [facts\|counters] [z80\|physical] [record]` | Switch on memory tracking at level `facts` (default) or `counters`, mode `z80` (default) or `physical`, and start a fresh session (`level=`, `mode=` work too); `record` (`record=true`) also starts a TTD recording for the L1 build. |
+| `analysis stop` | Stop the session (and the recording `record` started); the facts stay readable. |
+| `analysis build [frames] [from_frame=] [from_tinframe=] [to_frame=] [path=F] [wait=MS]` | L1: capture the recording, replay it on a muted analysis instance and build routines, CFG, call graph, loops, patterns, data flow, branches, paging. A job: the answer has its id and state; `frames` caps the replay; `from_frame` / `from_tinframe` (an arrival's frame and t-states into it) and `to_frame` (exclusive) build one window, one stage ([stages and windows](../../analysis/analysis-layers.md#stages-and-windows)); `path` writes the L1 JSON, `wait` (at most 30000 ms) waits for the end. Progress: topics `analysis.progress`, `analysis.ready`. |
+| `analysis cancel` | Cancel the running build (409 when none runs). |
+| `analysis status` (`analysis`) | State, level, mode, frame, what the facts hold. |
+| `analysis explain <addr> [page] [routine\|byte]` | With an L1 build, the fact sheet of the routine holding the address (at most 1 KB, 24 disassembly lines); `byte` (or no L1): what L0 knows of one byte: kinds, last writer and the values, last reader, frames, counters, labels. `<addr>`: `$80BC`, `#80BC`, `0x80BC`, `80BCh`, decimal or a label; `[page]` in physical mode: index, `ram:N`, `rom:N`. |
+| `analysis query [kind] [range] [limit=N]` | L2: the claims of the detectors (signatures, code map, text, init tables, pointer / handler tables, records, variables) that cover the range (hex `8000-83FF`, `$8000-$83FF`; default all memory): `kind` `all` (default), `conflicts` (pairs of clashing claims) or a region kind (`code`, `data`, `text`, `buffer`, `init_table`, `records`, `variable`, `pointer_table`, `handler_table`, ...); `limit` (default 200) caps the list, `truncated` says when it cut. One line per claim: range, kind, detector, confidence, status, label or title. 409 before an L1 build. |
+| `analysis export <format> [path] [ranges=R,...] [width=N]` | The L2 draft: `ctl` (SkoolKit control file for `sna2skool.py -c`), `skool` (a skool file that assembles relocatable: `@label` on referenced addresses, `@isub` where an operand points inside an instruction or names a page, `@keep` on constants equal to an address, ALIGN 256 and the ORG of a range start after the instruction before), `fields` / `geometry` (JSON: record field lists, graphics geometry), `layout` (zx-reaper `re/layout.mk` lines `REGION_START`, `SHIFT_END`), `symbols` (the unreal-asm symbol codec), `map` (one line per claim). `ranges` (comma separated, no overlap; default `4000-FFFF`) are the Z80 ranges written, `width` (1-64, default 8) the bytes per DEFB line; with `path` the file is written there, without it the answer carries it (`content`; the text up to 16 KB). |
+| `analysis gallery [kind] [addr [path]] [scale=N] [limit=N]` | L2 graphics (fonts, sprites, tiles, screens and back buffers, level maps): without an address, the list with the geometry (range, kind, width x height x frames, mask, prefix, detector, confidence); with one (or a label), the region starting there (else covering it) drawn from the memory at the end of the replay as a PNG: frames in a grid, black ink on white paper (a tile's attribute colours it, a mask's transparent pixels light grey), screens in display file order, attributes and map cells as 8x8 colour cells, zoomed `scale` (1-8, default 2) times; written to `path`, else base64 in `png`. 404 when no graphics region holds the address, 409 before an L1 build. |
+| `analysis findings [list\|add]` | L3: the findings register of the last build, every L2 claim, conflict, candidate bug, unnamed hot routine and unknown area plus the notes, coverage flips and experiments added since, ids `F1..` in a fixed order ([findings](../../analysis/analysis-layers.md#findings-register)). `kind=`, `status=`, `range=`, `limit=` filter; `format=markdown` (zx-reaper's `re/findings.md`) or `jsonl`, `path=` writes it. `add`: a note (`claim=`, `range=`, `status=`, `evidence=` `;`-separated, `by=`). 409 before an L1 build. |
+| `analysis review [next\|list\|show\|resolve] [id] [ok\|wrong\|skip]` | L3: the review queue (bugs, conflicts, unnamed hot routines, low-confidence claims, unknown areas over 16 bytes; at most `limit=` 40 plus a summary). `next` (default): the next open item and its fact sheet (at most 1 KB); `list`; `show <id>`; `resolve <id>` with a verdict and `label=`, `title=`, `comment=` that the draft export carries, `experiment=<json>` to decide with a run. 404 for an unknown id, 409 for a label already used. |
+| `analysis experiment <spec.json\|{json}> [finding=<id>] [parallel=<n>]` | L3: experiments on muted clones from the recording: `poke`, `regs`, `input` (keys, joystick), `frames`, `watch`, `expect`; one spec or an array ([experiment runner](../../analysis/analysis-layers.md#experiment-runner)). Each result is observed or refuted and marks `finding=`. The source machine is never touched. |
+| `analysis trace <path> [from_frame=] [from_tinframe=] [to_frame=] [to_tinframe=] [max_cycles=]` | the CPU access trace of a window of the recording: every instruction (frame, T-state, registers) and every fetch, read, write and port access (address, value, T-state) after it, with the memory the window starts from, written to `path` for scripts (format: [access trace](../../analysis/analysis-layers.md#access-trace)); the window defaults to one frame, at most 3000; 409 with no recording or outside it. |
+| `analysis cover [budget] [frames=<n>] [per_branch=<n>] [ranges=<r,...>]` | L3: directed coverage: the branches the session took one way only, flipped by holding the byte they test or pressing the keys / joystick of the port they read; flips become coverage findings and draft notes. |
+
+`--json` prints the fields instead of the lines. Example:
+
+```text
+> analysis start
+analysis: capturing, level facts, mode z80, frame 120; facts 1024 KB, 0 Z80 addresses touched
+> analysis explain $0038
+$0038 [ROM 0]: OpcodeFetch
+  frames 121..170
+  counters: 0 reads, 0 writes, 50 executes
+> analysis query conflicts limit=2
+L2 conflicts in $0000-$FFFF: 117 conflicts (first 2)
+range     kind          detector       conf status   label / title
+8418-841A data          code_map        700 observed 
+  vs 8418-841A text          text            800 observed 
+841F-845D data          code_map        700 observed 
+  vs 842F-8457 text          text            800 observed 
+> analysis export skool scratch/game.skool ranges=5900-59FF,8000-FFFF
+L2 skool (5900-59FF,8000-FFFF): 103 entries, 224275 bytes written to scratch/game.skool
+```
+
+### Memory markup
+
+What each byte of memory is (code, data, text, sprite, ...) by layer, the [memory markup](../../../inprogress/2026-11-05-software-metadata-profile/README.md): one command over the
+same core handler as every other plane (`markup::Execute`), so its lines are also the `text` of the REST and MCP
+answers. Addresses: `$8000`, `#8000`, `0x8000`, `8000h`, decimal or a label; a range `8000-80FF` or `$8000-$80FF`.
+`--json` prints the answer's fields.
+
+| CLI Command | Description |
+| :--- | :--- |
+| `markup [show] [<range> \| <from> [<to>]] [layer=<l>] [limit=<n>]` | The CPU range (default the 64K) as spans of one winning claim each (kind, layer source, title, confidence below 1000), then the comments; `layer=` keeps the spans that layer wins. |
+| `markup layers` | Every layer, highest first: its source and counts; the runtime layer's feed (`facts`, `facts-physical`, `coverage`, `none`). |
+| `markup mark <range> \| <from> [<to>] <kind> [<title words>] [cpu]` | The user layer: the range as a region kind on the pages the CPU shows now (`cpu`: on the CPU addresses). |
+| `markup unmark <range> \| <from> [<to>]` | The user layer forgets its claims there. |
+| `markup comment <address> [<text words>]` | The user layer's comment (no text removes it). |
+| `markup clear [<layer>]` | Empty a layer (`user` by default; `analysis` shows the last L2 build again). |
+| `markup save [<profile>] [analysis=all\|<kinds>] [confidence=<n>] [keep]` | The user layer, and the analysis claims of at least the confidence (700) chosen, into a software profile's `memory:` section (unreal-qt only): the profile named, else the matched one, else a new user profile keyed by the loaded program. The user layer is emptied after unless `keep` (or the profile does not lie over the machine). |
+
+```
+> markup mark 8000 80FF sprite hero
+Marked $8000-$80FF as sprite 'hero' (on the pages mapped now)
+> markup comment $8010 frame 2
+Comment at $8010: frame 2
+> markup 8000-81FF
+Markup $8000-$81FF: 1 span(s), 0 instruction start(s), 1 comment(s)
+$8000-$80FF sprite [user] hero
+; $8010 frame 2
+```
+
+### CPU time profile
+
+Where the CPU's T-states go per executed instruction and per routine, live, with no recording and no code map
+([CPU time profile](../../analysis/cpu-profile.md)); the same core handler as every plane (`profile::Execute`), so the
+lines are also the `text` of the REST and MCP answers.
+
+| CLI Command | Description |
+| :--- | :--- |
+| `cpuprofile start [nostack] [beam] [noframes] [reset] [stream=F] [ring_kib=N]` | Switch the profile on: cells, the call stack (routines found at run time, self / inclusive), the per-frame series (default on), `beam` (self per 1/64 of the frame), `stream` (the series as JSONL). The CPU is held for the switch. |
+| `cpuprofile stop` / `reset` / `status` (`cpuprofile`) | Off (counters kept) / a fresh window (marks dropped) / the totals. |
+| `cpuprofile mark <name> [drop]` | A baseline: `since=<name>` reads the time after it (at most 8). |
+| `cpuprofile report [top] [since=M] [sort=self\|inclusive\|calls] [callers=] [beam=]` | The top (24) routines with self / inclusive share, entries, kinds and the attribution notes. |
+| `cpuprofile frames [last] [top=N]` | The last (50) frames of the series, the top (8) routines of each. |
+| `cpuprofile export <kit\|json\|entries\|sym\|ann> [path] [since=M]` | `kit`: the L1 subset `kit/fig_budget.py` reads; `entries`, `sym`, `ann`: the routine entries found. |
+
+`--json` prints the fields. Example:
+
+```text
+> cpuprofile start
+CPU profile started (stack on, beam off, frames on). Run the program, then read the report.
+> run frames 500
+> cpuprofile report 3
+CPU profile since the start: 500 frame(s), 34944000 T, 118 routine(s) found
+  self    incl    calls  routine (entry, page, kinds)
+   22.5%   24.8%    500  sub_B30C ($B30C, RAM 2, call)
+   14.1%   14.1%  61000  sub_A6E0 ($A6E0, RAM 2, call)
+    9.8%   99.9%      0  (outside any call) ($8000, RAM 2, root)
+```
 
 ## Connection Examples
 

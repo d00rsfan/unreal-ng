@@ -2,6 +2,7 @@
 
 #include <base/featuremanager.h>
 #include <debugger/breakpoints/breakpointmanager.h>
+#include <emulator/coordinator/machineop.h>
 #include <emulator/emulator.h>
 #include <emulator/emulatormanager.h>
 #include <pybind11/functional.h>
@@ -22,6 +23,12 @@ PYBIND11_EMBEDDED_MODULE(unreal_emulator, m)
 {
     m.doc() = "Unreal Speccy NG Emulator Python bindings";
     PythonBindings::registerEmulatorBindings(m);
+    // The automation gate opened a session for a script that drove the machine without taking control: a
+    // UserWarning tells it (a script that turns warnings into errors gets the error)
+    execution::script::SetAdviceSink(execution::Origin::Python, [](const std::string& advice) {
+        if (PyErr_WarnEx(PyExc_UserWarning, advice.c_str(), 1) < 0)
+            throw pybind11::error_already_set();
+    });
 }
 
 /// region <Methods>
@@ -102,56 +109,47 @@ bool AutomationPython::executeCode(const std::string& code, std::string& errorMe
         auto result = dispatchSync([code]() -> std::pair<bool, std::string> {
             try
             {
-                // Ensure GIL is held for Python operations
-                PyGILState_STATE gstate = PyGILState_Ensure();
-                try
+                // The GIL for this call, released on every way out
+                struct GilHold
                 {
-                    // Use a separate execution context to avoid conflicts
-                    py::dict locals;
-
-
-                    // Set up stdout capture in the local context
-                    py::exec(R"(
+                    PyGILState_STATE state = PyGILState_Ensure();
+                    ~GilHold() { PyGILState_Release(state); }
+                } gil;
+                // The capture's own names stay apart from the script's
+                py::dict capture;
+                py::exec(R"(
 import sys
 from io import StringIO
 
-# Save original stdout
 original_stdout = sys.stdout
-
-# Create capture buffer
 capture_buffer = StringIO()
 sys.stdout = capture_buffer
 )",
-                             py::globals(), locals);
-
-                    // Execute the user code in the local context
-                    py::exec(code, py::globals(), locals);
-
-                    // Get captured output and restore stdout
-                    py::exec(R"(
-captured_content = capture_buffer.getvalue()
-sys.stdout = original_stdout
-)",
-                             py::globals(), locals);
-
-                    // Extract the captured output from locals
-                    std::string output = locals["captured_content"].cast<std::string>();
-
-                    return {true, output};
+                         py::globals(), capture);
+                std::pair<bool, std::string> outcome{true, {}};
+                try
+                {
+                    // The script runs in __main__ (globals and locals one dict): its functions and callbacks see its
+                    // top-level names, which stay for the next call as in the Lua console
+                    py::exec(code, py::globals());
                 }
                 catch (const py::error_already_set& e)
                 {
-                    return {false, std::string("Python error: ") + e.what()};
+                    outcome = {false, std::string("Python error: ") + e.what()};
                 }
                 catch (const std::exception& e)
                 {
-                    return {false, std::string("C++ error: ") + e.what()};
+                    outcome = {false, std::string("C++ error: ") + e.what()};
                 }
-                catch (...)
-                {
-                    PyGILState_Release(gstate);
-                    return {false, std::string("Unknown error occurred during Python execution")};
-                }
+                // stdout back even after an error: later output (a callback's print) must not go to this buffer
+                py::exec(R"(
+captured_content = capture_buffer.getvalue()
+sys.stdout = original_stdout
+)",
+                         py::globals(), capture);
+                if (outcome.first)
+                    outcome.second = capture["captured_content"].cast<std::string>();
+                return outcome;
             }
             catch (const std::exception& e)
             {
@@ -285,6 +283,8 @@ void AutomationPython::processPython()
         PyGILState_STATE gstate = PyGILState_Ensure();
         try
         {
+            // Script callbacks (docs/features/script-callbacks.md): the functions run here, never on the emulation thread
+            PythonBindings::PythonDrainCallbacks();
             // Minimal keep-alive code
             py::exec("pass", py::globals());
         }
@@ -402,6 +402,7 @@ static void registerEmulatorBindings()
 void AutomationPython::threadFunc(AutomationPython* python)
 {
     ThreadHelper::setThreadName("automation-python");
+    coordinator::SetThreadSource(coordinator::OpSource::Python);   // every script runs here: the operation log names it
 
     using namespace std::chrono_literals;
 
@@ -460,6 +461,7 @@ void AutomationPython::threadFunc(AutomationPython* python)
     {
         // Acquire GIL for finalization
         PyGILState_STATE cleanup_gstate = PyGILState_Ensure();
+        PythonBindings::PythonForgetCallbacks();
 
         // Use Py_FinalizeEx directly (returns 0 on success, -1 on error)
         int result = Py_FinalizeEx();

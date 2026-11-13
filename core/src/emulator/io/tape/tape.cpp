@@ -1,16 +1,20 @@
 #include "tape.h"
+#include "emulator/readoutschanged.h"
 
 #include "common/filehelper.h"
 #include "common/stringhelper.h"
 #include "emulator/cpu/core.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/io/tape/tapecatalog.h"
+#include "emulator/io/tape/tapeslot.h"
+#include "emulator/media/mediamanager.h"
 #include "emulator/io/tape/tapepulsegen.h"
 #include "emulator/sound/soundmanager.h"
 #include "loaders/tape/loader_tape.h"
 #include "stdafx.h"
 #include <cstring>
-#include "debugger/ttd/timetravelmanager.h"  // TimeTravelManager (Item 6 markers)
+#include "debugger/ttd/timetravelhooks.h"  // ITimeTravelHooks (Item 6 markers)
+#include "debugger/ttd/ttdexternalevents.h"
 
 /// region <Constructors / destructors>
 
@@ -48,10 +52,13 @@ void Tape::startTape()
     _lastTapeBit = false;
     _framesNotListened = 0;
     MLOGINFO("Tape started");
+    NotifyReadoutsChanged(_context, "tape");  // the transport: a deck shows it, paused too
 }
 
 void Tape::stopTape()
 {
+    _playWhenAttached = false;   // a stop drops a play still waiting for its tape
+
     // Phase 2 Item 6 - see startTape() for rationale.
     if (_context && _context->pTimeTravelHooks)
         _context->pTimeTravelHooks->RecordExternalEvent(
@@ -77,6 +84,7 @@ void Tape::stopTape()
 
     _currentClockCount = 0;
     _lastTapeBit = false;
+    NotifyReadoutsChanged(_context, "tape");  // the transport: a deck shows it, paused too
 }
 
 void Tape::stopPlayback()
@@ -105,6 +113,7 @@ void Tape::stopPlayback()
     _currentPulseIdxInBlock = 0;
     _currentOffsetWithinPulse = 0;
     _lastTapeBit = false;
+    NotifyReadoutsChanged(_context, "tape");  // the transport: a deck shows it, paused too
 }
 
 void Tape::pausePlayback()
@@ -142,6 +151,7 @@ void Tape::pausePlayback()
     // be consumed as one giant pulse. 0 is the "re-seed on next read" marker
     // honored by getTapeStreamBit().
     _currentClockCount = 0;
+    NotifyReadoutsChanged(_context, "tape");  // the transport: a deck shows it, paused too
 }
 
 void Tape::ResumePlaybackAfterPoll()
@@ -216,6 +226,13 @@ void Tape::AttachImage(const TapeImage* image, const std::string& sourcePath, co
     _attachedFormatId = formatId;
     _attachGeneration++;
     _context->coreState.tapeFilePath = sourcePath;
+    // A play asked for while this tape was on its way: it starts now, from its first block
+    if (_playWhenAttached && !_context->ttdReplayActive)
+    {
+        _playWhenAttached = false;
+        if (EnsureImageLoaded())
+            StartPlaybackAtCursor();
+    }
 }
 
 void Tape::DetachImage()
@@ -225,6 +242,25 @@ void Tape::DetachImage()
     _attachedPath.clear();
     _attachedFormatId.clear();
     _context->coreState.tapeFilePath.clear();
+}
+
+TapePlayResult Tape::Play()
+{
+    if (!EnsureImageLoaded())
+    {
+        MediaManager* media = _context ? _context->pMediaManager : nullptr;
+        if (media == nullptr || !media->HasIncoming(TapeSlot::kId))
+            return TapePlayResult::NoBlocks;
+        _playWhenAttached = true;
+        return TapePlayResult::Queued;
+    }
+    if (GetPlaybackState() == TapePlaybackState::Paused)
+    {
+        ResumePlaybackFromPause();
+        return TapePlayResult::Resumed;
+    }
+    StartPlaybackAtCursor();
+    return TapePlayResult::Started;
 }
 
 bool Tape::EnsureImageLoaded()
@@ -477,6 +513,7 @@ bool Tape::SeekToBlock(size_t index)
     _currentTapeBlockIndex = index;
 
     MLOGINFO("Tape seek: block %zu of %zu", index, _tapeBlocks.size());
+    NotifyReadoutsChanged(_context, "tape");
     return true;
 }
 
@@ -527,6 +564,7 @@ void Tape::ResumePlaybackFromPause()
 
     MLOGINFO("Tape resumed at block %zu, pulse %zu (manual)",
              _currentTapeBlockIndex, _currentOffsetWithinPulse);
+    NotifyReadoutsChanged(_context, "tape");  // the transport: a deck shows it, paused too
 }
 
 /// endregion </Playback state, position and seek>
@@ -627,20 +665,31 @@ uint8_t Tape::handlePortIn([[maybe_unused]] uint16_t port)
 
         /// region <Idle EAR level>
 
-        // No playback: the EAR input idles HIGH - the line is not driven low
-        // until the first edge of a real tape pulse arrives (on hardware the
-        // input is pulled up; UnrealSpeccy models the idle level as
-        // tape_bit() = -1, all bits set). Firmware EAR tests depend on this:
-        // the ProfROM monitor's tape-port check reads #FFBE and treats
-        // bit 6 = 0 as "no signal" (error #61), so a low idle level wedged its
-        // input polling forever. This also holds with NO tape image loaded:
-        // the monitor's boot/NMI path polls the tape port with no tape present
-        // (2026-09-10: the no-tape EAR-LOW exception kept for the z80test CRC
-        // snapshot re-wedged it; the z80test golden CRCs of the port-reading
-        // vectors were regenerated for the HIGH idle level instead).
-        // Deterministic by design - a random idle level would turn firmware
-        // timing into a lottery
-        result = 0b0100'0000;
+        // No playback: the level depends on the board. Deterministic by
+        // design - a random idle level would turn firmware timing into a lottery.
+        // - Ferranti ULA (48K / 128K / +2), issue 3: the EAR output feeds back
+        //   into the input, bit 6 follows bit 4 of the last #FE write. z80test's
+        //   hardware CRCs of the IN tests (z80full: IN A,(N) .. INDR->NOP')
+        //   are taken this way, with bit 4 = 0.
+        // - Every other board: LOW with no tape image (z80full passes as on the
+        //   48K), HIGH once an image is loaded - the line is not driven low
+        //   until the first edge of a real tape pulse arrives. No clone feeds
+        //   the output back: on the Scorpion the tape input is a self-biased
+        //   CD4069 amplifier with no pull-up, its idle level set by no part.
+        //   The ProfROM's #FFBE reads are the SMUC IDE status (bit 6 = DRDY,
+        //   error #61 = DRDY timeout), not the tape port.
+        switch (config.mem_model)
+        {
+            case MM_SPECTRUM48:
+            case MM_SPECTRUM128:
+            case MM_PLUS2:
+            case MM_NEXT:
+                result = (prevPortValue & 0b0001'0000) ? 0b0100'0000 : 0;
+                break;
+            default:
+                result = _imageLoadedPath.empty() ? 0 : 0b0100'0000;
+                break;
+        }
 
         /// endregion </Idle EAR level>
 
@@ -742,11 +791,8 @@ void Tape::handleFrameStart()
     }
 }
 
-void Tape::handleStep()
+void Tape::handleStepPlaying()
 {
-    if (!_tapeStarted)
-        return;
-
     Z80& cpu = *_context->pCore->GetZ80();
     const uint32_t tState = cpu.t;
     uint64_t clockCount = ClockCount();
@@ -1069,6 +1115,11 @@ size_t Tape::generateBitstream(TapeBlock& tapeBlock, uint32_t pilotHalfPeriod_tS
     // Signal half-periods come from the shared pure generator (tapepulsegen —
     // tape-audio-bridge design §4.3); the engine-side addition is the pause
     // hold-edge the playback cursor semantics rely on (1 ms == 3500 T-states).
+    // The edges replace any earlier ones: a block restarted at its first pulse
+    // (StartPlaybackAtCursor, from both WebAPI play and the ROM anchor at #0564)
+    // is generated again, and appending played it twice - the header replayed
+    // where LD-BYTES expected the data block
+    tapeBlock.edgePulseTimings.clear();
     uint64_t signalTotal = TapePulseGen::GenerateHalfPeriods(tapeBlock.data,
                                                              pilotHalfPeriod_tStates, synchro1_tStates, synchro2_tStates,
                                                              zeroEncodingHalfPeriod_tState, oneEncodingHalfPeriod_tStates,

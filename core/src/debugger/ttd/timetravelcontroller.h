@@ -2,10 +2,9 @@
 
 /// @file timetravelcontroller.h
 /// @brief TimeTravelController — the engine's playback controller (Phase 5, item 2): a
-/// copy of v1's TimeTravelManager that records into and restores from its own
+/// copy of v1's manager (deleted in Phase 6) that records into and restores from its own
 /// TimeTravelEngine: the engine holds the history (checkpoints, pieces, events,
-/// bus and write journals) and writes the session file; v1's page store and file
-/// format are gone (Phase 5, C1-C4). Parts of the description below are still v1's.
+/// bus and write journals) and writes the session file (Phase 5, C1-C4).
 ///
 /// Per parent TDD §7.1, §10.2. This class owns:
 ///   - The engine (TimeTravelEngine) - the history's store
@@ -34,11 +33,11 @@
 ///   - Start/Stop/Invalidate/Seek are called from the control thread while
 ///     the emulator is paused (existing pause discipline; no new concurrency).
 ///
-/// v1 simplification — never-touched handling:
+/// Never-touched handling:
 ///   The TDD §6.3 "lazy baseline upgrade" optimization (capture pre-first-
 ///   write content so never-touched-in-session pages cost zero even on
-///   extended-RAM machines) is deferred. For v1, the baseline capture at
-///   StartRecording interns every model-RAM page (cost: 128 KB – 4 MB,
+///   extended-RAM machines) is deferred. The baseline capture at
+///   StartRecording stores every model-RAM page (cost: 128 KB – 4 MB,
 ///   proportional to model RAM size, paid once per session). This is correct
 ///   and matches the design's restore semantics. The working-set-proportional
 ///   optimization can be added later as a fast path without changing the
@@ -56,16 +55,22 @@
 #include <mutex>
 #include <optional>
 #include <vector>
+#include <set>
 #include <string>
 #include <thread>
 
+#include "emulator/execution/executionarbiter.h"
 #include "emulator/platform.h"       // PlatformModulesEnum, MAX_RAM_PAGES
 #include "emulator/io/keyboard/keyboard.h"  // Keyboard::InputState (display sandbox)
+#include "emulator/io/controllers/ihapticfeed.h"  // controllers::HapticProbe (probe-frames)
 #include "common/modulelogger.h"    // ModuleLogger
 #include "debugger/ttd/timetravelhooks.h"  // ITimeTravelHooks, TTDSessionState, TTDGuardedAction
+#include "debugger/ttd/ttdcursorcell.h"   // the published cursor
 #include "debugger/ttd/timetravelengine.h"
+#include "debugger/ttd/engine/ttdbranchtable.h"
 #include "debugger/ttd/ttdsessiontypes.h"  // the session's status, results and options, shared with the controller
 #include "emulator/sound/soundmanager.h"  // SoundManager::HostOutputHold (replay hold)
+#include "emulator/video/screenmemoryspan.h"  // the picture's memory at a boundary (timeline `screen`)
 #include "ttdcheckpoint.h"
 #include "ttdexternalevents.h"
 #include "ttdfileinfo.h"
@@ -81,7 +86,14 @@
 #include "emulator/media/mediareadjournal.h"
 #include "ttdwritejournal.h"
 #include "ttdprobe.h"
+#include "ttdcausechain.h"
+#include "ttdbacktrace.h"
+#include "ttdfindevent.h"
+#include "ttdexplainframe.h"
+#include "ttddiffmoments.h"
+#include "ttdreplaycheck.h"
 #include "ttdcoverageindex.h"
+#include "ttdtimeline.h"
 #include "ttdperipheralregistry.h"
 #include "ttdportjournal.h"
 #include "ttdportsearch.h"
@@ -98,6 +110,16 @@ struct EmulatorState;
 namespace ttd { class TTDDirtyTracker; class TimeTravelEngine; }
 
 namespace ttd {
+
+/// The recording folder's free space (storage.md §4.2, S-7)
+enum class TTDDiskSpace : uint8_t
+{
+    Ok,
+    Low,    ///< under max(1 GB, 10 minutes at the measured rate): a warning, the files go on
+    Full,   ///< under kTTDDiskStopBytes: the files are finished whole, no more are written; memory records on
+};
+constexpr uint64_t kTTDDiskStopBytes = 128ull << 20;
+constexpr uint64_t kTTDDiskWarnBytes = 1ull << 30;
 
 class TimeTravelController final : public ITimeTravelHooks, public ITTDWriteSink
 {
@@ -118,6 +140,8 @@ public:
     /// Idempotent: calling while already Recording is a no-op.
     /// @return true if recording was started (or was already active).
     bool StartRecording();
+    /// Why the last StartRecording() refused (empty after a start that succeeded): the automation surfaces report it
+    const std::string& LastStartError() const { return _lastStartError; }
 
     /// @brief Make time travel unavailable for this instance, with the reason a
     /// user sees: StartRecording (and the debugger live history built on it)
@@ -135,19 +159,17 @@ public:
     /// The reason is logged and kept as TTDSessionInfo::lastDropReason.
     void InvalidateSession(const char* reason);
 
-    /// ITimeTravelHooks: a load, a configuration change and a model transfer all end
-    /// the session in v1, with the reason kept for status (Phase 5, Step 2 makes them events)
-    void OnLoad(TTDLoadKind kind, const char* reason) override;
-    bool QueueSnapshotLoad(std::function<void()> load) override;
-    void OnConfigurationChange(TTDConfigChangeKind kind, const char* reason) override;
-    void OnModelTransfer(const char* reason) override { EndSessionForMachineChange(reason); }
-    bool HasHistory() const override { return !_timeline.empty(); }
-    const TTDInputJournal& InputJournal() const override { return _inputJournal; }
+    /// ITimeTravelHooks: the session effects of the coordinator's operations (ttdsessionport.cpp)
+    void EndSession(const char* reason) override;
+    void EndSessionFor(TTDChange change, const char* reason) override;
+    bool HasHistory() const override { return !_line->timeline.empty(); }
+    const TTDInputJournal& InputJournal() const override { return _line->inputJournal; }
 
-    /// @brief Whether `action` may run now. While a user recording runs, every
-    /// TTDGuardedAction is refused - stop the recording first. A debugger's
-    /// live history (DebuggerLive) is not protected: an outside change drops it
-    /// and the debugger restarts it.
+    /// @brief Whether `action` may run now. While an explicit recording runs
+    /// (one the user started), a media change is refused - stop the recording
+    /// first. A background recording (the black box, a debugger's history) is
+    /// not protected: the change ends its session, the next one starts at once
+    /// (owner decision 2026-10-07).
     /// @return empty when allowed; otherwise the reason, one sentence a user can
     /// act on. Every automation surface shows it verbatim, and the core paths
     /// that perform the action refuse with it too.
@@ -165,26 +187,21 @@ public:
     inline bool IsRecording() const override { return _state.load(std::memory_order_acquire) == TTDSessionState::Recording; }
 
     inline TTDSessionState GetState() const override { return _state.load(std::memory_order_acquire); }
-    inline TTDRecordMode GetRecordMode() const { return _recordMode; }
-    inline bool IsDebuggerLive() const { return _recordMode == TTDRecordMode::DebuggerLive; }
+    /// The current session is a background one (the black box, a debugger's
+    /// history): it holds no lock and refuses nothing; an outside change ends it
+    inline bool IsBackgroundSession() const { return _backgroundSession; }
 
-    /// @brief Enter DebuggerLive mode (debugger session live history).
-    ///
-    /// Adopts whatever recording state exists instead of wiping:
-    ///  - already Recording (a Session-mode start hijacked by an attach):
-    ///    keep the timeline, just switch the mode flag;
-    ///  - Idle with history and no unrecorded gap: ResumeRecordingLive()
-    ///    (append after the recorded end);
-    ///  - Idle empty or gapped: fresh StartRecording-style baseline.
-    ///
-    /// @return true when recording is active in DebuggerLive mode on
-    ///         return.
-    bool BeginDebuggerLiveHistory();
+    /// @brief A debugger needs a history (DeZog, owner decision 2026-10-07): the
+    /// recording that runs is used - an explicit one stays explicit; with none,
+    /// a background recording starts (it goes on after the retained history
+    /// when it can, as a fresh session otherwise). Idempotent: called on every
+    /// resume and step. False while browsing a stopped session (Detached).
+    bool HoldBackgroundRecording();
 
-    /// @brief Leave DebuggerLive mode. Recording stops, the timeline is
-    ///        KEPT as normal Idle-with-history for the scrubber/.ttd
-    ///        flows. Idempotent (no-op when not in DebuggerLive).
-    void EndDebuggerLiveHistory();
+    /// @brief The debugger is gone: a background recording it started stops
+    /// (history kept, as for the scrubber and the .ttd flows) unless the black
+    /// box keeps it. Idempotent
+    void ReleaseBackgroundRecording();
 
     /// @brief The session summary, computed from the live session structures.
     ///
@@ -224,8 +241,14 @@ public:
     /// so the status follows a running recording instead of the last time
     /// somebody looked. Never pauses the machine.
     TTDSessionInfo ReadSessionInfo() const override;
+    /// The published cursor (TTDCursor, ttdcursorcell.h): written at every frame boundary (not by a control thread's
+    /// throwaway replays) and by every GetSessionInfo (so at the end of every operation); read lock-free
+    TTDCursor PublishedCursor() const override;
     /// D8: the recording is paused for browsing (state detached); see PauseRecordingForBrowsing
     bool IsRecordingPaused() const { return _recordingPaused; }
+    /// A start asked while the machine stood inside another CPU's run (Emulator::IsParkedInsideCardRun): the
+    /// recording begins at the next frame boundary, its baseline the frame's start (debuggers.md §7)
+    bool IsStartPending() const { return _startPending.load(std::memory_order_acquire); }
 
     /// @brief The machine's thread, about to park (pause): publish the
     /// recording's summary so status reads while paused are exact
@@ -243,13 +266,12 @@ public:
     /// checkpoint's device blobs (what the byte limit measures)
     uint64_t HistoryBytes() const;
 
-    /// Shadow mode (TTD v2 migration, Phase 1, Step 4): every capture is also
-    /// handed to @p engine - the same dirty pages, live memory, CPU and device
-    /// state - so the new engine records the running emulator next to v1 and
-    /// can be checked against it. When v1's history is cleared, loaded or cut
-    /// short, the engine starts a new session; after a restore it rescans all
-    /// pieces once. Null detaches and leaves the engine's session as it is.
-    /// Without an engine attached this costs one pointer check per frame.
+    /// Record into @p engine instead of the controller's own (the "shadow"
+    /// engine, a name from the TTD v2 migration, Phase 1, Step 4): every capture
+    /// is handed to it - the same dirty pages, live memory, CPU and device
+    /// state. When the history is cleared, loaded or cut short, the engine
+    /// starts a new session; after a restore it rescans all pieces once. Null
+    /// detaches and leaves the engine's session as it is.
     /// Tests and benchmarks only
     void SetShadowEngine(TimeTravelEngine* engine);
     /// Shadow mode (Phase 4): write the shadow engine's session as it records,
@@ -259,15 +281,21 @@ public:
     void SetShadowRecordingRoot(const std::string& root) { _shadowRecordingRoot = root; }
     /// The folder the shadow session is written to (empty when none)
     std::string ShadowRecordingFolder() const;
+    /// The folder's free space as last checked (every 25 captures and at each new file)
+    TTDDiskSpace ShadowDiskSpace() const { return _shadowDiskSpace; }
+    /// Tests: the free bytes of the folder's volume (default: std::filesystem::space)
+    void SetFreeSpaceProbeForTesting(std::function<uint64_t(const std::string&)> probe)
+    {
+        _freeSpaceProbe = std::move(probe);
+    }
     TimeTravelEngine* GetShadowEngine() const { return _shadowEngine; }
     /// The engine this controller records into and restores from (Phase 5, C1)
     TimeTravelEngine& GetEngine() { return *_engine; }
     const TimeTravelEngine& GetEngine() const { return *_engine; }
 
-    /// Phase 3 A/B: seeks restore from @p engine's checkpoints and replay its
-    /// event log and bus journals instead of v1's (null: v1's own data). The
-    /// engine must hold the same session (the shadow engine, or a v1 file fed
-    /// into one). The replay itself runs as v1's does
+    /// Seeks restore from @p engine's checkpoints and replay its event log and
+    /// bus journals (a session fed into another engine, tests). Null: the
+    /// session's own engine, the default
     void SetReplaySource(TimeTravelEngine* engine);
     TimeTravelEngine* GetReplaySource() const { return _replayEngine; }
     /// The settings and media check of the last restore from the replay
@@ -283,19 +311,23 @@ public:
     void UpdateFeatureCache() override;
     void StopForFeatureChange(const char* feature) override;
     bool LocksAcceleration() const override { return !_blackBox; }
+    std::string SpeedLock() const override;
+    bool RecordsShortcuts() const override { return true; }
     void OnAccelerationChanging(bool accelerating) override;
 
     /// @brief The black box (Phase 5, Step 3; D29): a recording that keeps the
     /// last @p minutes and never holds the machine at real speed - before an
     /// acceleration (host speed above 1x, turbo mode, turbo tape's warp) it
     /// stops, its history kept, and once nothing accelerates a new session
-    /// starts. The fast loaders' traps are recorded edits. Real-time clocks still run on emulated time. Applies to
+    /// starts. The tape trap is a recorded edit; fast disk is held (its FDC timing is no edit). Real-time clocks still run on emulated time. Applies to
     /// the next StartRecording; off: an explicit recording (the lock)
     void SetBlackBox(bool on, uint32_t minutes = 5);
     /// The recording session as a refusal names it: "#3, started at frame 1200" (the instance's recordings
     /// counted from 1). Empty while nothing records
     std::string RecordingSessionLabel() const;
     bool IsBlackBox() const { return _blackBox; }
+    /// The black box's window in minutes; a running black box keeps the new window at once
+    void SetBlackBoxMinutes(uint32_t minutes);
     /// Whether host speed or turbo mode is on now
     bool AccelerationActive() const;
 
@@ -349,16 +381,21 @@ public:
     /// loader checks (model, ROM set, recorded devices), the coverage index and
     /// the bookmarks. While recording, the engine first takes the journals of
     /// the current frame. The caller has paused the emulator.
+    /// With branches the file holds every live branch; @p lineageOnly writes the active branch's lineage alone as a
+    /// linear file (TTD branches storage.md §5): the trunk up to the first fork, each branch up to the next, the
+    /// lineage's bookmarks on the trunk, no coverage index (each branch's starts at its fork)
     /// @return false with @p err set when there is no session or a write fails
-    bool SerializeSession(std::ostream& out, std::string& err);
+    bool SerializeSession(std::ostream& out, std::string& err, bool lineageOnly = false);
 
-    /// @brief Replace the session by the one in @p in: an engine session file,
-    /// or a v1 .ttd file (read by v1's manager and converted on the way in,
-    /// until v1 files are retired). Refused, leaving the current session as it
-    /// was, when the file is unreadable, recorded on another model or ROM set,
+    /// @brief Replace the session by the one in @p in, an engine session file.
+    /// Refused, leaving the current session as it was, when the file is
+    /// unreadable or a (deleted) v1 file, recorded on another model or ROM set,
     /// or with devices this machine lacks. The session is Idle afterwards;
     /// SeekTo browses it, ResumeRecordingFrom continues it
     bool DeserializeSession(std::istream& in, std::string& err);
+    /// DeserializeSession from a file, read where the loader asks: the file is
+    /// not copied into memory first ("Cannot open file: <path>" when it cannot be opened)
+    bool DeserializeSessionFile(const std::string& path, std::string& err);
 
 private:
     /// The engine this controller records into and restores from (Phase 5, C1): created
@@ -368,10 +405,29 @@ private:
 
     /// Load @p source into a fresh engine, checked against this machine and
     /// bound to it; nothing of the current session changes
+    /// The load from any byte source (a file, memory)
+    bool DeserializeSessionFrom(const ITTDByteSource& source, std::string& err);
     std::unique_ptr<TimeTravelEngine> LoadEngineSession(const ITTDByteSource& source, TTDSessionFacts& facts,
                                                         std::vector<uint8_t>& coverage, TTDBookmarkJournal& bookmarks,
                                                         std::string& err);
-    /// Make @p loaded the session: the side table, v1's journals and indexes from it
+    /// Make @p loaded the session: the side table, the controller's journals and indexes from it
+    /// A loaded file's branches (TTD branches P2): per branch line its record, coverage and bookmarks, the
+    /// session's branch state; LoadEngineSession fills it, CommitLoadedSession builds the tree from it
+    struct LoadedBranches
+    {
+        std::map<uint32_t, std::vector<uint8_t>> records;
+        std::map<uint32_t, std::vector<uint8_t>> coverage;
+        std::map<uint32_t, std::vector<TTDBookmark>> bookmarks;
+        std::vector<uint8_t> state;
+    };
+    LoadedBranches _loadedBranches;
+    /// The loaded file's branches into the tree and their controller lines, each built by @p buildLine on its
+    /// own lineage; the saved active branch becomes the active one
+    void CommitLoadedBranches(const std::function<void(const std::vector<uint8_t>&)>& buildLine);
+    /// Save with branches: each branch's record and coverage, the session's branch state
+    void AddBranchesToSave(TTDSessionSaveParams& params);
+    /// Save the active lineage alone: the engine's lineage file, the lineage's bookmarks moved to the trunk
+    void AddLineageToSave(TTDSessionSaveParams& params);
     void CommitLoadedSession(std::unique_ptr<TimeTravelEngine> loaded, const TTDSessionFacts& facts,
                              const std::vector<uint8_t>& coverage, TTDBookmarkJournal& bookmarks);
 
@@ -463,6 +519,10 @@ public:
     ///         is not in a restorable state (Recording / Detached).
     bool RestoreCheckpointForTesting(size_t idx);
 
+    /// @brief The memory work of the last checkpoint restore: inside a KnownMemoryScope only the written and the
+    /// changed pieces are decoded
+    const TTDRestoreStats& LastMemoryRestoreStats() const { return _lastMemoryRestore; }
+
     // -----------------------------------------------------------------------
     // Silent replay mode (control thread; emulator must be paused)
     // -----------------------------------------------------------------------
@@ -523,9 +583,34 @@ public:
         TimeTravelController* _manager;
     };
 
+    /// @brief A run of replays that only the replay executes between (a verb's frame loop, a seek and its
+    /// picture): inside it a checkpoint restore trusts what the previous restore left in memory, apart from the
+    /// pieces the trackers marked since (_engineMemoryKnown). Nests; the outermost end forgets
+    class KnownMemoryScope
+    {
+    public:
+        explicit KnownMemoryScope(TimeTravelController& manager) : _manager(manager) { ++_manager._knownMemoryDepth; }
+        ~KnownMemoryScope()
+        {
+            if (--_manager._knownMemoryDepth == 0)
+                _manager._engineMemoryKnown = false;
+        }
+        KnownMemoryScope(const KnownMemoryScope&) = delete;
+        KnownMemoryScope& operator=(const KnownMemoryScope&) = delete;
+
+    private:
+        TimeTravelController& _manager;
+    };
+
     /// @brief Query the replay-mode flag. Reads `_context->ttdReplayActive`.
     /// Defined out-of-line (EmulatorContext is only forward-declared here).
     bool IsReplayActive() const override;
+
+    /// The bytes a tool edit changes in memory the CPU sees, as a replay applies the edit: a fast tape load or a
+    /// script's poke reaches memory past the bus, so the analysis replay (replaytracer.cpp) folds these as the
+    /// writes of the instruction that made the edit. Only bytes whose value changes are reported for a page image
+    using EditWriteObserver = std::function<void(uint16_t z80, uint8_t value)>;
+    void SetEditWriteObserver(EditWriteObserver observer) { _editWriteObserver = std::move(observer); }
 
     // -----------------------------------------------------------------------
     // Input journal (Phase 2 Item 3; parent TDD §5 row #1)
@@ -565,11 +650,12 @@ public:
     void RecordKeyboardReset();
 
     /// @brief Read-only access to the input journal (playback cursor, tests).
-    inline const TTDInputJournal& GetInputJournal() const { return _inputJournal; }
+    inline const TTDInputJournal& GetInputJournal() const { return _line->inputJournal; }
 
-    /// @brief Read-only access to the port-read journal (tests, status).
-    inline const TTDPortJournal& GetPortReadJournal() const { return _portReads; }
-    inline const TTDPortJournal& GetPortWriteJournal() const { return _portWrites; }
+    /// @brief The session's IN / OUT journals: the engine's bus journals, recorded straight into
+    /// (port-journals-on-engine.md)
+    inline const TTDPortJournal& GetPortReadJournal() const { return _engine->BusReads(); }
+    inline const TTDPortJournal& GetPortWriteJournal() const { return _engine->BusWrites(); }
 
     /// @brief "When did the program ..." over the port journals
     /// (ttdportsearch.h): no replay, works on loaded files. Fails with a reason
@@ -584,6 +670,11 @@ public:
     /// - the journals do not need them. Fails with a reason for an unreadable
     /// file or one without port journals
     TTDPortSearchResult SearchPortEventsInFile(const std::string& path, const TTDPortQuery& q);
+
+    /// @brief The machine at each access of `hits` (port-events' context, phase 2 D5): the registers at the M1
+    /// of the IN / OUT instruction (before it ran) and the word at SP then. Replays to each access and puts the
+    /// machine back verbatim, as ReadCpuView does; a running recording pauses for browsing. One entry per hit
+    std::vector<TTDPortContext> PortAccessContexts(const std::vector<TTDPortHit>& hits);
 
     // -----------------------------------------------------------------------
     // Input ownership: live input vs the recorded journal
@@ -635,6 +726,7 @@ public:
     /// cheap gate: EmulatorContext::kStepWorkTtdInput in stepWork): play due journal events,
     /// then apply queued live input.
     void ServiceInput() override;
+    uint32_t InputIdleLimit() const override;
 
     /// RZX playback while recording (Phase 3, Step 2): the CPU reports each
     /// RZX frame end at the end of the step that ended it (@p rzxFrame: the
@@ -704,13 +796,27 @@ public:
     /// find-last's beforeGlobalT, the journal segments and the engine's events
     /// share it. Without a session: frame x FrameSpan() + tInFrame
     uint64_t GlobalT(const TTDTimePoint& at) const;
+    /// GlobalT of a moment in @p frame, the start of the frame cached: a journaled write asks for the frame being
+    /// recorded at every store, and the frame table's lookups cost more than the record itself. The start depends
+    /// only on the frame, the table (its generation) and the frame span, so the cache is keyed by them
+    uint64_t GlobalTInFrame(uint64_t frame, uint32_t tInFrame) const;
+    struct FrameStartCache
+    {
+        uint64_t frame = UINT64_MAX;
+        uint64_t generation = 0;
+        uint32_t span = 0;
+        bool open = false;
+        uint64_t start = 0;
+        const TTDFrameTable* table = nullptr;   ///< the lineage line's table the start came from
+    };
+    mutable FrameStartCache _frameStartCache;
     /// @brief The position of machine time @p globalT (the inverse of GlobalT)
     TTDTimePoint TimePointAt(uint64_t globalT) const;
     /// @brief The first barrier in (@p from, @p to] on the engine's event log,
-    /// as a v1 marker (C3): what a replay cannot reproduce. Tape control and
+    /// as a marker (TTDExternalEvent, C3): what a replay cannot reproduce. Tape control and
     /// debugger edits with their bytes are input the replay applies, not barriers
     std::optional<TTDExternalEvent> FirstBarrierBetween(const TTDTimePoint& from, const TTDTimePoint& to) const;
-    /// @brief The engine gets what v1's journals hold since the last boundary
+    /// @brief The engine gets what the controller's journals hold since the last boundary
     /// (bus records, input, markers, facts): at a stop, and before a replay
     /// while recording
     void FlushToEngine();
@@ -723,7 +829,8 @@ public:
     /// @brief Upper bound of the recorded timeline.
     ///
     /// Returns the time of the last checkpoint. Seeks to any point > this
-    /// will fail. Returns {0,0} when the timeline is empty.
+    /// will fail. Returns {0,0} when the timeline is empty. While a recording
+    /// runs, another thread gets the end the machine's thread noted (no park)
     TTDTimePoint SessionEndPosition() const;
 
     /// @brief Where "frame N" without a T-state lands (D13): the end of frame
@@ -757,15 +864,15 @@ public:
     // External-event markers (Phase 2 Item 6; parent TDD §5.1)
     // -----------------------------------------------------------------------
     //
-    // Sources of nondeterminism that aren't covered by an input journal in
-    // v1 (tape control, disk writes, debugger-initiated state edits) get
-    // a marker on the timeline. Markers are replay barriers: SeekTo refuses
+    // Sources of nondeterminism that the input journal does not cover (tape
+    // control, disk writes, debugger-initiated state edits) get a marker on
+    // the timeline. Markers are replay barriers: SeekTo refuses
     // to cross them silently and surfaces the marker to the caller via
     // TTDSeekResult. This keeps TTD honest — it never pretends to reproduce
     // what it cannot. Journals (input today, tape/disk later) progressively
     // convert marker classes into replayable events.
     //
-    // Item 6 v1 ships the data structure, the capture API, and the
+    // Item 6 shipped the data structure, the capture API, and the
     // SeekTo barrier logic. Hook points in Tape / BetaDisk / debugger edit
     // paths land incrementally — each new hook is a one-line call to
     // RecordExternalEvent() guarded by IsRecording().
@@ -780,24 +887,33 @@ public:
     /// @param kind   Source classification (UI / automation hint).
     /// @param reason Short human-readable description. May be nullptr.
     void RecordExternalEvent(TTDExternalEventKind kind, const char* reason) override;
+    void NoteMediaChange(const char* slot, const char* what) override;
     /// The same, stamped at @p at (a tool edit's event sits where the edit began)
     void RecordExternalEventAt(TTDExternalEventKind kind, const char* reason, const TTDTimePoint& at);
 
     /// A tool's edit of the machine while recording (Emulator::EditMemoryFromTool,
     /// Phase 3): BeginToolEdit before the edit, EndToolEdit after it. The edit
-    /// is a DebuggerEdit marker for v1 (a barrier) and, with its bytes - the
+    /// is a DebuggerEdit marker in the marker journal and, with its bytes - the
     /// RAM pages and device-memory pieces written since the last checkpoint,
     /// and every device state the edit changed - an input event the engine's
     /// replay applies (no barrier)
     void BeginToolEdit() override;
     void EndToolEdit(const char* source) override;
+    /// A logic callback's writes (ScriptCallbackManager::ApplyEdits): an edit with only those bytes and, with @p cpu,
+    /// the CPU, which the engine's replay applies at the same boundary
+    bool RecordsScriptEdits() const override { return true; }
+    void RecordScriptEdit(const char* source, const std::vector<std::pair<uint16_t, uint8_t>>& pokes,
+                          bool cpu) override;
+    /// A card hook's writes (GSCardTarget): one edit of kind-10 records at the main CPU's position; the replay hands
+    /// them to the card's target a frame at a time (ServiceInput), since the card runs behind the main CPU
+    void RecordCardEdits(const char* source, const std::vector<TTDCardEdit>& edits) override;
 
-    /// The bytes of the tool edit recorded as v1 marker @p markerIndex (empty: none)
-    const std::unordered_map<size_t, std::vector<uint8_t>>& ToolEditPayloads() const { return _toolEditPayloads; }
+    /// The bytes of the tool edit recorded as marker @p markerIndex (empty: none)
+    const std::unordered_map<size_t, std::vector<uint8_t>>& ToolEditPayloads() const { return _line->toolEditPayloads; }
 
     /// @brief Read-only access to the marker journal. Used by tests, the UI,
     /// and automation surfaces that surface the marker list.
-    inline const TTDExternalEventJournal& GetExternalEvents() const { return _externalEvents; }
+    inline const TTDExternalEventJournal& GetExternalEvents() const { return _line->externalEvents; }
 
     // -----------------------------------------------------------------------
     // Seek engine — barrier-aware overload (Phase 2 Item 6)
@@ -861,6 +977,9 @@ public:
     /// ExportClip; leaves the machine displayed at the last frame visited.
     /// @return empty on success, otherwise the reason
     std::string VisitComposedFrames(uint64_t fromFrame, uint64_t toFrame, const TTDFrameVisitor& visit);
+    /// VisitComposedFrames as one operation of the session (its lock, the CPU held), for a caller outside the TTD
+    /// (capture::ExportTtdClip writes the frames as a video file)
+    std::string VisitComposedFramesAsOperation(uint64_t fromFrame, uint64_t toFrame, const TTDFrameVisitor& visit);
 
     // -----------------------------------------------------------------------
     // Agent bookmarks (TD-4; ttd-coverage-evaluation.md §TD-4)
@@ -875,8 +994,8 @@ public:
     //
     // Lifecycle mirrors the other journals: cleared on StartRecording /
     // InvalidateSession / DeserializeSession, clipped by
-    // ResumeRecordingFrom, persisted in the .ttd file as a flag-gated
-    // section (ttd::dump::kFlagsHasBookmarks).
+    // ResumeRecordingFrom, persisted in the .ttd file as the "bookmarks"
+    // holder stream (ttdcontrollersessionfile.cpp).
 
     /// @brief Add a bookmark at an explicit position.
     ///
@@ -894,8 +1013,21 @@ public:
     bool AddBookmark(const TTDTimePoint& time, const std::string& label,
                      std::string* err = nullptr);
 
+    /// @brief Add a bookmark with its note, tags and watched ranges (agent notes, 2026-11-03). With
+    /// @p captureContext the context (registers, the instruction at PC, its page, the paging latch) and the watched
+    /// bytes are taken at the bookmark's moment: the current position as the machine stands, another moment by one
+    /// silent seek with the machine put back (a live recording pauses for browsing then). A moment the replay cannot
+    /// reach leaves the context invalid and the bytes empty; the bookmark is still added. The same position checks
+    /// as above, and the bounds of ValidateBookmark.
+    bool AddAgentBookmark(TTDBookmark bookmark, bool captureContext, std::string* err);
+
+    /// @brief Change a bookmark's note, tags or label under the journal's lock (TTDBookmarkJournal::Edit).
+    bool EditBookmark(const std::string& label, const std::function<void(TTDBookmark&)>& edit, std::string* err);
+
     /// @brief All bookmarks, time-sorted (thread-safe snapshot copy).
     std::vector<TTDBookmark> GetBookmarks() const;
+    /// @brief Every bookmark of the session, on any branch (GetBookmarks lists the active lineage's: TTD branches §5.1)
+    std::vector<TTDBookmark> GetAllBookmarks() const;
 
     /// @brief Resolve a label to its bookmark. False when unknown.
     bool FindBookmark(const std::string& label, TTDBookmark& out) const;
@@ -939,8 +1071,8 @@ public:
     ///   2. SeekTo(from) — ensures the emulator is positioned at `from`.
     ///      No-op-equivalent if already there (re-restore is deterministic).
     ///   3. Release page refs for every checkpoint cp where cp.time > from.
-    ///   4. Erase those checkpoints from _timeline.
-    ///   5. _inputJournal.DropAfter(from).
+    ///   4. Erase those checkpoints from _line->timeline.
+    ///   5. _line->inputJournal.DropAfter(from).
     ///   6. _state = Recording.
     ///
     /// @param from  Position to resume from. Must be within the current
@@ -948,6 +1080,39 @@ public:
     /// @return true on success. False (with a logged warning) if state is
     ///         Idle, the timeline is empty, or `from` is out of bounds.
     bool ResumeRecordingFrom(const TTDTimePoint& from);
+
+    /// region <Branches> (docs/inprogress/2026-11-08-ttd-branches/architecture.md §4-5)
+
+    /// The session's branches: identities, metadata, the tree. The trunk alone until a resume (or an edit) in the
+    /// past keeps the old future: a fork at that moment, its branch active from then on
+    const TTDBranchTable& Branches() const { return _branches; }
+    /// The active branch: the end of the lineage shown, continued at its end
+    uint32_t ActiveBranch() const { return _tip; }
+    /// The branch the machine stands on: the active lineage's owner of the current moment
+    uint32_t ViewedBranch() const { return _viewId; }
+    /// Make @p branch active and stand at @p at on its lineage (default: its last visited moment, else its end).
+    /// A recording pauses for browsing first
+    bool SwitchBranch(uint32_t branch, const std::optional<TTDTimePoint>& at, std::string& error);
+    /// Delete @p branch and its descendants (TTDBranchTable::Delete: never the trunk or the active lineage, pinned
+    /// ones only with @p force); their history leaves memory. @p removed: the ids deleted
+    bool DeleteBranch(uint32_t branch, bool force, std::vector<uint32_t>& removed, std::string& error);
+    /// Edit @p branch's name, note, tags or pin (the table's rules: a name stays unique among the live branches)
+    bool UpdateBranch(uint32_t branch, const TTDBranchUpdate& update, std::string& error);
+    /// Who asks for the next fork and why (createdBy, run, tags, note, name; reason when empty: resume): taken by
+    /// the next fork only
+    void SetNextBranchMeta(TTDBranchMeta meta)
+    {
+        _nextBranchMeta = std::move(meta);
+        _nextBranchMetaSet = true;
+    }
+    /// The lineage spans of the active branch (trunk first)
+    std::vector<TTDLineageSpan> ActiveLineage() const { return _branches.Lineage(_tip); }
+
+    /// endregion </Branches>
+    /// The media a recording continued from @p from could not set back there (M5, F11): another medium in the
+    /// slot, or a version its undo log does not reach. One MediaVersionDiffers issue per slot, detail
+    /// "<slot>: <why>"; empty when every medium goes back. Changes nothing
+    std::vector<TTDRestoreIssue> PlanCut(const TTDTimePoint& from) const;
 
     /// @brief Resume live recording from the CURRENT position, keeping history.
     ///
@@ -1028,7 +1193,7 @@ public:
         // and pruning then deleted real search hits. Every ROM page collapses
         // into one bucket, which over-approximates — extra replays, never a
         // lost answer.
-        _coverageIndex.Record(TTDCoverageKind::Read, MakeCoverageKey(physPage, addr));
+        _line->coverageIndex.Record(TTDCoverageKind::Read, MakeCoverageKey(physPage, addr));
     }
 
     inline void RecordExecutedCoverage(PhysPage physPage, uint16_t pc)
@@ -1040,11 +1205,11 @@ public:
 
         // ROM execution is recorded under the kPhysPageNone bucket, not
         // dropped — see RecordReadCoverage for why.
-        _coverageIndex.Record(TTDCoverageKind::Executed, MakeCoverageKey(physPage, pc));
+        _line->coverageIndex.Record(TTDCoverageKind::Executed, MakeCoverageKey(physPage, pc));
     }
 
     /// @brief Read-only access to the coverage index (control thread).
-    inline const TTDCoverageIndex& GetCoverageIndex() const { return _coverageIndex; }
+    inline const TTDCoverageIndex& GetCoverageIndex() const { return _line->coverageIndex; }
 
     /// @brief Is per-frame coverage collection enabled for new sessions?
     inline bool IsCoverageIndexEnabled() const { return _enableCoverageIndex; }
@@ -1061,7 +1226,7 @@ private:
     /// and the operations built on it, StepForwardInstruction). Internal
     /// restores during search, reverse execution and frame-cache builds never
     /// reach it, so they cannot touch the display.
-    /// @param frameTarget true when the user positioned by frame number
+    /// @param frameTarget true at a frame boundary: the frame that ended there
     void PresentPosition(bool frameTarget);
 
     /// @brief Flush the video delay line and post NC_VIDEO_FRAME_REFRESH so
@@ -1081,6 +1246,10 @@ private:
     /// inside a 16 KB page. A range spanning a page boundary, or wider than a
     /// page, could match any offset, so it is left unpruned rather than
     /// approximated.
+    /// May frame `frame` hold an access q matches (CanPruneByCoverage first): the coverage keys name the byte's true
+    /// offset in its page (Memory::TtdKeyOf), so on 8K slots a query with no known half asks both halves
+    bool CoverageMayContain(TTDCoverageKind kind, uint64_t frame, const TTDSearchQuery& q) const;
+
     inline bool CanPruneByCoverage(const TTDSearchQuery& q) const
     {
         if (!_enableCoverageIndex)
@@ -1100,7 +1269,7 @@ private:
 public:
 
     void RecordMemoryWrite(uint16_t addr, uint8_t oldVal, uint8_t newVal,
-                           uint16_t m1pc, PhysPage physPage) override;
+                           uint16_t m1pc, PhysPage physPage, uint8_t flip = 0) override;
     
     /// @brief Hot-path capture: record a port OUT (used for IO probe).
     ///
@@ -1130,7 +1299,7 @@ public:
     /// address, value, PC, physical page), as the write journal recorded
     /// them. The machine is left at the frame's end.
     /// @return false when the session has no checkpoint of @p frame or none
-    ///         after it, while recording, or when a v1 marker lies in the frame
+    ///         after it, while recording, or when a barrier marker lies in the frame
     bool RegenerateFrameWrites(uint64_t frame, std::vector<TTDSearchResult>& out);
 
     /// @brief Build the write journal for a span of recorded history by
@@ -1140,8 +1309,8 @@ public:
     /// order and the frames join its segments. Slow - about 2-4 ms per frame,
     /// like RZX playback - so @p progress reports each frame and can stop
     /// the build (the frames built so far are kept). The session's last
-    /// frame (no checkpoint after it) and frames holding a v1 marker without
-    /// its data are not built. Refused while recording. The machine returns
+    /// frame (no checkpoint after it) and frames holding a marker without
+    /// its data (a barrier) are not built. Refused while recording. The machine returns
     /// to where it stood (positioned in history, as after any search).
     TTDJournalBuildResult BuildWriteJournal(uint64_t fromT, uint64_t toT,
                                             const TTDJournalBuildProgress& progress = nullptr);
@@ -1167,6 +1336,10 @@ public:
         std::optional<PhysPage> physPage = std::nullopt) const;
 
     /// @brief Scan frames in [fromFrame, toFrame] touching range (TD-7 §3.1.2).
+    ///
+    /// The list keeps the first `limit` matches in scan order: oldest first, or newest first with
+    /// `newestFirst`. With `asRanges` it holds runs of consecutive matching frames and `limit` counts runs.
+    /// The counts and first / last match cover the whole window either way.
     TTDCoverageScanResult QueryCoverageScan(
         uint64_t fromFrame,
         uint64_t toFrame,
@@ -1174,7 +1347,31 @@ public:
         uint16_t addrFrom,
         uint16_t addrTo,
         std::optional<PhysPage> physPage = std::nullopt,
+        size_t limit = 200,
+        bool newestFirst = false,
+        bool asRanges = false) const;
+
+    /// Most items a coverage scan list returns (frames or runs)
+    static constexpr size_t kCoverageScanLimitMax = 10000;
+
+    /// @brief The keys of [fromFrame, toFrame] touched in at most @p maxFrames frames, as blocks (D1 of
+    /// docs/inprogress/2026-10-28-ttd-analysis-feedback/phase-2-plan.md): one pass over the index, no replay.
+    ///
+    /// A block joins neighbouring keys of one page (executed: up to 4 bytes apart, an instruction's length;
+    /// written and read: adjacent) touched in the same frames. The range and page filter as in QueryCoverageScan.
+    /// The list keeps the first `limit` blocks, rarest first; the counts cover the whole window.
+    TTDCoverageRareResult QueryCoverageRare(
+        uint64_t fromFrame,
+        uint64_t toFrame,
+        TTDCoverageKind kind,
+        uint16_t addrFrom,
+        uint16_t addrTo,
+        std::optional<PhysPage> physPage = std::nullopt,
+        uint32_t maxFrames = 1,
         size_t limit = 200) const;
+
+    /// Most frames a key may have to count as rare
+    static constexpr uint32_t kCoverageRareMaxFrames = 1000;
 
     /// @brief Activity heatmap over [fromFrame, toFrame] (TD-7 §3.1.3).
     TTDCoverageSummaryResult QueryCoverageSummary(
@@ -1183,6 +1380,54 @@ public:
         std::optional<TTDCoverageKind> kind = std::nullopt,
         uint64_t bucketSize = 0,
         size_t limit = 100) const;
+
+    /// @brief The timeline summary (TD-5, docs/inprogress/2026-10-31-ttd-timeline-summary): per bucket of frames
+    /// the facts the session holds, and the phases they make. Reads only what the recording stores (no replay);
+    /// a fact it cannot give is named in `missing`
+    TTDTimelineResult QueryTimeline(const TTDTimelineOptions& options) const;
+
+    /// @brief The cause chain (docs/inprogress/2026-11-02-ttd-cause-chain): where the value of a memory byte or a
+    /// register at a moment came from, as a tree of links back to constants, port reads and the session's initial
+    /// memory. Replays the frames it needs with the instruction and bus hooks and puts the machine back exactly
+    /// where it stood; a live recording pauses for browsing
+    TTDCauseResult QueryCauseChain(const TTDCauseQuery& query);
+
+    /// @brief The call stack at a moment (docs/inprogress/2026-11-07-ttd-backtrace/README.md): the return addresses on
+    /// the stack above SP, innermost first, each with the CALL / RST / interrupt that pushed it and when. Each stack
+    /// word is named by its last write before the moment (the write journal, the frame's trace); the machine is put
+    /// back exactly where it stood; a live recording pauses for browsing
+    TTDBacktraceResult QueryBacktrace(const TTDBacktraceQuery& query);
+
+    /// @brief Find event (docs/inprogress/2026-11-02-ttd-find-event): the first (or last) moments in a frame window
+    /// where a described event happened - a memory value meets a condition, the screen changed as a whole, an address
+    /// ran, a port access, a border change, a key. Frames are filtered from what the session stores; only the hit
+    /// frames are replayed. The machine is put back where it stood; a live recording pauses for browsing
+    TTDFindEventResult QueryFindEvent(const TTDFindEventQuery& query);
+
+    /// @brief Explain frame (docs/inprogress/2026-11-02-ttd-explain-frame): what one frame did - its time split, the
+    /// routines by time, the interrupts, paging, ports per device, the memory changed with its writers, the screen,
+    /// the border, the keys and the markers - from one replay of the frame with the instruction and bus hooks. The
+    /// machine is put back where it stood; a live recording pauses for browsing
+    TTDExplainFrameResult QueryExplainFrame(const TTDExplainFrameQuery& query);
+
+    /// @brief What differs between two moments (docs/inprogress/2026-11-03-ttd-diff-moments/design.md): the
+    /// registers, the latches and the slot mapping, the RAM in ranges per region with the last write in between, the
+    /// screen and border, the devices, and the time, keys and markers in between. Replays to each moment and puts the
+    /// machine back where it stood.
+    TTDDiffMomentsResult QueryDiffMoments(const TTDDiffMomentsQuery& query);
+
+    /// @brief Replay check (docs/inprogress/2026-11-05-ttd-replay-check/README.md): each frame of the range replayed
+    /// from its checkpoint to its end and compared with the next checkpoint, the state the live machine had there:
+    /// the CPU, the chipset, the RAM per page, every registered device, the engine's device regions. Frames with a
+    /// barrier inside or a cut at their end are skipped and counted. The machine is put back where it stood; a live
+    /// recording pauses for browsing
+    TTDReplayCheckResult QueryReplayCheck(const TTDReplayCheckQuery& query);
+
+    /// @brief check_seeks (the replay check's README, section 3): each seek also runs the replay check of the frame
+    /// it lands in, before the picture is composed; the seek's result carries the outcome and the session info counts
+    /// checks and divergences. Off by default: a check costs a frame's replay and two state copies
+    void SetCheckSeeks(bool on) { _checkSeeks.store(on, std::memory_order_relaxed); }
+    bool GetCheckSeeks() const { return _checkSeeks.load(std::memory_order_relaxed); }
     
     /// @brief Step back one instruction (TDD §10.2 + §16 row 2).
     ///
@@ -1197,6 +1442,13 @@ public:
     /// from the current position. Returns false when at or past the session
     /// end (no further history).
     bool StepForwardInstruction();
+
+    /// @brief Step back over (the debuggers' Shift+F8): one instruction back, but when that instruction is a return
+    /// (RET, RET cc taken, RETI, RETN) that brought the stack up to where it is now, back past the whole routine to
+    /// the instruction at this stack level before it: the CALL / RST that entered it, or the instruction an interrupt
+    /// came after. The routine is found by the stack level of each instruction's start (SP), so nested calls,
+    /// interrupts inside it and recursion are passed over too. There is no reverse step out (owner 2026-11-12).
+    ttd::TTDReverseStepOverResult ReverseStepOver();
 
     // -----------------------------------------------------------------------
     // Phase 4 reverse execution (extends single-opcode step helpers with
@@ -1280,9 +1532,46 @@ public:
     /// @return See TTDReverseContinueResult.
     TTDReverseContinueResult ReverseContinue(const std::vector<uint16_t>& breakpoints);
 
+    /// @brief Every access matching @p q, newest first, back from q.beforeGlobalT (UINT64_MAX: now).
+    ///
+    /// The list mode of FindLastAccess: write-journal segments answer at once, other frames are replayed from
+    /// their checkpoints (pruned by the coverage index). With changesOnly a write counts only when it changes
+    /// the byte: the byte it replaced is the previous write to the same page and offset, or the byte at the
+    /// checkpoint the stretch starts from. The machine stays exactly where it stood.
+    TTDFindResult FindAccesses(const TTDSearchQuery& q, const TTDFindOptions& options);
+    /// FindAccesses on the line being viewed (FindAccesses walks the active lineage with it)
+    TTDFindResult FindAccessesOnLine(const TTDSearchQuery& q, const TTDFindOptions& options);
+
+    /// @brief The Z80's view of memory at @p at: @p length bytes from Z80 address @p offset and the four
+    /// windows' mapping. Replays there silently and puts the machine back exactly where it stood (like a frame
+    /// cache build). Fails on a replay barrier before the point, or a point outside the history.
+    TTDCpuView ReadCpuView(const TTDTimePoint& at, uint16_t offset, size_t length);
+
+    /// @brief ReverseContinue with bounds, a page filter and the all mode.
+    ///
+    /// Single mode: the newest hit in (fromFrame, before], the machine moved there. All mode: up to `limit` hits,
+    /// newest first; the machine is replayed from checkpoints and put back exactly where it stood.
+    TTDReverseContinueResult ReverseContinue(const TTDReverseContinueQuery& query);
+
+    /// Most hits an all-mode reverse search or find-last returns
+    static constexpr size_t kReverseHitLimitMax = 10000;
+
+    /// @brief In which frames of [fromFrame, toFrame] each of @p probes fired (feedback item 7 of
+    /// docs/inprogress/2026-10-28-ttd-analysis-feedback): the probes of a game profile (exec, read, write, port in /
+    /// out, a page, a port mask, an `if:` condition), armed as taps of the replay's own sink, so they match as they
+    /// do in real time. Each complete recorded frame of the window is replayed from its checkpoint, unless the
+    /// coverage index proves it holds no hit of a memory probe; a frame a barrier cuts is skipped and named. The
+    /// live haptics, the user's breakpoints and the deck hear nothing; the machine is put back exactly where it
+    /// stood. At most HapticFrame::kMaxProbes probes; the list keeps each probe's first @p limit frames.
+    TTDProbeFramesResult ProbeFrames(const std::vector<controllers::HapticProbe>& probes, uint64_t fromFrame,
+                                     uint64_t toFrame, size_t limit = 1000);
+
+    /// Most frames a probe-frames list returns per probe
+    static constexpr size_t kProbeFramesLimitMax = 10000;
+
     /// @brief Read-only accessor for the write journal (for serialization
     /// and tests).
-    inline const TTDWriteJournal* GetWriteJournal() const { return _writeJournal.get(); }
+    inline const TTDWriteJournal* GetWriteJournal() const { return _line->writeJournal.get(); }
 
     // -----------------------------------------------------------------------
     // Per-frame decode cache (reverse-browsing accelerator, §5 of the DeZog
@@ -1327,8 +1616,12 @@ public:
     // Test/diagnostic accessors
     // -----------------------------------------------------------------------
     
-    /// @brief Number of checkpoints currently in the timeline.
-    inline size_t GetCheckpointCount() const { return _timeline.size(); }
+    /// @brief Number of checkpoints currently in the timeline: the active lineage's (trunk first; a fork
+    /// checkpoint counted once, on the branch)
+    inline size_t GetCheckpointCount() const
+    {
+        return _tip == kTTDTrunk ? _lines.front()->timeline.size() : LineageCheckpointCount();
+    }
     
     /// @brief Earliest frame covered by the timeline (0 when empty).
     ///
@@ -1338,12 +1631,15 @@ public:
     /// to 0.
     inline uint64_t GetEarliestRecordedFrame() const
     {
-        return _timeline.empty() ? 0 : _timeline.front().time.frame;
+        return _lines.front()->timeline.empty() ? 0 : _lines.front()->timeline.front().time.frame;
     }
     
     /// @brief Read-only access to a timeline entry (bounds-checked).
     /// Returns nullptr if idx is out of range.
     const TTDCheckpoint* GetCheckpoint(size_t idx) const;
+    /// Where a checkpoint's CPU stands in machine time: its frame boundary plus
+    /// the last instruction's overshoot (a frame's writes are after it)
+    uint64_t CheckpointStartT(const TTDCheckpoint& cp) const;
 
 
     /// @brief Last capture / restore timings (benchmark harness, BM-2 / BM-6).
@@ -1354,59 +1650,25 @@ public:
     /// the hash code knowing which machine is running.
     inline const TTDPeripheralRegistry& GetPeripheralRegistry() const { return _peripherals; }
 
-    /// @brief Re-point a peripheral slot at a new object, for an owner that
-    /// replaces its own device instance at runtime.
-    ///
-    /// Currently: General Sound personality switching. SoundManager::
-    /// switchGeneralSoundCard deletes the outgoing card and installs a new
-    /// one under the same GeneralSoundCard* the SoundManager exposes.
-    /// RegisterModelPeripherals only runs at StartRecording/session load, so
-    /// a switch that happens while a recording is already active would
-    /// otherwise leave the registry holding a dangling pointer to the
-    /// just-deleted card - the next checkpoint's TTDSaveState call would be a
-    /// use-after-free. The owner calls this immediately after the swap
-    /// (whether or not TTD is currently recording - the registry array
-    /// persists after StopRecording too, ready for the next
-    /// StartRecording/seek, so a stale pointer left uncorrected here would
-    /// resurface later even outside an active recording).
-    ///
-    /// @p newId is the slot to (re-)register @p device under - the device's
-    /// own `TTDPeripheralId()`, not necessarily the slot the previous device
-    /// occupied: the GS personalities register under different ids
-    /// (GeneralSound for LLE, GeneralSoundLightweight for LW - same pattern
-    /// as the TurboSound/TSFM slot split in RegisterModelPeripherals), so a
-    /// personality switch moves the registration to a different slot rather
-    /// than reusing the old one. @p oldId, if different from @p newId, is
-    /// unregistered first - leaving it registered would keep offering a
-    /// blob-less capture for a slot nothing occupies anymore, and would leave
-    /// a stale pointer in that slot exactly as bad as the use-after-free this
-    /// method exists to prevent had @p device simply been registered under
-    /// the wrong slot instead. Pass the same value for both when the device
-    /// keeps its slot (the common case for every other peripheral type).
-    ///
-    /// A null TimeTravelController pointer (TTD unavailable) is a caller error
-    /// to guard against, not this method's job. An @p oldId with no existing
-    /// registration (e.g. no GS card was fitted at RegisterModelPeripherals
-    /// time) is harmless - Unregister on an absent id is a no-op.
-    inline void UpdatePeripheral(PeripheralId oldId, PeripheralId newId, TTDSerializable* device) override
+    /// @brief A device was swapped for another one (the General Sound card's personality switch): the registry
+    /// drops every device of @p oldType and takes @p device under its own key (the lightweight GS: marked not
+    /// recorded). Keeps the registry free of a stale pointer to the outgoing device (whether or not TTD is
+    /// recording: the registry persists for the next StartRecording / seek). See SwitchMachinePeripheral
+    inline void UpdatePeripheral(TTDDeviceType oldType, TTDSerializable* device) override
     {
-        // The outgoing device leaves its id, also when the new one takes the same id (the registry refuses a
-        // second device under a held id)
-        _peripherals.Unregister(oldId);
-        // The lightweight GS is fitted but not recorded (state registry)
-        if (newId == PeripheralId::GeneralSoundLightweight)
-            _peripherals.MarkNotRecorded(newId);
-        else
-            _peripherals.Register(newId, device, SlotCardInstance(_context, device));
+        SwitchMachinePeripheral(_context, _peripherals, oldType, device);
     }
 
     /// @brief Number of model-RAM pages (set at StartRecording from the
     /// active model's RAM size).
     inline uint16_t GetModelRamPages() const { return _modelRamPages; }
 
-    /// Devices fitted but deliberately not recorded (bit = PeripheralId): the
-    /// loaded file's when the session came from one, else the live registry's
-    uint64_t NotRecordedMask() const { return _loadedFromFile ? _loadedNotRecordedMask : _peripherals.NotRecordedMask(); }
+    /// Devices fitted but deliberately not recorded: the loaded file's when the
+    /// session came from one, else the live registry's
+    const std::vector<TTDDeviceKey>& NotRecorded() const
+    {
+        return _loadedFromFile ? _loadedNotRecorded : _peripherals.NotRecorded();
+    }
 
 private:
     // -----------------------------------------------------------------------
@@ -1421,7 +1683,7 @@ private:
     // -----------------------------------------------------------------------
 
     /// @brief Snapshot CPU + chipset + RAM pages into a fresh checkpoint at
-    /// the current frame boundary. Caller pushes it onto _timeline. False when
+    /// the current frame boundary. Caller pushes it onto _line->timeline. False when
     /// the engine (the history's store) did not take it
     bool CaptureNow(TTDCheckpoint& out);
 
@@ -1467,6 +1729,19 @@ private:
     /// @param cp Checkpoint to apply. Read-only; no refs are taken or released.
     void RestoreCheckpoint(const TTDCheckpoint& cp);
 
+    /// @brief The pieces a replay may have written since the engine last restored memory: the RAM pages and the
+    /// device pieces their trackers marked (taken and cleared), every piece of a region no tracker watches. Valid
+    /// only while _engineMemoryKnown holds
+    TTDWrittenFn TakeWrittenSinceRestore();
+    /// @brief The same marks, kept: the next TakeWrittenSinceRestore adds its own to them (a replay check reads the
+    /// frame's writes, the next restore still needs them)
+    TTDWrittenFn PeekWrittenSinceRestore();
+
+    /// @brief ReadCpuView at a checkpoint (a frame start the restore lands on) from the store: the four windows
+    /// the capture mapped, their pages decoded, the machine untouched. False where only a replay can tell (no
+    /// window map, a window outside the stored regions and ROM, a point past the checkpoint)
+    bool ReadCpuViewFromStore(const TTDTimePoint& at, uint16_t offset, size_t length, TTDCpuView& view);
+
 
     /// @brief Internal seek implementation without the Recording-state guard.
     ///
@@ -1497,6 +1772,10 @@ private:
     ///        time units (FrameSpan() = the whole frame).
     void ReplayWithinFrame(uint64_t targetFrame, uint32_t targetTInFrame);
 
+    /// The cause chain's frame trace: the frame of checkpoint @p cpIndex replayed up to @p endT with the instruction
+    /// and bus hooks (ttdcontrollercausechain.cpp). The caller saved the live machine
+    std::shared_ptr<TTDFrameTrace> TraceCauseFrame(size_t cpIndex, uint32_t endT);
+
     /// @brief Run the CPU until the current frame reaches `targetTInFrame`
     /// (TTD time units) or ends. A hardware turbo may switch on the way, so
     /// the T-state budget is re-derived after each run.
@@ -1505,8 +1784,10 @@ private:
     /// @brief Compose the picture for the current position (display rule,
     /// docs/inprogress/2026-09-28-ttd-positioning-and-display/design.md §3).
     ///
-    /// - Frame target (positioned by frame number): the frame's FINAL
-    ///   picture — its own T-states replayed from its checkpoint to its end.
+    /// - Frame target: a frame's FINAL picture — its own T-states replayed
+    ///   from its checkpoint to its end. @p frame: the frame that ended at the
+    ///   current position (a frame boundary, D13: "frame N" is {N+1, 0});
+    ///   the clip export passes the current frame instead (kCurrentFrame).
     /// - Time target (frame f, T-state T): what the beam rendered from the
     ///   start of f up to T, over frame f-1's final picture for the part not
     ///   drawn yet — exactly the framebuffer of a live machine paused there.
@@ -1516,7 +1797,9 @@ private:
     /// the composed pixels are written. Machine state is never changed.
     /// Checkpoint restores themselves never paint (ResyncScreenState), so
     /// this is the only place that decides what a TTD position shows.
-    void ComposeDisplay(bool frameTarget);
+    static constexpr uint64_t kEndedFrame = UINT64_MAX;     ///< ComposeDisplay: the frame that ended here
+    static constexpr uint64_t kCurrentFrame = UINT64_MAX - 1;   ///< ComposeDisplay: the current frame to its end
+    void ComposeDisplay(bool frameTarget, uint64_t frame = kEndedFrame);
 
     /// @brief Replay the rest of the current frame up to its end through the
     /// normal CPU/video pipeline (the frame-end processing runs, so the
@@ -1553,6 +1836,10 @@ private:
                                        uint64_t endGlobalT,
                                        std::vector<TTDM1Record>& outM1s,
                                        TTDExternalEvent* outBlockingMarkerStorage);
+    /// EnumerateM1InRange on the viewed line only (EnumerateM1InRange walks the lineage with it)
+    EnumerateResult EnumerateM1InRangeOnLine(uint64_t startGlobalT, uint64_t endGlobalT,
+                                             std::vector<TTDM1Record>& outM1s,
+                                             TTDExternalEvent* outBlockingMarkerStorage);
 
     // -----------------------------------------------------------------------
     // Internal resume helpers (Phase 2 Item 5; parent TDD §8.3)
@@ -1565,12 +1852,152 @@ private:
     /// nothing was recorded after `cut`.
     void TruncateTimelineAfter(const TTDTimePoint& from, const TTDTimePoint& cut);
 
+    /// Branches (ttdcontrollerbranches.cpp)
+    TTDBranchTable _branches;
+    uint32_t _tip = 0;      ///< the active branch
+    uint32_t _viewId = 0;   ///< the line read and written now (an ancestor's while standing in its part)
+    TTDBranchMeta _nextBranchMeta;
+    bool _nextBranchMetaSet = false;
+    /// Per branch id: where it was last visited (SwitchBranch's default)
+    std::vector<std::optional<TTDTimePoint>> _lastVisited = {std::nullopt};
+    /// The active lineage as the bookmark readers see it: a copy under its own lock, so a read while recording
+    /// does not park the machine (GetBookmarks); empty = the trunk alone
+    mutable std::mutex _lineageViewLock;
+    std::vector<TTDLineageSpan> _lineageView;
+    /// GetSessionInfo's branch list: rebuilt when the table's revision or the active branch moved
+    mutable std::shared_ptr<const TTDBranchesView> _branchesView;
+    mutable uint32_t _branchesViewTip = kTTDTrunk;
+    /// The trunk alone (a new session, a load, an invalidation): the active line's state stays the trunk's
+    void ResetBranches();
+    /// A resume at @p from (cut @p cut) on the viewed line, which has recorded history after it: a new branch
+    /// keeps that history, recording goes on the new one. False when the engine cannot fork (it truncates then)
+    bool ForkBranchAt(const TTDTimePoint& from, const TTDTimePoint& cut);
+    /// Read and write line @p id (the controller's and the engine's); the playback and journal hooks follow
+    void ViewBranch(uint32_t id);
+    /// The branch of the active lineage that owns frame @p frame (a fork's frame belongs to the branch)
+    uint32_t OwnerOnLineage(uint64_t frame) const;
+    /// The history before @p beforeT on the active lineage, newest part first (TTD branches §4.4): the line that owns
+    /// that moment viewed, then each parent before its child's first checkpoint, down to the trunk.
+    /// @p onLine(lineStartT, upToT) works on the viewed line from its start (0 for the trunk) up to upToT and returns
+    /// false to stop. Afterwards the machine reads the line that owns where it stands. Without branches: one call
+    void WalkLineageBack(uint64_t beforeT, const std::function<bool(uint64_t lineStartT, uint64_t upToT)>& onLine);
+    /// FindLastAccess on the viewed line only (FindLastAccess walks the lineage with it); *outBlocked: a barrier
+    /// stopped the walk
+    std::optional<TTDSearchResult> FindLastAccessOnLine(const TTDSearchQuery& q, uint64_t beforeGlobalT,
+                                                        TTDExternalEvent* outBlockingMarker,
+                                                        TTDSearchWindow* outWindow, bool* outBlocked);
+    /// The branch of the active lineage whose history holds @p time (the trunk without branches)
+    uint32_t BranchHolding(const TTDTimePoint& time) const;
+    /// The frame table holding @p frame on the active lineage (its owner's; the viewed line's without branches)
+    const TTDFrameTable& LineageFrames(uint64_t frame) const;
+    /// The frame table holding machine time @p t on the active lineage
+    const TTDFrameTable& LineageFramesAtT(uint64_t t) const;
+    /// Engine index of the active lineage's first checkpoint, and one past its last (the tip's)
+    size_t LineageFirstIndex() const { return _engine->LineFirstCheckpoint(kTTDTrunk); }
+    size_t LineageEndIndex() const { return _engine->LineFirstCheckpoint(_tip) + _lines[_tip]->timeline.size(); }
+    /// View the lineage line holding engine checkpoint @p index (the deepest one starting at or before it)
+    void ViewLineageIndex(size_t index);
+    /// The controller checkpoint at engine index @p index of the lineage, its line viewed; null when not held
+    const TTDCheckpoint* ViewLineageCheckpoint(size_t index);
+    /// Engine index of the lineage checkpoint at or before @p t, its line viewed; -1 before the start
+    int64_t ViewLineageIndexAtOrBefore(const TTDTimePoint& t);
+    /// Back on the line that owns where the machine stands (a query that viewed other lines leaves through it)
+    void ViewOwnerOfPosition();
+    /// The checkpoint at the start of @p frame on its lineage line; null when none starts it (no view change)
+    const TTDCheckpoint* LineageCheckpointAtFrame(uint64_t frame) const;
+    /// The coverage index holding @p frame: its lineage line's (a branch's index starts at its fork)
+    const TTDCoverageIndex& CoverageOfFrame(uint64_t frame) const;
+    /// Whether any line of the active lineage sealed a frame of @p kind
+    bool LineageHasCoverage(TTDCoverageKind kind) const;
+    /// The frames of the active lineage covered for @p kind: each line's range up to where its child forks
+    bool LineageCoveredRange(TTDCoverageKind kind, uint64_t& first, uint64_t& last) const;
+    /// The active branch recorded nothing after its fork (§4.6): one checkpoint, no input or marker of its own, its
+    /// end at the fork moment
+    bool TipIsEmpty() const;
+    /// An empty active branch goes at once, without a notice (§4.6): its parent is active again with its own end.
+    /// Called by the user's acts that leave it (a seek elsewhere, a switch); true when one went
+    bool DropEmptyTip(const TTDTimePoint& leavingTo);
+    /// Release the lines of removed branches (engine and controller), their bookmarks with them
+    void ReleaseBranchLines(const std::vector<uint32_t>& removed);
+    /// View the lineage line holding @p frame (OwnerOnLineage)
+    void ViewOwnerOfFrame(uint64_t frame);
+    /// The input events of the active lineage in time order: each line's part before the next line starts
+    std::vector<TTDInputEvent> LineageInputEvents() const;
+
+    /// A query's way out: the machine reads the line that owns where it stands again
+    struct LineageViewGuard
+    {
+        TimeTravelController& controller;
+        ~LineageViewGuard() { controller.ViewOwnerOfPosition(); }
+    };
+
+    /// The engine as a query reads it with branches: every checkpoint index of the active lineage (one engine
+    /// index space, a branch's starting at its fork checkpoint's), the line that holds an index viewed before it is
+    /// read. Without branches the calls go straight to the engine. Same names as TimeTravelEngine's
+    class LineageEngine
+    {
+    public:
+        explicit LineageEngine(TimeTravelController& c) : _c(c), _e(*c._engine) {}
+        size_t FirstCheckpoint() const { return _c.LineageFirstIndex(); }
+        size_t CheckpointCount() const { return _c.LineageEndIndex(); }
+        const TTDEngineCheckpoint* Checkpoint(size_t i) const { _c.ViewLineageIndex(i); return _e.Checkpoint(i); }
+        int64_t CheckpointIndexOf(const TTDPosition& p) const
+        {
+            _c.ViewOwnerOfFrame(p.frame);
+            return _e.CheckpointIndexOf(p);
+        }
+        uint32_t ChangeCount(size_t i, uint32_t region) const
+        {
+            _c.ViewLineageIndex(i);
+            return _e.ChangeCount(i, region);
+        }
+        std::vector<std::pair<uint32_t, TTDPieceId>> ChangesAt(size_t i, uint32_t region) const
+        {
+            _c.ViewLineageIndex(i);
+            return _e.ChangesAt(i, region);
+        }
+        TTDRestoreResult RestoreRegion(size_t i, uint32_t region, uint8_t* out,
+                                       std::vector<uint8_t>* present = nullptr) const
+        {
+            _c.ViewLineageIndex(i);
+            return _e.RestoreRegion(i, region, out, present);
+        }
+        uint32_t VersionAt(size_t i, uint32_t region, uint32_t piece) const
+        {
+            _c.ViewLineageIndex(i);
+            return _e.VersionAt(i, region, piece);
+        }
+        const std::vector<TTDScreenRange>* ScreenLayoutOf(const TTDEngineCheckpoint& cp) const
+        {
+            return _e.ScreenLayoutOf(cp);
+        }
+        const std::vector<TTDRegionDesc>& Regions() const { return _e.Regions(); }
+        const TTDPieceStore& PieceStore() const { return _e.PieceStore(); }
+
+    private:
+        TimeTravelController& _c;
+        const TimeTravelEngine& _e;
+    };
+    /// Copy the active lineage for the bookmark readers (after every change of _tip or of the tree)
+    void PublishLineage();
+    /// Whether @p bookmark lies on the active lineage: its branch owns its moment there (_lineageView)
+    bool OnActiveLineage(const TTDBookmark& bookmark) const;
+    /// GetCheckpointCount with branches
+    size_t LineageCheckpointCount() const;
+    /// Does the active lineage hold recorded history after @p cut: a later part of it (a branch after the viewed
+    /// line), a checkpoint, an input event or a marker. A resume there forks; at the end it continues (the few
+    /// T-states between a restore and where the recording stopped hold none of them)
+    bool HasHistoryAfter(const TTDTimePoint& cut) const;
+    /// Running forward through the history of an ancestor: at the frame boundary where the next branch of the
+    /// active lineage forks, the machine goes on with that branch's records. True when it moved
+    bool FollowLineageAtBoundary(uint64_t frame);
+
     /// @brief Apply the history limit: the frame window and the byte budget
-    /// drop the engine's oldest segments; _timeline and the journals follow.
+    /// drop the engine's oldest segments; _line->timeline and the journals follow.
     void EnforceHistoryLimit();
     /// @brief The engine's history policy from the limits (SetHistoryLimit)
     void ApplyHistoryPolicy();
-    /// @brief _timeline drops what the engine dropped from the front, and the
+    /// @brief _line->timeline drops what the engine dropped from the front, and the
     /// input, marker, bookmark and port journals are cut to the new start
     void SyncTimelineFront();
     /// @brief D8: a navigation while recording pauses the recording - stopped
@@ -1578,17 +2005,54 @@ private:
     /// (_pausedEnd), browsable; execution reaching that point again, or a
     /// resume there, continues it. A stop ends it
     void PauseRecordingForBrowsing();
+
+    /// The context and watched bytes of @p bookmark at its moment (AddBookmark); false when it cannot be reached
+    bool CaptureBookmarkMoment(TTDBookmark& bookmark);
     /// @brief Continue recording from the machine's present (at or after
     /// @p from), dropping what was recorded after it: the second half of
     /// ResumeRecordingFrom, after its seek; called without one at a paused end
     bool ContinueRecordingAt(const TTDTimePoint& from);
+    /// One branch's own history in the controller (docs/inprogress/2026-11-08-ttd-branches/architecture.md §5.1),
+    /// beside the engine's line of the same id: what is read and written goes through _line. A session that never
+    /// forks holds one line
+    struct ControllerLine
+    {
+        /// The recorded timeline. Appended only on the emulator thread
+        std::vector<TTDCheckpoint> timeline;
+        /// Input journal: keyboard matrix mutations captured for replay (Item 3)
+        TTDInputJournal inputJournal;
+        /// Journal playback: next event to apply while the machine executes recorded history (ArmInputPlayback)
+        size_t inputCursor = 0;
+        /// External-event journal: replay barriers for nondeterminism sources that aren't input-journaled (Item 6)
+        TTDExternalEventJournal externalEvents;
+        std::unordered_map<size_t, std::vector<uint8_t>> toolEditPayloads;   ///< marker index -> edit bytes
+        /// Per-frame coverage sets backing reverse-search frame skipping
+        TTDCoverageIndex coverageIndex;
+        /// The write journal (D40), allocated on the first StartRecording() when _enableWriteJournal is true
+        std::unique_ptr<TTDWriteJournal> writeJournal;
+        /// The write journal's segments (D40): closed spans, then the open one (to == kSegmentOpen)
+        std::vector<TTDJournalSegment> journalSegments;
+        size_t forkInputs = 0;    ///< a branch: its input events at the fork (the copied part), §4.6
+        size_t forkMarkers = 0;   ///< a branch: its markers at the fork
+    };
+    static std::vector<std::unique_ptr<ControllerLine>> MakeTrunkLine()
+    {
+        std::vector<std::unique_ptr<ControllerLine>> lines;
+        lines.push_back(std::make_unique<ControllerLine>());
+        return lines;
+    }
+    /// A line's coverage index as a holder stream's bytes (empty: nothing sealed)
+    std::vector<uint8_t> CoverageBytes(const ControllerLine& line) const;
+    /// Every line by branch id (the trunk first) and the one read and written now
+    std::vector<std::unique_ptr<ControllerLine>> _lines = MakeTrunkLine();
+    ControllerLine* _line = _lines.front().get();
+
     bool _recordingPaused = false;   ///< D8: the recording is paused for browsing
-    std::function<void()> _queuedSnapshotLoad;   ///< D10: runs at the next frame boundary while recording
-    /// D10: the boundary at the start of @p frame is a cut (a snapshot load): its checkpoint holds the loaded state
+    /// The boundary at the start of @p frame is a cut (a snapshot load recorded by an older build): its checkpoint holds the loaded state
     bool CutAtFrameStart(uint64_t frame) const;
     TTDTimePoint _pausedEnd{};       ///< where it paused
     /// @brief The engine checkpoint held at or before @p t, as an index into
-    /// _timeline (_timeline[i] is the engine's FirstCheckpoint() + i), or -1
+    /// _line->timeline (_line->timeline[i] is the engine's FirstCheckpoint() + i), or -1
     /// when the history starts after it (Phase 5, C2)
     int64_t TimelineIndexAtOrBefore(const TTDTimePoint& t) const;
 
@@ -1637,16 +2101,27 @@ private:
         TTDBankOverrides bankOverrides{};  ///< debugger-forced windows 1/2
         uint32_t        z80TInFrame = 0;   ///< z80.t (host-side, not in TTDCpuState)
         std::vector<uint8_t> ram;          ///< model RAM, _modelRamPages × 16 KB
-        /// Peripheral state, keyed by PeripheralId — same representation the
-        /// checkpoints use, produced by the same registry.
-        std::unordered_map<uint8_t, std::vector<uint8_t>> peripheralBlobs;
+        /// Every registered device's state, by registry entry (TTDPeripheralRegistry::SaveLive)
+        std::vector<std::vector<uint8_t>> deviceStates;
         size_t inputCursor = 0;            ///< journal playback cursor (ServiceInput)
         bool   inputPlaybackArmed = false;
-        /// Port-read journal mode and position (a throwaway replay moves them)
-        TTDPortJournal::Mode portReadMode = TTDPortJournal::Mode::Off;
-        uint64_t portReadCursor = 0;
-        TTDPortJournal::Mode portWriteMode = TTDPortJournal::Mode::Off;
-        uint64_t portWriteCursor = 0;
+        size_t engineEventCursor = 0;      ///< the engine's event log: a replay in between delivers its events
+        uint64_t cardEditFrame = UINT64_MAX;
+        uint64_t inputStartFrame = UINT64_MAX;
+        TTDMachineTime inputFrameStart = 0;
+        bool inputFrameKnown = false;
+        /// The replay engine's journals as the machine plays them (a machine on the recorded history after a seek
+        /// runs from them; a throwaway replay starts them elsewhere) and the hooks the CPU and the media read through
+        TTDPortJournal::Mode busReadMode = TTDPortJournal::Mode::Off;
+        uint64_t busReadCursor = 0;
+        TTDPortJournal::Mode busWriteMode = TTDPortJournal::Mode::Off;
+        uint64_t busWriteCursor = 0;
+        TTDPortJournal::Mode busVectorMode = TTDPortJournal::Mode::Off;
+        uint64_t busVectorCursor = 0;
+        TTDMediaJournal::Mode mediaReadMode = TTDMediaJournal::Mode::Off;
+        uint64_t mediaReadCursor = 0;
+        TTDPortJournal* portReadHook = nullptr;
+        TTDPortJournal* portWriteHook = nullptr;
         /// Keyboard matrix + counters: journal playback inside a sandbox
         /// replay presses/releases keys on the live device.
         Keyboard::InputState keyboard{};
@@ -1663,8 +2138,9 @@ private:
     LiveStateSnapshot _liveSnapshot;
 
     /// @brief Capture the live machine state into `out` (pure copies; no
-    /// timeline or dirty-tracker effects).
-    void SaveLiveState(LiveStateSnapshot& out);
+    /// timeline or dirty-tracker effects). Without @p withMemory the RAM, the framebuffer and plane B are left
+    /// empty (a replay check compares memory through the engine's versions; such a snapshot is not restored)
+    void SaveLiveState(LiveStateSnapshot& out, bool withMemory = true);
 
     /// @brief Restore a SaveLiveState snapshot verbatim, mirroring
     /// RestoreCheckpoint's ordering: CPU → chipset → bank rebuild → RAM →
@@ -1709,12 +2185,13 @@ private:
     ///   - parks the machine while a session is active (Recording: its thread
     ///     appends to the timeline and journals; Detached: it replays them),
     ///     and resumes it afterwards if it parked it here;
-    ///   - after a Change, the outermost operation publishes the summary.
-    /// An Idle session is not touched by a running machine, so it is not parked.
+    ///   - after a Change or a Configure, the outermost operation publishes the summary.
+    /// An Idle session is not touched by a running machine, so it is not parked - except for a Configure: the
+    /// settings it writes (the black box, a restart due) are read at every frame boundary, whatever the state.
     class SessionOperation
     {
     public:
-        enum class Kind : uint8_t { Read, Change };
+        enum class Kind : uint8_t { Read, Change, Configure };
         SessionOperation(const TimeTravelController& manager, Kind kind);
         ~SessionOperation();
         SessionOperation(const SessionOperation&) = delete;
@@ -1724,7 +2201,8 @@ private:
         const TimeTravelController& _manager;
         Kind _kind;
         bool _locked = false;
-        bool _parked = false;
+        /// The CPU held for the operation (a running machine executing an active session): execution arbiter
+        execution::HoldToken _hold;
     };
     bool OnMachineThread() const;
     mutable std::recursive_mutex _controlMutex;
@@ -1734,11 +2212,23 @@ private:
     /// recording relies on); GetSessionInfo no longer hashes the ROM per call
     uint64_t _liveRomSignature = 0;
 
-    /// Recording mode (Session vs DebuggerLive). See TTDRecordMode.
-    TTDRecordMode _recordMode = TTDRecordMode::Session;
+    bool _debuggerHold = false;        ///< HoldBackgroundRecording: a debugger wants a history
+    bool _backgroundSession = false;   ///< the session started as a background one (the black box, a debugger)
 
-    /// The recorded timeline. Appended only on the emulator thread.
-    std::vector<TTDCheckpoint> _timeline;
+    /// The timeline's end (_line->timeline.back().time) as its last change left it: SessionEndPosition answers another
+    /// thread from it while a recording runs. Reading the timeline itself needs the machine parked (it appends every
+    /// frame), and a client polling the position (a companion's live readout, 50 times a second) parked the machine
+    /// as often - every park a stall of the frame and a session publish on the machine's thread
+    mutable std::mutex _liveEndMutex;
+    TTDTimePoint _liveEnd{};
+    /// After every change of _line->timeline
+    void NoteTimelineEnd();
+    /// SessionEndPosition's answer for a caller that may read the session (the machine's thread, an operation)
+    TTDTimePoint TimelineEnd() const;
+    /// The published cursor: PublishCursor stores the live position and bounds, from where reading the session is
+    /// safe (the machine's thread at a frame boundary, GetSessionInfo)
+    mutable TTDCursorCell _cursor;
+    void PublishCursor() const;
 
     /// Model-specific peripheral serializers. The framework never names a
     /// machine: it registers whatever the active model provides (see
@@ -1753,8 +2243,8 @@ private:
     bool _shadowArmed = false;
     /// Start or stop the devices marking their memory writes for the shadow engine
     void ArmShadowRegions(bool on);
-    TTDExternalEvent _barrierScratch;   ///< EnumerateM1InRange's barrier, as a v1 marker
-    TTDV1EventCursor _shadowEvents;   ///< how far the shadow engine has v1's journals
+    TTDExternalEvent _barrierScratch;   ///< EnumerateM1InRange's barrier, as a marker
+    TTDV1EventCursor _shadowEvents;   ///< how far the shadow engine has the controller's journals
     std::vector<TTDPendingFact> _shadowFacts;   ///< the live machine's facts since the last boundary
     /// A fact at the current instant (normalized past the frame's end)
     void NoteFact(const TTDEvent& ev);
@@ -1764,9 +2254,37 @@ private:
     std::string _shadowRecordingRoot;
     std::unique_ptr<TTDRecordingFolder> _shadowFolder;
     std::unique_ptr<TTDRecordingWriter> _shadowWriter;
+    /// Branches in the folder (storage.md §4): a file holds one line; only the active one records
+    uint32_t _shadowWriterLine = 0;              ///< the engine line _shadowWriter writes
+    std::set<uint32_t> _shadowLinesWithFiles;    ///< lines with a file in the folder
+    TTDSessionSaveParams _shadowParams;          ///< the folder's files: identity, holder streams, branch records
+    bool _shadowFilesStopped = false;            ///< writing failed: no new writer until the session's next folder
+    bool _shadowDiskStop = false;                ///< the disk is full: the recording stops at the frame's end (S-7)
+    TTDDiskSpace _shadowDiskSpace = TTDDiskSpace::Ok;
+    std::function<uint64_t(const std::string&)> _freeSpaceProbe;
+    uint32_t _shadowSinceSpaceCheck = 0;
+    uint64_t _shadowClosedBytes = 0;    ///< the folder's closed files (the rate of the warning's 10 minutes)
+    uint64_t _shadowFramesWritten = 0;  ///< frames captured while the folder was written
+    /// The free space against the limits; false when writing must stop (the files are finished)
+    bool CheckShadowDiskSpace();
+    /// The writer of the active branch's files: a new branch's from its fork (its first file whole), one with
+    /// files from its next segment; false when the line cannot be written (no folder, a branch whose fork has no file)
+    bool StartLineFiles(TimeTravelEngine& engine);
+    /// The open writer finishes on its line; that line's next recording starts a segment of its own
+    void FinishLineFiles();
+    /// The branch's record for the branch table (identity, metadata, end)
+    std::vector<uint8_t> BranchRecordBytes(uint32_t id) const;
     /// The shadow session's files: finished (stop, a new session) or deleted (invalidated)
     void FinishShadowFiles();
     void DiscardShadowFiles();
+    /// A black box restarting (after an acceleration, a machine change): its
+    /// finished folder stays on disk for Load, under the crashed-recordings
+    /// rule (kept while this process runs, then 7 days); an empty one goes
+    void KeepShadowFiles();
+    /// The controller's holder streams of a session file (facts, coverage,
+    /// bookmarks) as they are now. @p declareAll: coverage too when empty (a
+    /// recording's files declare the same streams in every segment)
+    std::vector<TTDHolderStream> SessionHolderStreams(bool declareAll) const;
 
 public:
     /// Frame-boundary stream 0 of the shadow engine: width u16, height u16,
@@ -1793,31 +2311,65 @@ private:
     MediaReadAdapter _mediaReads{*this};
     /// Point the media manager at the journal the session now needs (recording, replaying, none)
     void SyncMediaReadJournal();
-    std::map<uint8_t, std::vector<uint8_t>> _toolEditBefore;   ///< device states when a tool edit began
+    /// Stop the replay engine's journals the machine plays on the recorded history (sectors, interrupt vectors, the
+    /// CPU's IN / OUT hooks): it leaves the history (a resume, a reset, a new recording)
+    void StopHistoryPlayback();
+    std::map<size_t, std::vector<uint8_t>> _toolEditBefore;   ///< device states when a tool edit began, by registry entry
     bool _toolEditOpen = false;
     TTDTimePoint _toolEditAt{};   ///< where the edit began: its event's time (a trap's instruction boundary)
     uint32_t _toolEditTt = 0;     ///< the CPU clock (Z80::tt) when it began: a trap also spends time
-    std::unordered_map<size_t, std::vector<uint8_t>> _toolEditPayloads;   ///< v1 marker index -> edit bytes
     /// Apply a tool edit's bytes (a replay crossing it)
     void ApplyToolEdit(const std::vector<uint8_t>& payload);
+    EditWriteObserver _editWriteObserver;   ///< see SetEditWriteObserver
+    /// The replay's card edits of frame @p frame to the card targets (those of an earlier frame leave). The scan
+    /// starts at the event cursor; @p fromFrameStart scans from the frame's first event instead (a restore mid-frame,
+    /// where the cursor is already past some of the frame's edits)
+    void DeliverCardEdits(uint64_t frame, bool fromFrameStart = false);
     /// The live machine's memory regions as the engine sees them: machine RAM, then each region source's
     std::vector<TTDRegionDesc> LiveRegions() const;
-    uint64_t _shadowBusReads = 0;     ///< ... and v1's port journals
     uint64_t _shadowLastStart = 0;         ///< the last captured frame's start in machine time
+    std::vector<ScreenMemorySpan> _shadowScreenSpans;   ///< the picture's memory at the boundary (reused)
+    std::vector<TTDScreenRange> _shadowScreenRanges;
     uint64_t _shadowLastBase = 0;          ///< emulatorState.t_states at that capture
     uint64_t _shadowLastLength = 0;        ///< the length of the frame before it (0: none yet)
     uint64_t _shadowRomSignature = 0;      ///< the ROM set's, hashed once per shadow session
     uint64_t _shadowMediaStamp = 0;        ///< IMediaHistory::VersionStamp at the last capture
     bool _shadowMediaKnown = false;        ///< _shadowMediaStamp is valid for this session
-    uint64_t _shadowBusWrites = 0;
     bool _shadowRescan = false;   ///< live memory may differ from the engine's delta base: hand it every piece
+    /// Live memory holds what the engine's last restore wrote, apart from the writes the trackers marked since:
+    /// set by a restore inside a KnownMemoryScope, cleared when the scope ends or anything else may write memory
+    /// (the live state put back, a tool edit). A restore then decodes only the written and changed pieces
+    bool _engineMemoryKnown = false;
+    int _knownMemoryDepth = 0;   ///< open KnownMemoryScopes
+    TTDRestoreStats _lastMemoryRestore;
+    std::vector<uint8_t> _writtenRamPages;            ///< TakeWrittenSinceRestore: per RAM page
+    std::vector<std::vector<uint8_t>> _writtenPieces; ///< TakeWrittenSinceRestore: per engine region, per piece
+    bool _writtenHeld = false;                        ///< PeekWrittenSinceRestore: the next take merges
+    std::vector<uint16_t> _writtenPages;              ///< TakeWrittenSinceRestore: the dirty tracker's pages
+    std::vector<uint32_t> _writtenScratch;
     /// Hand this capture to the shadow engine
     bool FeedShadow(const TTDCheckpoint& out, bool baseline);
-    /// The capture's device states (CaptureNow -> FeedShadow): the ids with a
-    /// state, and the region sources' states without their memory
-    std::vector<uint8_t> _capturedDevices;
-    std::vector<std::pair<uint8_t, std::vector<uint8_t>>> _withoutRegions;
-    /// The shadow engine's history no longer matches v1's: it starts over at the next capture
+    /// Per registry entry: its index in the shadow engine's device table, -1 when it has none (no state). The
+    /// table entry bound to the same live device (a session loaded from a file names its devices as the file does),
+    /// else the one of the same key. Mapped at every capture: a table and the registry are a few dozen entries
+    std::vector<int32_t> _shadowEntryDevice;
+    void MapShadowEntries()
+    {
+        const std::vector<TTDRegistryEntry>& entries = _peripherals.Entries();
+        _shadowEntryDevice.assign(entries.size(), -1);
+        if (!_shadowEngine || !_shadowEngine->IsSessionOpen())
+            return;
+        const std::vector<TTDDeviceEntry>& table = _shadowEngine->Devices().Entries();
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            for (size_t k = 0; k < table.size() && _shadowEntryDevice[i] < 0; ++k)
+                if (table[k].device != nullptr && table[k].device == entries[i].device)
+                    _shadowEntryDevice[i] = static_cast<int32_t>(k);
+            if (_shadowEntryDevice[i] < 0)
+                _shadowEntryDevice[i] = _shadowEngine->DeviceIndex(entries[i].key);
+        }
+    }
+    /// The shadow engine's history no longer matches the timeline's: it starts over at the next capture
     void ResetShadow();
     TTDPeripheralRegistry _peripherals;
 
@@ -1846,7 +2398,7 @@ private:
     std::atomic<uint64_t> _historyLimitFrames{0};
     std::atomic<uint64_t> _historyLimitBytes{0};
     uint64_t _evictedCheckpoints = 0;   ///< released by the limit in this session
-    uint64_t _blobBytes = 0;            ///< device blob bytes of every checkpoint in _timeline (kept with it)
+    uint64_t _blobBytes = 0;            ///< device blob bytes of every checkpoint in _line->timeline (kept with it)
     static uint64_t BlobBytes(const TTDCheckpoint& cp);
 
 
@@ -1878,31 +2430,28 @@ private:
     uint64_t    _capturedAtUnixMs = 0;
     uint8_t     _sessionModelId = 0;
     uint64_t    _loadedRomSignature = 0;  ///< The loaded file's rom_signature
-    uint64_t    _loadedNotRecordedMask = 0;  ///< The loaded file's not-recorded mask (kFlagsHasNotRecordedMask)
+    std::vector<TTDDeviceKey> _loadedNotRecorded;   ///< The loaded file's devices fitted but not recorded
     std::string _loadedRecordedBy;        ///< The loaded file's emulator_id
 
-    /// Per-frame coverage sets backing reverse-search frame skipping.
-    TTDCoverageIndex _coverageIndex;
     bool _enableCoverageIndex = true;
 
 
     /// Reusable scratch buffer for CollectAndClear (avoids per-frame alloc).
     std::vector<uint16_t> _dirtyScratch;
 
-    /// Input journal — keyboard matrix mutations captured for replay (Item 3).
-    /// Dropped on InvalidateSession/StartRecording; truncated by Item 5
-    /// Resume-from-past.
-    TTDInputJournal _inputJournal;
 
-    /// Journal playback: next event to apply while the machine executes
-    /// recorded history (armed by a navigation restore, see ArmInputPlayback)
-    size_t _inputCursor = 0;
     size_t _engineEventCursor = 0;          ///< the replay engine's event log (SetReplaySource)
+    uint64_t _cardEditFrame = UINT64_MAX;    ///< the frame whose card edits the card targets hold (replay)
     uint64_t _replayRomSignature = 0;       ///< this machine's ROM set (SetReplaySource)
     TTDRestoreResult _lastEngineCheck;      ///< LastEngineCheck
     /// Settings and media of the replay engine's checkpoint @p index against
     /// this machine (into _lastEngineCheck)
     void CheckEngineCheckpoint(size_t index, bool forReplay);
+    /// Every medium to its version at the replay engine's checkpoint @p index
+    /// (the restore, before the devices load); what could not be set goes
+    /// into _mediaIssues
+    void SetMediaToCheckpoint(size_t index);
+    std::vector<TTDRestoreIssue> _mediaIssues;  ///< SetMediaToCheckpoint's, for the replay's check
     TimeTravelEngine* _replayEngine = nullptr;
     bool _inputPlaybackArmed = false;
 
@@ -1920,6 +2469,13 @@ private:
     };
     std::vector<PendingInput> _pendingInput;
     std::vector<std::function<void()>> _pendingTasks;
+    /// Either queue holds something; written under _pendingInputMutex, read without it by the per-instruction
+    /// ServiceInput, which takes the mutex only when it is set
+    std::atomic<bool> _pendingQueued{false};
+    /// The replay engine's start of the frame playback last looked up (one lookup a frame, not an instruction)
+    uint64_t _inputStartFrame = UINT64_MAX;
+    TTDMachineTime _inputFrameStart = 0;
+    bool _inputFrameKnown = false;
 
     /// Position the playback cursor at the restored machine time (events
     /// journaled at exactly that time are applied by the next instruction)
@@ -1942,55 +2498,49 @@ private:
     /// reverse queries) - not the capture/restore self-test
     void RestoreCheckpointForReplay(const TTDCheckpoint& cp);
 
-    /// Port-read journal of the session (ttd-port-read-journal.md) and whether
-    /// it holds every IN of the history (_portJournalOffReason says why not)
-    TTDPortJournal _portReads{TTDPortJournal::Direction::Read};
-    TTDPortJournal _portWrites{TTDPortJournal::Direction::Write};
+    /// The engine's bus journals hold every IN / OUT of the session: recorded
+    /// on every machine from the baseline on (the CPU's hooks write into them,
+    /// port-journals-on-engine.md); false after a gap (DropPortJournal, the
+    /// reason in _portJournalOffReason) or for a loaded session without them.
+    /// _portJournalValid is the same flag as the session file and status name it
     bool _portJournalValid = false;
-    /// The journals hold every IN / OUT of the session (always while
-    /// recording, Phase 3): the engine's bus data. _portJournalValid adds
-    /// that v1's own replay may play them (its machine gate)
     bool _portJournalRecorded = false;
     std::string _portJournalOffReason;
-
-    /// Why the current configuration cannot record an isolating port-read
-    /// journal; nullptr when it can
-    const char* PortJournalUnsupportedReason() const;
     /// Give up the journal for this session (a gap in it): replay falls back
     /// to the live devices
     void DropPortJournal(const char* reason);
-    /// Point EmulatorContext::ttdPortReads / ttdPortWrites at the journals while they record
-    /// or plays, null otherwise
+    /// Point EmulatorContext::ttdPortReads / ttdPortWrites at the recording engine's bus journals
+    /// while recording, null otherwise (a replay points them at the replay engine's: RestoreCheckpointForReplay)
     void SyncPortJournalHook();
+    /// The recording engine's bus journals back to recording at their ends (after a pause, a replay, a resume)
+    void ResumeBusRecording();
+    /// The recording engine's bus journals stop recording (a stop, a gap)
+    void StopBusRecording();
 
-    /// External-event journal — replay barriers for nondeterminism sources
-    /// that aren't input-journaled in v1 (Item 6). Same lifecycle as the
-    /// input journal: dropped on Invalidate/Start, truncated by Resume.
-    TTDExternalEventJournal _externalEvents;
 
     /// Advisory bookmarks (TD-4) — named annotations BESIDE the barrier
     /// journal above, never inside it. Same lifecycle: dropped on
     /// Invalidate/Start, truncated by Resume, persisted in the .ttd file.
     TTDBookmarkJournal _bookmarks;
 
-    /// Write journal — fast-path accelerator for FindLastAccess (Phase 4;
-    /// parent TDD §9.3). 64 MB ring of 12-byte TTDWriteRecords (~5.5M records,
-    /// ~50 sec at max intensity). Appended from MemoryWriteDebug / DecodePortOut
-    /// hooks. Same lifecycle as other journals: dropped on Invalidate/Start.
-    /// Lazily allocated on first StartRecording() when _enableWriteJournal is true.
-    std::unique_ptr<TTDWriteJournal> _writeJournal;
 
     /// Whether to capture write journal entries. When false, journal is empty
     /// and reverse-watchpoint queries fall back to checkpoint replay.
     /// Set via SetEnableWriteJournal() before StartRecording().
 
     bool _enableWriteJournal = false;   ///< D40: the journal is recorded on demand
+    std::atomic<bool> _checkSeeks{false};  ///< SetCheckSeeks
+    uint64_t _seekChecks = 0;
+    uint64_t _seekCheckDivergences = 0;
+    std::string _lastSeekDivergence;
+    /// check_seeks: the replay check of the frame a seek landed in, into the seek's result and the counters
+    void CheckSeekLanding(TTDSeekResult& result);
+    /// The live ring holds one frame's writes: it is drained into the engine at
+    /// each capture and cleared, its memory committed in chunks as it fills.
+    /// This is the most one frame may write before the oldest records are lost
     static constexpr size_t kDefaultWriteJournalBytes = 64u * 1024 * 1024;
     size_t _writeJournalBytes = kDefaultWriteJournalBytes;   ///< SetWriteJournalCapacity
 
-    /// The write journal's segments (D40): closed spans, then the open one
-    /// (to == kSegmentOpen) while writes reach the journal
-    std::vector<TTDJournalSegment> _journalSegments;
     std::atomic<bool> _journalBuildActive{false};
     std::atomic<bool> _journalBuildCancel{false};
     std::atomic<uint64_t> _journalBuildDone{0};
@@ -2007,15 +2557,13 @@ private:
     /// The segments as they stand: the open one ends at the current position,
     /// and the ring's evicted records are no longer covered
     std::vector<TTDJournalSegment> JournalSegments() const;
-    /// Where a checkpoint's CPU stands in machine time: its frame boundary plus
-    /// the last instruction's overshoot (a frame's writes are after it)
-    uint64_t CheckpointStartT(const TTDCheckpoint& cp) const;
     /// One segment from the session's first checkpoint to its last
     bool JournalCoversSession(const std::vector<TTDJournalSegment>& segments) const;
     /// See TTDSessionInfo::lastDropReason
     std::string _lastDropReason;
     /// See TTDSessionInfo::lastStopReason
     std::string _lastStopReason;
+    std::string _lastStartError;   ///< LastStartError()
     std::string _unavailableReason;    // see SetUnavailableReason
     /// Position at StopRecording, to tell whether the machine ran before a live resume
     uint64_t _recordingStoppedAtT = 0;
@@ -2031,13 +2579,13 @@ private:
 
     /// True while inside EnterReplayMode / ExitReplayMode, so nested calls are safe
     bool _inReplayMode = false;
+    /// A probe-frames query runs: the replay steps with the instruction-start check, so its exec taps are told
+    bool _replayTaps = false;
 
     /// The host audio hold of the replay (reason TtdReplay): taken by EnterReplayMode after the replay flag is
     /// set, released by ExitReplayMode before it clears it (and with the manager). Replay runs as fast as the
     /// host goes; the user's master mute is never touched
     SoundManager::HostOutputHold _replayHostHold;
-    /// Z80 debug mode before replay engaged the debug memory path (restored on exit)
-    bool _debugModeBeforeReplay = false;
 
     // -----------------------------------------------------------------------
     // Auto-pause at session end (Detached state)
@@ -2091,7 +2639,9 @@ private:
 
     bool _recordingLockEngaged = false;
     uint8_t _savedHostSpeedMultiplier = 1;  // restored on release
-    bool _accelerationLocked = false;       // this session's lock covers acceleration (not a black box)
+    bool _accelerationLocked = false;       // this session's lock covers acceleration (not a background one)
+    /// A new session now would be a background one: the black box is on, or a debugger holds a history
+    bool BackgroundWanted() const { return _blackBox || _debuggerHold; }
     bool _blackBox = false;                 // SetBlackBox
     uint32_t _recordingNumber = 0;          // recordings this instance started (RecordingSessionLabel)
     /// DeZog-forced RAM windows 1/2 (no latch describes them): beside each checkpoint, re-applied after the banks
@@ -2099,7 +2649,14 @@ private:
     void ApplyBankOverrides(const TTDBankOverrides& in);
     uint32_t _blackBoxMinutes = 5;
     bool _blackBoxSuspended = false;        // stopped for an acceleration; starts again after it
-    bool _blackBoxRestart = false;          // a machine change ended it: a new session at the next frame boundary
+    std::atomic<bool> _startPending{false};  // StartRecording inside a card's run: the machine starts it at the next boundary
+    bool _restartPending = false;           // the session ended (reset, snapshot load, machine change): a new one at the next frame boundary
+    /// The one rule (D42): the recording session ends, @p keepHistory = the machine is still the one the history belongs to.
+    /// A new session starts at the next frame boundary for a black box, or when the `ttdrestart` feature is on
+    void EndSessionImpl(const char* reason, bool keepHistory);
+    bool RestartFeatureOn() const;
+    /// The black box's window in frames (its minutes at the model's frame length)
+    uint64_t BlackBoxFrames() const;
     /// A change of the machine itself (ROM reload, model transfer, General Sound card, slots) ends the session:
     /// the recording stops, its history goes; a black box starts a new session on the changed machine
     void EndSessionForMachineChange(const char* reason);

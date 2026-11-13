@@ -31,6 +31,27 @@ drive restrictions, pause races).
   a file that exists on the *agent's* machine (embedded content).
 - Test artifacts (`.trd`, `.tap`, `.sna`, traces, `.ttd` dumps) belong in
   `scratch/` — never in the project root.
+- **Automation sessions.** For a long automated job, take run control first: MCP
+  `control_execution {"action":"take_control","client":"<your name>"}`, WebAPI
+  `POST $BASE/emulator/$EMU_ID/control/session` (then the returned id in the
+  `X-Unreal-Session` header), CLI `session take <name>`, Lua / Python
+  `take_control("<name>")`. The user sees it in the GUI and can **take control
+  back**. A client that changes the machine without one gets a session
+  implicitly (the automation gate): the reply says so (`automation_session`, the
+  `X-Unreal-Session*` headers, an MCP note) and advises taking it explicitly. An
+  explicit take takes over another client's implicit session (never an explicit
+  one); a refusal `held_by_other` names the holder and how to resolve it, and a
+  release without the id ends your own implicit session
+  ([transports](_common/transports.md)). If the user takes control back, the
+  session's calls answer `revoked_by_user` (WebAPI 409,
+  `retry: false`; Python `ControlRevoked`). **Stop. Do not retry, do not take
+  control again by yourself - ask the user.** A re-take by the same client is
+  refused (`revoked_cooldown`) until the user allows it.
+- **Companion clients are the user, not you.** A device the user paired at the
+  GUI (`companion_manage list`) acts as the user's hands: its changes open no
+  session. An agent never acts as one, never asks to pair, and revokes one only
+  when the user asks. A companion may take control back from your session, as
+  the GUI can: you then get `revoked_by_user` as above.
 
 ## Picking recipes for a task (read this before the index)
 
@@ -56,15 +77,26 @@ matches; it names the recipe(s) for that action.
 | First call of the session / no instance yet | [_common/setup.md](_common/setup.md) | everything else until the instance exists |
 | Loading a disk/tape/snapshot | the matching [media/](media/) file for that format | the other media files |
 | Making loaded software actually run (autostart/`RUN`/tape play) | the matching [run/](run/) file for the load path you used | machines/peripherals, unless the model itself matters |
+| Reverse engineering a game into a reviewed disassembly (capture, coverage, review queue, experiments, export, rebuild gates, score) | [analysis/reverse-engineering.md](analysis/reverse-engineering.md) | the other analysis recipes until a sheet asks for more |
 | Recording/replaying/seeking machine state | [analysis/ttd-recording.md](analysis/ttd-recording.md) (+ [ttd-reverse-debugging.md](analysis/ttd-reverse-debugging.md) for `find-last`/`reverse-continue`) | port-trace, memory-counters |
 | Typing, key presses, key combos, macros, the host-keyboard gate | [input/keyboard.md](input/keyboard.md) | joystick, mouse |
 | Pressing joystick buttons / checking what the guest reads at `IN #1F` | [input/joystick.md](input/joystick.md) | everything else |
-| Moving the mouse, clicking, the wheel / checking what the guest reads at `#FADF` / `#FBDF` / `#FFDF` | [input/keyboard.md](input/keyboard.md) | Keyboard injection: tap / type / press / release / combo / macro / abort, timing in frames, key names, the host-keyboard route gate, ZX-Evo PS/2 and the ATM2 controller path |
-| [input/mouse.md](input/mouse.md) | everything else |
+| Moving the mouse, clicking, the wheel / checking what the guest reads at `#FADF` / `#FBDF` / `#FFDF` | [input/mouse.md](input/mouse.md) | keyboard, joystick |
+| Making a game's controller vibrate on its events: finding the trigger code, writing and testing its profile | [input/game-haptics.md](input/game-haptics.md) (+ [code-coverage-and-analyzers.md](analysis/code-coverage-and-analyzers.md)) | keyboard, joystick, mouse |
 | Breakpoints, stepping, being told about pauses (WebSocket events) | [analysis/breakpoints-and-events.md](analysis/breakpoints-and-events.md) | ttd-* |
+| Stop only when an expression holds (`A == 7`, `VAL == 0`, the border turning red) | [analysis/conditional-breakpoints.md](analysis/conditional-breakpoints.md) | breakpoints-and-events |
+| [analysis/script-callbacks.md](analysis/script-callbacks.md) | Script callbacks: `on_tap` / `on_breakpoint` / `on_game_event` in Lua and Python, the hit snapshot, `callbacks()` statistics, the budget and the suspend / disable / ignore policies |
+| Run a Lua / Python function on every hit of a tap, a breakpoint stop or a game event, without stopping | [analysis/script-callbacks.md](analysis/script-callbacks.md) | conditional-breakpoints |
+| How a running program keeps its state: its buffers, pointers, flags and the code that changes them | [articles/program-state-reverse.md](articles/program-state-reverse.md) | trying keys and diffing screenshots |
+| Reverse-engineering a whole program into annotated sources that rebuild byte for byte (coverage, code/data split, naming, relocation proof, SkoolKit / zx-reaper interop) | [articles/game-reverse-pipeline.md](articles/game-reverse-pipeline.md) | reading the code to answer what a run can show |
+| A game reversed into a case (sjasmplus sources bit for bit, editable resources, documents, routine animations, code vs screen) over MCP, with each question's cheapest call | [articles/game-reverse-case.md](articles/game-reverse-case.md) | an MCP call per frame where a script or an access trace answers |
+| Waiting until something happens (PC, a write, a port, a prompt on screen) instead of `sleep`; who writes an address | [analysis/waiting-and-watching.md](analysis/waiting-and-watching.md) | profilers |
 | Running to a scanline / pixel / interrupt, frame and T-state stepping, step over / out | [analysis/execution-control-and-stepping.md](analysis/execution-control-and-stepping.md) | ttd-*, profilers |
 | Who calls a routine, hot opcodes, per-frame cost | [analysis/calltrace-and-opcode-profiler.md](analysis/calltrace-and-opcode-profiler.md) | port-trace |
 | Labels, symbols, sjasmplus listings, stepping by source line, assembling | [analysis/symbols-listings-and-source-stepping.md](analysis/symbols-listings-and-source-stepping.md) | everything else |
+| Symbol files in every format (import / export / detect), symbol sets and priorities | [analysis/symbols-import-export.md](analysis/symbols-import-export.md) | everything else |
+| Assembler sources: the files of a disk with their formats, decode, encode (onto the disk too), convert to sjasmplus / pasmo / z88dk | [analysis/asm-sources.md](analysis/asm-sources.md) | everything else |
+| Running a Spectrum assembler (TASM, ALASM, STORM, ZX-ASM, GENS, MASM, ZEUS, XAS, PROMETHEUS, Laser Genius, Power Assembler, Primus; the PC cross assembler ASM80) in the machine; its sources, code and labels to and from the host | [assemblers/README.md](assemblers/README.md), then the one assembler's recipe | the other assemblers' recipes |
 | Which code ran / never ran, TR-DOS analyzer events | [analysis/code-coverage-and-analyzers.md](analysis/code-coverage-and-analyzers.md) | port-trace |
 | Searching, mapping or writing memory; named regions; ROM protect; writing a port (paging) | [analysis/memory-search-map-and-regions.md](analysis/memory-search-map-and-regions.md) | memory-counters unless you need access counts |
 | A debugger front end's redraw in one call; raw (binary) memory dumps | [analysis/debugger-snapshot.md](analysis/debugger-snapshot.md) | separate /registers + /disasm + /memory calls per redraw |
@@ -72,15 +104,21 @@ matches; it names the recipe(s) for that action.
 | Reading raw sectors, tracks, catalog of a loaded disk | [media/disk-sector-and-catalog-inspection.md](media/disk-sector-and-catalog-inspection.md) | tape, snapshot |
 | Per-device volume, mute, solo, recording a sound source | [peripherals/audio-mixer-and-capture.md](peripherals/audio-mixer-and-capture.md) | the card recipes unless the card matters |
 | Watching port I/O | [analysis/port-trace.md](analysis/port-trace.md) | ttd-*, memory-counters |
-| Capturing the VDAC2 card's FT812 bus (an .evr replay stream) | [machines/tsconf-vdac2.md](machines/tsconf-vdac2.md) | port-trace |
-| Counting/mapping memory access | [analysis/execution-control-and-stepping.md](analysis/execution-control-and-stepping.md) | Pause / resume / reset / NMI, step / steps / step over / out, run frames / T-states / scanlines, run to scanline / pixel / interrupt, skip until, beam position |
-| [analysis/calltrace-and-opcode-profiler.md](analysis/calltrace-and-opcode-profiler.md) | Call-trace, opcode and memory profilers, frame cost: start, run, read, stop; which one answers which question |
-| [analysis/symbols-listings-and-source-stepping.md](analysis/symbols-listings-and-source-stepping.md) | Labels and symbols, sjasmplus listings, step / run to a source line, assemble into memory |
-| [analysis/code-coverage-and-analyzers.md](analysis/code-coverage-and-analyzers.md) | Code coverage and its gaps, the analyzer framework (TR-DOS events, raw FDC), coverage over a TTD timeline |
-| [analysis/memory-search-map-and-regions.md](analysis/memory-search-map-and-regions.md) | Memory find / map / info, named regions, write, ROM protect, paging state, a port write through the decoder (`ports/out`), disasm pages |
-| [analysis/debugger-snapshot.md](analysis/debugger-snapshot.md) | `GET /debug/snapshot` (registers, prev_regs, pages, stack, time, code, memory at one moment, `seq`), `format=binary` memory reads, `mem_read_bytes`, `memory save` windows |
-| [analysis/memory-counters.md](analysis/memory-counters.md) | port-trace, ttd-* |
+| SD / SPI bus traffic, driver races, a driver that fails on real cards | [analysis/bus-analyzer.md](analysis/bus-analyzer.md) (+ [sd-driver-debugging.md](analysis/sd-driver-debugging.md) for the whole driver workflow) | port-trace (bytes only) |
+| Capturing the VDAC2 card's FT812 bus (an .evr replay stream) | [machines/next.md](machines/next.md) | ZX Spectrum Next: create on a card, drive NextZXOS's menu and Browser, the debugger reports (`next_dma`, `next_video`, `next_palette`, `next_ports`, `next_nextreg` and the NextREG write), the NextREG write journal (who wrote which register - the NEXTREG instruction and the copper make no port cycle), how NextZXOS starts a snapshot (Multiface NMI, stackless NMI, RETN to a ROM `RET`), the real-board test programs, which layer draws a pixel (the per-layer capture of a frame and the pixel inspector: why a tile or a sprite does not show) |
+| [machines/tsconf-vdac2.md](machines/tsconf-vdac2.md) | port-trace |
+| Counting/mapping memory access | [analysis/memory-counters.md](analysis/memory-counters.md) | port-trace, ttd-* |
+| Starting a game from its title screen (which keys / joystick) | [analysis/game-start-input.md](analysis/game-start-input.md) | memory-counters, port-trace, input/joystick |
+| Building, installing or driving Unreal NG on a Steam Deck (the bundle, Game Mode, the Steam library, a Stream Deck on its USB-C, screenshots with gamescopectl) | [testing/steamdeck.md](testing/steamdeck.md) | everything else |
+| Finding where the emulator itself (the host process) spends its CPU time | [testing/host-profiling.md](testing/host-profiling.md) | analysis/* (they profile the guest) |
+| Which video mode a machine is in, putting it into another, finding where frame / window / tile / recording disagree | [testing/steamdeck.md](testing/steamdeck.md) | Unreal NG on a Steam Deck: build the bundle, install or update it, start it in Game Mode through Steam, screenshots of the composed screen, a Stream Deck on the Deck's USB-C, logs |
+| [testing/video-modes.md](testing/video-modes.md) | media/agent-screenshot-view.md (it only shows a frame) |
+| A Sprinter boot straight into a program (tests, benchmarks, a GUI session) | [media/sprinter-test-images.md](media/sprinter-test-images.md) | demo-runner, Flex Navigator walking |
+| Showing the border in the window ("режим с бордюром"), overscan and its crops (full / horizontally centred) | [media/window-view-border.md](media/window-view-border.md) | crt-effects.md |
 | Recording a video (with sound) of a run | [media/video-recording.md](media/video-recording.md) | everything else |
+| A demo video of the GUI window (CRT effects, on-screen keyboard), every frame, 4K for YouTube | [media/window-recording.md](media/window-recording.md) | video-recording.md (the emulated frame only) |
+| [media/window-view-border.md](media/window-view-border.md) | Show the border or not: the window view (`full` / `screen` / `content`, `PUT /video/window`); the overscan (Pentagon only, for now) on / off (`PUT /state/screen/overscan`) and its crops (`full`, `symmetric` = horizontally centred, `standard`, `screen_only`); a handheld start shows `content` |
+| Smooth motion, VRR or the refresh grid, the display rate switch; the presenter's report (late presents, timing error, GPU time per pass) and its `video.present` topic | [media/frame-presenter.md](media/frame-presenter.md) | crt-effects.md (the picture's effects, not its timing) |
 | Debugging a visual/screen bug | [analysis/ttd-visual-inspection.md](analysis/ttd-visual-inspection.md) + [media/agent-screenshot-view.md](media/agent-screenshot-view.md) | everything else until you have a reproducible frame |
 | Detecting a custom loader / triaging a hang | [analysis/nonstandard-loader.md](analysis/nonstandard-loader.md) | port-trace (it's composed in already) |
 | A full multi-step investigation (memory corruption, boot verification, disk protection) | check [articles/](articles/) first — it may already compose the recipes you'd otherwise assemble by hand | the individual recipes it cites; open those only if the article sends you there |
@@ -105,16 +143,21 @@ call.
 | Recipe | What it covers |
 |:--|:--|
 | [media/use-media-slots.md](media/use-media-slots.md) | Every media slot (floppy drives, SD card): list, insert a file or a **host folder**, `auto` slot choice, swap multi-disk software with save/export/discard, export the guest's writes |
+| [media/compose-media.md](media/compose-media.md) | Composite media (`*.ucompose.yaml`): one disk, card or CD from FAT images, folders and ISOs; graft vs rebuild, partitions, `layers`, `changes`, and keeping the guest's writes (delta, flat image, commit into the base, write-back into folders) |
 | [media/cd-audio.md](media/cd-audio.md) | CD audio in the ATAPI CD drive: CUE/BIN and CD CHD discs with audio tracks, play / pause / stop a track, the head (LBA, MSF, track, index), page 0Eh volume, the drive's mixer row; which machines have a CD drive |
-| [media/insert-disk.md](media/insert-disk.md) | Insert/eject disk images (`.trd .scl .fdi .udi .dsk .td0 .mgt .img .ima .hfe .scp`, Hobeta), drives A-D, which formats upload by bytes, blank disks, catalog/sysinfo inspection, Sprinter 1.44 MB floppies and the density latch |
+| [media/insert-disk.md](media/insert-disk.md) | Insert/eject disk images (`.trd .scl .fdi .udi .dsk .td0 .mgt .img .ima .mb2 .mbd .d40 .d80 .pro .hfe .scp`, Hobeta), drives A-D, which formats upload by bytes, blank disks, catalog/sysinfo inspection, Sprinter 1.44 MB floppies and the density latch |
 | [media/insert-tape.md](media/insert-tape.md) | Load/eject tapes (`.tap/.tzx`), play/pause/seek/rewind, block catalog, fast-load plan, WAV import |
-| [media/load-snapshot.md](media/load-snapshot.md) | Load/save snapshots (`.sna/.z80/.szx`, TS-Conf `.spg` with automatic model switch), `force` on save, verify a state took effect, snapshot round-trips |
-| [media/play-rzx.md](media/play-rzx.md) | Play RZX input recordings (`.rzx`): model switch, progress, desync diagnosis, conventions |
+| [media/load-snapshot.md](media/load-snapshot.md) | Load/save snapshots (`.sna/.z80/.szx`, TS-Conf `.spg` with automatic model switch; `.rzx` goes to `rzx/play`, which call for which file), `force` on save, verify a state took effect, snapshot round-trips |
+| [media/play-rzx.md](media/play-rzx.md) | Play RZX input recordings (`.rzx`) with `rzx/play`, never `snapshot/load` (no model switch there): model switch, progress, desync diagnosis, conventions |
 | [media/author-udi-images.md](media/author-udi-images.md) | Creating proper UDI images: format capability matrix, host-side conversion/authoring, in-emulator formatting, weak-bit limits |
 | [media/video-recording.md](media/video-recording.md) | Record the screen to GIF/H.264/HEVC with an optional sound track (`audio: aac`) from MCP, WebAPI, CLI, Lua, Python; codec/container rules; ffprobe checks |
 | [media/agent-screenshot-view.md](media/agent-screenshot-view.md) | Viewing emulator screen as agent: native MCP/WebAPI server-side binary saving without base64 transcript corruption |
+| [media/window-recording.md](media/window-recording.md) | Record the unreal-qt window as drawn (CRT shader) with the on-screen keyboard lighting the held keys: start / frames / stop over MCP and WebAPI, a paused machine stepped frame by frame (every frame, any host load), ProRes 4444 / H.264 4:4:4, the 4K layout that survives YouTube's 4:2:0 |
+| [media/crt-effects.md](media/crt-effects.md) | CRT effects in the GUI window: read / set `gpu`, `crt`, `crt_profile` (Basic, seven models, libretro `shader:` presets), `source=window` grabs, the GPU-only and no-window errors, a GPU vs software bit-for-bit check |
+| [media/frame-presenter.md](media/frame-presenter.md) | The frame presenter over MCP and WebAPI: `smooth_motion` (off / blend / interpolate / auto), `present_policy`, `display_rate`, the `present` report (`late`, `error_ms`, `gpu_ms`), the `video.present` monitor name and WebSocket topic |
 | [media/disk-sector-and-catalog-inspection.md](media/disk-sector-and-catalog-inspection.md) | Inspect a loaded disk: catalog, info, sysinfo, decoded and raw sectors and tracks, image download, create / eject |
 | [media/sprinter-hdd.md](media/sprinter-hdd.md) | Sprinter hard disks: IDE slots ide0/ide1, mounting an HDD image, booting DSS from it (DSS 1.71 needs BIOS 3.06), state ide |
+| [media/sprinter-test-images.md](media/sprinter-test-images.md) | A Sprinter disk that boots straight into your program: a composite over the system disk (no copy), a copy with `make-test-image.sh`, or the in-session `SYSTEM.BAT` rewrite of the tests; the same boot every time |
 
 ### `run/` — making software actually run
 
@@ -131,21 +174,47 @@ call.
 |:--|:--|
 | [input/joystick.md](input/joystick.md) | Kempston joystick: press / release / set / tap / status on MCP, WebAPI, CLI, Lua and Python; which models decode `IN #1F`; the paused-machine queueing; reading the byte from a guest loop |
 | [input/mouse.md](input/mouse.md) | Mouse: move / press / release / click / buttons / wheel / counters / status on MCP, WebAPI, CLI, Lua and Python; which mouse each machine has (Kempston interface, ZX-Evo / TS-Conf AVR PS/2 mouse, Sprinter board mouse); host capture and the toolbar gate |
+| [input/game-haptics.md](input/game-haptics.md) | Game haptics: which probe kind to use and what it costs, finding the event code by per-frame coverage and a sound-request byte, proving it by play, the profile, the index, the tests (Dizzy X worked example) |
 
 ### `analysis/` — instrumenting the machine
 
 | Recipe | What it covers |
 |:--|:--|
+| [analysis/reverse-engineering.md](analysis/reverse-engineering.md) | Reverse engineering on the analysis layers: capture from the game's medium, directed coverage, the review queue and resolve, experiments on muted clones, export, the rebuild / assemble gates, the score against a reference |
 | [analysis/ttd-recording.md](analysis/ttd-recording.md) | TTD on/off, write journal on demand, dump/save `.ttd`, load back, seek/step, bookmarks, coverage heatmap |
 | [analysis/ttd-write-journal.md](analysis/ttd-write-journal.md) | The write journal on demand: record it, switch it during a recording, build it later for any span by replay |
 | [analysis/ttd-reverse-debugging.md](analysis/ttd-reverse-debugging.md) | Reverse queries: `find-last`, `reverse-step`, `reverse-continue`, coverage probe/scan |
+| [analysis/ttd-gameplay-automation.md](analysis/ttd-gameplay-automation.md) | Drive a game deterministically, record it, find gameplay events (crash, jump, death) in code and memory; checks for gameplay tests, speedrun plan |
+| [analysis/waiting-and-watching.md](analysis/waiting-and-watching.md) | Waits that do not depend on host timing (`run_frames`, `skip_until`, breakpoint + `debug/wait` loop, OCR / digest polling), who writes an address (write breakpoint, TTD `find-last`, operand search over all RAM) |
+| [analysis/conditional-breakpoints.md](analysis/conditional-breakpoints.md) | Conditional breakpoints: the condition language in examples, `match_count` / `hit_count`, refusals with the reason, the run-time failure mark, CLI `if` / `bpcond`, MCP, Lua, Python |
 | [analysis/breakpoints-and-events.md](analysis/breakpoints-and-events.md) | Breakpoints and what they stop, `/step` / `/steps` with the stop reason, the `/api/v1/websocket` debugger events (subscribe, `paused` / `resumed` / `step_done` / `breakpoints_changed`), CLI / MCP / Lua / Python |
+| [analysis/bus-analyzer.md](analysis/bus-analyzer.md) | Bus analyzer: the SPI buses of every machine and card (`zc.spi`, `next.spi`, `divmmc.spi`, `neogs.*`), transactions + SD protocol events with frame / T / PC / source, driver checks (early access, chip select mid-byte / mid-command, command while busy, unread block, CRC error, TS-Conf DMA collision), VCD / JSON lines export |
+| [analysis/sd-driver-debugging.md](analysis/sd-driver-debugging.md) | SD driver workflow: per-host ports, a healthy init sequence, what each finding means and how to fix it, hardening with the `realistic` / `slow` card timing profiles, comparing with a board capture in PulseView |
 | [analysis/port-trace.md](analysis/port-trace.md) | Port I/O tracing: feature gate, filters/presets, ring buffer, save `json/csv/bin/binz`, re-read server-side, internal port codes (ZX-Evo, Sprinter) |
-| [analysis/memory-counters.md](analysis/memory-counters.md) | Memory access counters: profiler start/stop, per-page summaries, per-address counters, YAML export |
+| [analysis/memory-counters.md](analysis/memory-counters.md) | Memory access counters: profiler start/stop, per-page summaries, per-address counters in any space (one cell, lists, windows, top, binary), region and masked port watches, YAML export |
+| [analysis/game-start-input.md](analysis/game-start-input.md) | Start a game from its title: probe the half-rows and Kempston with port watches, try only those inputs from one snapshot, judge by new code and the screen (`tools/gamestart/gamestart.py`) |
 | [analysis/nonstandard-loader.md](analysis/nonstandard-loader.md) | Detect custom loaders (port-PC attribution, fastdisk litmus, structural pre-scan), trace hangs and crashes |
 | [analysis/ttd-visual-inspection.md](analysis/ttd-visual-inspection.md) | Record once with TTD, then seek/step to any frame for guaranteed-stable inspection (registers, video aspect, per-frame screenshot) |
 | [analysis/sprinter-ttd.md](analysis/sprinter-ttd.md) | Sprinter time travel: what a checkpoint holds (PLD, Z84C15, VRAM, fast RAM, keyboard / mouse streams, floppy command), record / seek / dump on MCP, WebAPI, CLI |
 | [analysis/sprinter-mame-compare.md](analysis/sprinter-mame-compare.md) | Sprinter boot port trace against MAME's `sprinter` driver, access by access (port, value, PC, internal code); new MAME captures |
+
+### `assemblers/` — the Spectrum's own assemblers
+
+| Recipe | What it covers |
+|:--|:--|
+| [assemblers/README.md](assemblers/README.md) | What every assembler recipe shares: own instance, starting from a TR-DOS disk, inverted keyboards and Extend, sources between host and machine (folders as disks, `zxasm`, the assemblers' text import / export, disk export), code out, labels into the debugger with `symconv source` |
+| [assemblers/tasm.md](assemblers/tasm.md) | TASM 2.0 - 4.12: command line, editor, assemble, run, object save, symbol list, export to PC text, TASMHELP |
+| [assemblers/alasm.md](assemblers/alasm.md) | ALASM 3.8c - 5.09: word commands, Work / Assemble / sYmbol, the editor, eXport / impOrt of text |
+| [assemblers/storm.md](assemblers/storm.md) | STORM 1.0beta - 1.3i: BREAK and Extend commands, save Obj, eXport, the code after Quit |
+| [assemblers/zxasm.md](assemblers/zxasm.md) | ZX-ASM 2.4 - ZAsm 3.15: menus, drive D, Load / Assemble / Launch, the user's memory in RAM page 1 |
+| [assemblers/gens.md](assemblers/gens.md) | GENS4 / GENS3 (tape) and GENS4B (TR-DOS): put in memory, `G` from a tape image, `A`, `R` |
+| [assemblers/masm.md](assemblers/masm.md) | MASM 1.1 / 3.0: Work file, Assemble, code in RAM page 0 for `#C000` up |
+| [assemblers/prometheus.md](assemblers/prometheus.md) | PROMETHEUS 48K: installer, SS+letter commands, `LOAD :name` (the name is required), ASSEMBLY, saves to and from the host |
+| [assemblers/laser-genius.md](assemblers/laser-genius.md) | Laser Genius 1.04 (Beta Disk): loader questions, paragraph numbers, Y/N keys pressed once, `assem` after `PUT`, sources to and from the host |
+| [assemblers/power-assembler.md](assemblers/power-assembler.md) | Power Assembler 3.0 128K: the menu (SS then CS), CAPS LOCK on, the code in page 4, `$` ahead in instructions, texts to and from the host |
+| [assemblers/asm80.md](assemblers/asm80.md) | ASM80 / Asm80Win 2.02 (PC): asm80win.exe under wine or its host build, a directory project to sjasmplus, labels from the listing |
+| [assemblers/zeus.md](assemblers/zeus.md) | ZEUS 1983 (tape), 1.1, GG, v7.E: source in memory, `O`, `A`, INCLUDE / PLACE / INCBIN |
+| [assemblers/xas.md](assemblers/xas.md) | XAS 4.18 / 7.447: the file list, EXT commands, LTEXT / LCODE |
 
 ### `machines/` — per-model recipes
 
@@ -184,6 +253,14 @@ call.
 | [peripherals/network.md](peripherals/network.md) | Network adapters: ZXNETUSB (W5300) card, the virtual network (DHCP, DNS, gateway, guest servers), NedoOS setup, state on every interface, what hangs without a card |
 | [peripherals/cmos-rtc.md](peripherals/cmos-rtc.md) | CMOS clock on ATM3 / Profi / Scorpion+SMUC: report, cell read / write on every interface, setting the time, battery files |
 
+### `testing/` — checking and measuring the emulator itself
+
+| Recipe | What it covers |
+|:--|:--|
+| [testing/webapi-verification.md](testing/webapi-verification.md) | Verifying a WebAPI change end to end |
+| [testing/host-profiling.md](testing/host-profiling.md) | Where the emulator spends its host CPU time (macOS xctrace): a repeatable load, record, reports per function / source line / callee / thread |
+| [testing/video-modes.md](testing/video-modes.md) | Which video mode a machine is in, how to reach the others on every platform, and `tools/verification/video/check_video_modes.py`: where the frame, the window, a video wall tile or a recording disagree with what the machine says |
+
 ### `articles/` — full workflows that combine recipes
 
 | Article | What it covers |
@@ -191,6 +268,9 @@ call.
 | [articles/bug-hunt-ttd.md](articles/bug-hunt-ttd.md) | "Who corrupted this memory?" — snapshot + TTD + `find-last` + `reverse-continue` |
 | [articles/demo-boot-verification.md](articles/demo-boot-verification.md) | Deterministic boot verification: autostart + `run_frames` + screen digest + OCR |
 | [articles/disk-protection-triage.md](articles/disk-protection-triage.md) | Disk protection triage: catalog vs raw sectors + FDC state + `fdc-only` port trace |
+| [articles/program-state-reverse.md](articles/program-state-reverse.md) | Where a running program keeps its state: `memory/find` over all RAM + a state diff + write journal `find-last` / a write watchpoint with `debug/wait` + `disasm` (operands the code rewrites) |
+| [articles/game-reverse-pipeline.md](articles/game-reverse-pipeline.md) | A whole program (game, demo, resident tool) into readable, annotated, rebuildable sources on any machine: capture at handover, coverage from scripts / random play / RZX with a stop rule, classification by writers and readers (write journal, `find-last`), annotation rules, a findings register, the shift test on per-frame screen digests, labels back into the debugger and SkoolKit interop (the method of zx-reaper) |
+| [articles/game-reverse-case.md](articles/game-reverse-case.md) | A game into a reverse case: sessions per recording, the call for each question (memory_at, explain_frame, find_last, cause_chain, explain, gallery, experiment, the access trace), habits that keep the context small, figures from access traces, pitfalls (fast load frames, stage windows) |
 | [articles/physical-protection-forensics.md](articles/physical-protection-forensics.md) | Physical copy-protection forensics: diskinfo structural scan, clock bitmap, flaky-sector differential test, RE the check |
 
 ## Ground truth links
@@ -219,10 +299,9 @@ call.
 
 1. **One emulator can own port 8090.** Kill stale instances before starting a
    fresh one (see [setup](_common/setup.md)).
-2. **Scrubbing during TTD recording pauses it** (`backend: engine`) — the
+2. **Scrubbing during TTD recording pauses it** — the
    state becomes `detached` with `recording_paused: true`; `POST /ttd/resume`
-   at the paused point continues, `POST /ttd/stop` ends it. On
-   `backend: v1` it is a 409: `POST /ttd/stop` first.
+   at the paused point continues, `POST /ttd/stop` ends it.
 3. **Disk autostart is drive A only** — a hard error elsewhere, never silent.
 4. **Port trace needs its runtime feature on** —
    `PUT /feature/porttrace {"enabled": true}` (or let the capture tools do it).

@@ -1,6 +1,7 @@
 #include "codecs/alasm/alasmcodec.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 #include "encoding/utf8.h"
@@ -67,6 +68,34 @@ bool ToBuffer(const std::string& text, std::vector<uint8_t>& out, std::string& e
     return true;
 }
 
+/// The indexes of a table's names by their first character (the low 7 bits, as sea_tkn compares), table order kept
+template <typename Table>
+std::array<std::vector<uint8_t>, 128> FirstIndex(const Table& names)
+{
+    std::array<std::vector<uint8_t>, 128> out;
+    for (size_t c = 0; c < names.size(); ++c)
+        if (!names[c].empty())
+            out[static_cast<uint8_t>(names[c][0]) & 0x7F].push_back(static_cast<uint8_t>(c));
+    return out;
+}
+
+const std::array<std::vector<uint8_t>, 128>& MnemonicIndex(const alasm::Version& version)
+{
+    static const std::vector<std::array<std::vector<uint8_t>, 128>> indexes = [] {
+        std::vector<std::array<std::vector<uint8_t>, 128>> out;
+        for (const alasm::Version& v : alasm::Versions())
+            out.push_back(FirstIndex(v.mnemonics));
+        return out;
+    }();
+    return indexes[static_cast<size_t>(&version - alasm::Versions().data())];
+}
+
+const std::array<std::vector<uint8_t>, 128>& RegisterIndex()
+{
+    static const std::array<std::vector<uint8_t>, 128> index = FirstIndex(alasm::Registers());
+    return index;
+}
+
 /// sea_tkn of alTOKENS.H: the keyword starting at `h`; 0 when none. `end` = where scanning goes on (a mnemonic takes
 /// one blank after it)
 uint8_t FindKeyword(const std::vector<uint8_t>& t, size_t h, bool operands, const alasm::Version& version, size_t& end)
@@ -78,9 +107,12 @@ uint8_t FindKeyword(const std::vector<uint8_t>& t, size_t h, bool operands, cons
                 return false;
         return true;
     };
+    if (h >= t.size())
+        return 0;
+    const uint8_t first = t[h] & 0x7F;
     if (!operands)
     {
-        for (size_t c = 0; c < version.mnemonics.size(); ++c)
+        for (const uint8_t c : MnemonicIndex(version)[first])
         {
             const std::string_view name = version.mnemonics[c];
             if (name.empty() || !matches(name))
@@ -98,7 +130,7 @@ uint8_t FindKeyword(const std::vector<uint8_t>& t, size_t h, bool operands, cons
         return 0;
     }
     const alasm::RegisterTable& registers = alasm::Registers();
-    for (size_t c = 0; c < registers.size(); ++c)
+    for (const uint8_t c : RegisterIndex()[first])
     {
         const std::string_view name = registers[c];
         if (name.empty() || !matches(name))
@@ -139,6 +171,103 @@ std::vector<std::string_view> KeywordNames(const std::vector<uint8_t>& record, c
         }
     }
     return names;
+}
+/// What tells the versions apart (they differ only in their mnemonic tables): the codes some version spells
+/// differently, and every spelling at such a code. A line with none of those bytes decodes alike in every version; when
+/// its text holds none of those words either, it also encodes alike, so one version's check stands for all
+struct VersionDifferences
+{
+    std::array<bool, 256> byte{};
+    std::vector<std::string> words;
+    std::array<bool, 256> first{};                          ///< the first characters of the words
+    std::vector<std::vector<const std::string*>> byLength;  ///< the words by their length
+};
+
+const VersionDifferences& Differences()
+{
+    static const VersionDifferences differences = [] {
+        VersionDifferences out;
+        const auto& versions = alasm::Versions();
+        for (size_t c = 0; c < alasm::MnemonicTable{}.size(); ++c)
+        {
+            if (std::all_of(versions.begin(), versions.end(), [&](const alasm::Version& v) { return v.mnemonics[c] == versions[0].mnemonics[c]; }))
+                continue;
+            out.byte[alasm::kFirstMnemonic + c] = true;
+            for (const alasm::Version& v : versions)
+                if (!v.mnemonics[c].empty() && std::find(out.words.begin(), out.words.end(), v.mnemonics[c]) == out.words.end())
+                    out.words.emplace_back(v.mnemonics[c]);
+        }
+        for (const std::string& w : out.words)
+        {
+            out.first[static_cast<uint8_t>(w[0])] = true;
+            if (out.byLength.size() <= w.size())
+                out.byLength.resize(w.size() + 1);
+            out.byLength[w.size()].push_back(&w);
+        }
+        return out;
+    }();
+    return differences;
+}
+
+/// The line's mnemonic byte is one the versions read differently (only the first keyword byte of a line is looked up
+/// in the mnemonic table; the bytes after it are operands, the same in every version)
+/// The byte the mnemonic table reads, as DecodeLine walks the line: #FF marks and blank runs skipped, a string skipped
+/// to its closing quote, a comment or literal rest ends the line; the first byte from #80. -1 when there is none
+int MnemonicByte(std::span<const uint8_t> line)
+{
+    for (size_t i = 1; i < line.size(); ++i)
+    {
+        const uint8_t b = line[i];
+        if (b == kNoText)
+            continue;
+        if (b == ';' || b == kLiteralRest)
+            return -1;
+        if (b == '"')
+        {
+            while (++i < line.size() && line[i] != '"')
+            {
+            }
+            continue;
+        }
+        if (b >= 0x80)
+            return b;
+    }
+    return -1;
+}
+
+bool AnyVersionByte(std::span<const uint8_t> line)
+{
+    const int b = MnemonicByte(line);
+    return b >= 0 && Differences().byte[static_cast<uint8_t>(b)];
+}
+
+/// The line's stored text holds, as a word of its own, a keyword some version lacks or spells differently (a version
+/// would tokenize it, the others not). Read from the bytes: any byte but a letter or a digit bounds a word, which
+/// finds every word the decoded text has and a few more (in strings and comments): those lines are only checked in
+/// every version
+bool AnyVersionWord(std::span<const uint8_t> line)
+{
+    // Every maximal run of letters and digits, compared with the words of its length
+    const auto letter = [](uint8_t c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); };
+    const VersionDifferences& d = Differences();
+    for (size_t i = 1; i < line.size();)
+    {
+        if (!letter(line[i]))
+        {
+            ++i;
+            continue;
+        }
+        size_t end = i + 1;
+        while (end < line.size() && letter(line[end]))
+            ++end;
+        const size_t length = end - i;
+        if (d.first[line[i]] && length < d.byLength.size())
+            for (const std::string* w : d.byLength[length])
+                if (std::equal(w->begin(), w->end(), line.begin() + static_cast<std::ptrdiff_t>(i)))
+                    return true;
+        i = end;
+    }
+    return false;
 }
 }  // namespace
 
@@ -269,10 +398,13 @@ std::string AlasmCodec::DecodeLine(std::span<const uint8_t> line, const alasm::V
 // cnv2str of alTOKENS.H
 bool AlasmCodec::EncodeLine(const std::string& text, const alasm::Version& version, std::vector<uint8_t>& record, std::string& error)
 {
-    std::vector<uint8_t> t;
+    // Kept between calls: version detection encodes every line in several versions
+    thread_local std::vector<uint8_t> t;
+    thread_local std::vector<uint8_t> out;
+    t.clear();
+    out.clear();
     if (!ToBuffer(text, t, error))
         return false;
-    std::vector<uint8_t> out;
     size_t h = 0;
     bool keywordSeen = false;
     bool afterRun = false;
@@ -325,11 +457,13 @@ bool AlasmCodec::EncodeLine(const std::string& text, const alasm::Version& versi
             afterRun = false;
             continue;
         }
-        if (c == ',' || (c != '(' && c < '?'))
+        // Another character below '?' is kept and the next one read afresh, so a register after it is a keyword
+        // (`DISPLAY "d",/D,x` stores D as #F1, which DISPLAY's switch needs). The source on the 5.09 disk copies the
+        // word after it (c2COPY) instead, as only its ATM and 80-column ZX Evo builds do; the editors of 4.2-5.09
+        // (alasm64, alasm42, alasm442, al64_444, alasm4.5, alasm48) and every file they write take it afresh
+        if (c != '(' && c < '?')
         {
             out.push_back(c);
-            if (c != ',')
-                copyWord();
             afterRun = false;
             continue;
         }
@@ -418,25 +552,40 @@ DecodeResult AlasmCodec::Decode(std::span<const uint8_t> bytes, const DecodeOpti
         std::string error;
         // Evidence per version: lines it re-tokenizes exactly as stored (a keyword it lacks, or a word it would have
         // tokenized, breaks that), plus the operand of #96: a string for DEFM (3.8-4.5), hex digits for DD (4.44, 5.x)
-        std::vector<size_t> exact;
-        for (const alasm::Version& v : alasm::Versions())
+        const auto& versions = alasm::Versions();
+        std::vector<size_t> exact(versions.size(), 0);
+        for (const auto& line : lines)
         {
-            const std::string_view code96 = v.mnemonics[0x96 - alasm::kFirstMnemonic];
-            size_t n = 0;
-            for (const auto& line : lines)
+            // A line the versions cannot tell apart (Differences) counts alike for all of them: it cannot change the
+            // choice, so only the others are decoded and encoded in every version
+            if (AnyVersionByte(line) || AnyVersionWord(line))
             {
-                if (EncodeLine(DecodeLine(line, v), v, record, error) && std::equal(record.begin(), record.end(), line.begin(), line.end()))
-                    ++n;
-                const auto first = std::find_if(line.begin() + 1, line.end(), [](uint8_t b) { return b >= 0x80 || b == '"' || b == ';' || b == kLiteralRest; });
-                if (first != line.end() && *first == 0x96 && first + 1 != line.end())
+                // The decoded text depends only on how a version spells the line's mnemonic byte: once per spelling
+                const int mb = MnemonicByte(line);
+                std::vector<std::pair<std::string_view, std::string>> texts;
+                for (size_t i = 0; i < versions.size(); ++i)
                 {
-                    const uint8_t operand = *(first + 1);
-                    const bool isString = operand == '"';
-                    const bool isHex = operand == '#' || (operand >= '0' && operand <= '9') || (operand >= 'A' && operand <= 'F');
-                    n += (isString && code96 == "DEFM") || (isHex && code96 == "DD");
+                    const std::string_view spelling =
+                        mb >= alasm::kFirstMnemonic && mb <= alasm::kLastMnemonic ? versions[i].mnemonics[static_cast<size_t>(mb - alasm::kFirstMnemonic)] : std::string_view();
+                    auto text = std::find_if(texts.begin(), texts.end(), [&](const auto& t) { return t.first == spelling; });
+                    if (text == texts.end())
+                        text = texts.insert(texts.end(), {spelling, DecodeLine(line, versions[i])});
+                    if (EncodeLine(text->second, versions[i], record, error) && std::equal(record.begin(), record.end(), line.begin(), line.end()))
+                        ++exact[i];
                 }
             }
-            exact.push_back(n);
+            const auto first = std::find_if(line.begin() + 1, line.end(), [](uint8_t b) { return b >= 0x80 || b == '"' || b == ';' || b == kLiteralRest; });
+            if (first != line.end() && *first == 0x96 && first + 1 != line.end())
+            {
+                const uint8_t operand = *(first + 1);
+                const bool isString = operand == '"';
+                const bool isHex = operand == '#' || (operand >= '0' && operand <= '9') || (operand >= 'A' && operand <= 'F');
+                for (size_t i = 0; i < versions.size(); ++i)
+                {
+                    const std::string_view code96 = versions[i].mnemonics[0x96 - alasm::kFirstMnemonic];
+                    exact[i] += (isString && code96 == "DEFM") || (isHex && code96 == "DD");
+                }
+            }
         }
         const size_t best = *std::max_element(exact.begin(), exact.end());
         std::vector<const alasm::Version*> tied;
@@ -454,6 +603,8 @@ DecodeResult AlasmCodec::Decode(std::span<const uint8_t> bytes, const DecodeOpti
                 continue;
             for (size_t i = 0; i < lines.size(); ++i)
             {
+                if (!AnyVersionByte(lines[i]))
+                    continue;
                 const std::string theirs = DecodeLine(lines[i], *v);
                 if (theirs != DecodeLine(lines[i], *version))
                 {

@@ -1,6 +1,9 @@
 #include "emulator/io/sprinter/isa/isaslotconfig.h"
 
+#include "emulator/platform.h"
+
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -28,7 +31,7 @@ struct KindEntry
 constexpr KindEntry kKinds[] = {
     {CardKind::None, "NONE"},           {CardKind::ZxBus, "ZXBUS"},         {CardKind::Ram, "RAM"},
     {CardKind::Ne2000, "NE2000"},       {CardKind::El3c509b, "EL3C509B"},   {CardKind::SprinterEsp, "SPRINTERESP"},
-    {CardKind::Modem, "MODEM"},         {CardKind::Dual16552, "DUAL16552"},
+    {CardKind::Modem, "MODEM"},         {CardKind::Dual16552, "DUAL16552"}, {CardKind::WildSound, "WILDSOUND"},
 };
 }  // namespace
 
@@ -325,10 +328,65 @@ bool KindAvailable(CardKind kind, std::string* why)
         case CardKind::Modem:
         case CardKind::Dual16552:
             break;   // network phase SN4: NetworkManager builds the PcSerialCard, the Sprinter fits it
+        case CardKind::WildSound:
+            break;   // the Sprinter decoder fits the card (docs/inprogress/2026-10-09-wildsound)
     }
     if (why && reason)
         *why = reason;
     return reason == nullptr;
+}
+
+std::vector<SlotSummary> SlotSummaries(const CONFIG& config)
+{
+    std::vector<SlotSummary> out;
+    for (int n = 0; n < kSlots; n++)
+    {
+        const SlotConfig& isa = config.sprinter.isa.slot[n];
+        const auto kind = static_cast<CardKind>(isa.kind);
+        SlotSummary slot;
+        slot.key = KindKey(kind);
+        switch (kind)
+        {
+            case CardKind::None:
+                slot.name = "empty";
+                break;
+            case CardKind::ZxBus:
+                slot.name = "ISA to ZX-bus adapter";
+                slot.hostsZxBus = true;
+                break;
+            case CardKind::Ram:
+                slot.name = "ISA RAM";
+                break;
+            case CardKind::Ne2000:
+                slot.name = "NE2000 Ethernet";
+                break;
+            case CardKind::El3c509b:
+                slot.name = "3Com EtherLink III";
+                break;
+            case CardKind::SprinterEsp:
+                slot.name = "SprinterESP Wi-Fi";
+                break;
+            case CardKind::Modem:
+                slot.name = "ISA Hayes modem";
+                break;
+            case CardKind::Dual16552:
+                slot.name = "SprinterSerial (2 x 16550)";
+                break;
+            case CardKind::WildSound:
+                slot.name = "Wild Sound (Robus)";
+                break;
+        }
+        slot.details = SlotChipName(isa);
+        if (kind == CardKind::Ne2000 || kind == CardKind::El3c509b || kind == CardKind::Modem)
+        {
+            char resources[32] = {};
+            std::snprintf(resources, sizeof(resources), "#%03X, IRQ %u", static_cast<unsigned>(isa.base),
+                          static_cast<unsigned>(isa.irq));
+            slot.details += (slot.details.empty() ? "" : ", ") + std::string(resources);
+        }
+        out.push_back(std::move(slot));
+    }
+    return out;
 }
 
 }  // namespace sprinterisa

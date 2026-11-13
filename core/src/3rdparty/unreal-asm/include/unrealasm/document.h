@@ -22,8 +22,10 @@ struct AttrBag
 
 struct SourceLine
 {
-    std::string text;    ///< UTF-8, exactly as the assembler shows it, without the line break
+    std::string text;    ///< UTF-8, exactly as the assembler shows it, without the line break (and without its number)
     AttrBag attrs;
+    int number = -1;     ///< the line's number in formats that number their lines (GENS, ZEUS); -1 = none
+    uint32_t origin = 0; ///< a converted line: the 1-based line of the source it was written from (0 = none)
 };
 
 struct SourceDocument
@@ -36,6 +38,9 @@ struct SourceDocument
     encoding::LineEnd lineEnd = encoding::LineEnd::Lf;        ///< the dominant line end of the original
     std::vector<SourceLine> lines;
     AttrBag attrs;                   ///< file level
+    /// The file is part of a project written for the ZX Spectrum Next (another file enables it with DEVICE ZXSPECTRUMNEXT
+    /// or OPT --zxnext): its frontend reads the Z80N mnemonics from the first line. ConvertProject sets it
+    bool z80n = false;
 
     /// The lines joined with '\n' (for display, comparisons, examples)
     std::string Text() const;

@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 
+#include "emulator/bus/bustap.h"
 #include "emulator/cpu/z80.h"
 #include "emulator/io/sdcard/sdcardspi.h"
 #include "emulator/io/spi/zcontrollerspi.h"
@@ -83,7 +84,7 @@ public:
         LegacyFddLatch,     ///< legacy FPGA only: #2F/#4F/#6F/#8F in shadow, plain R/W bytes of the RAM-disk DOS
     };
 
-    /// EmulatorState::evoTrdemu bits
+    /// EvoState::trdemu bits
     static constexpr uint8_t kTrdemuIn = 0x01;       ///< RAM page #FE is in window 0
     static constexpr uint8_t kTrdemuPending = 0x02;  ///< swap in before the next opcode fetch
 
@@ -127,7 +128,7 @@ public:
     /// endregion </Board NMI>
 
     /// #1F outside shadow answers Joystick::Read()
-    bool HasKempstonJoystick() const override { return true; }
+    bool BoardHasKempstonJoystick() const override { return true; }
 
     /// region <SD card (Z-Controller, tdd-storage-sd-ide-cd.md §2)>
     /// The card is the media manager's slot "sd.zc" (storage-manager
@@ -136,6 +137,7 @@ public:
     /// reset keeps the card and its session writes, like the board's reset
     SdCardSpi& GetSdCard() { return _sdCard; }
     ZControllerSpi& GetZController() { return _zc; }
+    BusTap& SpiTap() { return _spiTap; }
     /// Insert an image file / any medium through the media manager (directly
     /// when the context has none: bare decoder unit tests)
     bool InsertSdCard(const std::string& path, SdCardSpi::WriteMode mode, bool writeProtect = false);
@@ -143,7 +145,7 @@ public:
     void EjectSdCard();
 
     /// ATM paging + the SD card's protocol state
-    std::vector<ttd::PeripheralId> GetTTDModelStateIds() const override;
+    std::vector<ttd::TTDDeviceType> GetTTDModelStateTypes() const override;
     /// The mouse ports read the AVR's PS/2 mouse registers
     bool PeekMouseRegister(uint8_t reg, uint8_t& value) const override
     {
@@ -184,6 +186,9 @@ protected:
         SlotDescriptor _descriptor;
     };
 
+    // The bus analyzer's view of the Z-Controller bus (docs/inprogress/2026-10-11-bus-analyzer): declared
+    // before the card and the controller, which point at it
+    BusTap _spiTap{"zc.spi", BusProtocol::Spi, "Z-Controller SPI (#57 data, #77 chip select): SD card"};
     SdCardSpi _sdCard;
     ZControllerSpi _zc;
     EvoSdSlot _sdSlot{*this};
@@ -277,7 +282,7 @@ public:
     bool IsPaletteWriteEnabled() override;
 
     /// `#BF` bit 5 (pal444): 4 bits per channel, the low ones from A15..A8
-    bool PaletteLowBitsFromAddress() const override { return (_state->pBF & 0x20) != 0 && !IsLegacyFpga(); }
+    bool PaletteLowBitsFromAddress() const override { return (_state->evo.pBF & 0x20) != 0 && !IsLegacyFpga(); }
 
     // Gluk clock ports: #DFF7 / #BFF7 outside shadow (needs #EFF7 bit 7),
     // #DEF7 / #BEF7 in shadow (always on); decoded on A8/A13/A14 (zports.v)
@@ -321,6 +326,9 @@ public:
     /// The ATM710 layout plus the BaseConf's own state: #7FFD bits 5-7 are not page bits (#EFF7 bit 2 = 1), no RAM at #0000
     /// (bit 3 = 0), no write protection, no NMI or virtual TR-DOS page
     void EnterSpectrum128Paging(uint16_t pc) override;
+    /// #FF77 bit 3 (14 MHz) in the low byte, #EFF7 bit 4 (3.5 MHz) in the high byte
+    uint16_t GetClockSelect() const override;
+    void RestoreClockSelect(uint16_t select) override;
 protected:
 
     void DecodeF7Out(uint16_t port, uint8_t value, uint16_t pc);

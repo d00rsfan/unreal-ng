@@ -6,7 +6,7 @@
 | **Code** | `src/dialects/tasm/tasmfrontend.cpp` (the `tasm` frontend, versions 3 / 4.0 / 4.12), shared macro expansion `src/dialects/common/macros.cpp`, the sjasmplus backend |
 | **Oracles** | the General Sound 1.04 ROM (the sources and the ROM TASM 4.0 built, disk `GS104SRC.TRD` in `GS104SRC.ZIP` from KLUG's BBS archive, [klug_bbs.7z](https://yadi.sk/d/N_p56RIHWU15Gw); the ROM is also unreal-ng's `data/rom/gs104.rom`), and TASM 4.12's SINUS example assembled by TASM 4.12 in the emulator |
 | **Result** | the converted ROM sources assemble to the 32 768 bytes of the ROM, every byte; SINUS's 256-byte table equal; 99 sources from 6 disks unchanged through the sjasmplus round trip |
-| **Checks** | `tools/unreal-asm/` (round trip, emulator oracle) and `unreal-asm-tests` (`TasmFrontend_Test`) |
+| **Checks** | `tools/verification/unreal-asm/` (round trip, emulator oracle) and `unreal-asm-tests` (`TasmFrontend_Test`) |
 
 ## 1. Example first
 
@@ -39,12 +39,14 @@ tables in the binaries (research-tasm.md), and the oracles.
 | `+ - * / & |`, `!` xor; postfix `^` swaps the bytes, `{` high byte, `}` low byte, in 4.0 `[` / `]` rotate a 16-bit word by one bit | the same operations; `SwapBytes` and the rotations spelled out |
 | TASM 4.12: `[address]` reads the word at the address while assembling | `{address}`, with `DEVICE` |
 | An operand that starts with `(` is memory (`0+((\0)+1)` makes it a value, 4.12 article) | memory up to the matching `)` |
-| Directives: `ORG`, `EQU`, `DEFB`/`DB`, `DEFW`/`DW`, `DEFM`/`DM`, `DEFS`/`DS n,fill...` (the fill, strings too, repeats n times), `PHASE` / `UNPHASE`, `INCLUDE` / `INCBIN name` without quotes; 4.12 adds `.INCLUDE`, `.INCBIN`, `.PHASE`, `.UNPHASE`, `.IF` / `.ELSE` / `.ENDIF`, `.LOCAL`, `.PAGE`, `.RUN`, `DEFMAC` / `ENDMAC`, `DISPLAY` | the IR directive kinds; `.PAGE` / `.RUN` kept as text with a warning |
+| Directives: `ORG`, `EQU`, `DEFB`/`DB`, `DEFW`/`DW`, `DEFM`/`DM`, `DEFS`/`DS n,fill...` (the fill, strings too, repeats n times), `PHASE` / `UNPHASE`, `INCLUDE` / `INCBIN name` without quotes; 4.12 adds `.INCLUDE`, `.INCBIN`, `.PHASE`, `.UNPHASE`, `.IF` / `.ELSE` / `.ENDIF`, `.LOCAL`, `.PAGE`, `.RUN`, `DEFMAC` / `ENDMAC`, `DISPLAY` | the IR directive kinds; `.PAGE` / `.RUN` below |
+| `.PAGE n` (4.05): the code of the following ORGs at `#C000` and up goes to RAM page `n` (the page number as such: page 1 and page 0 got the bytes; TASM's manual: "ORG must be above #C000"); `.RUN address` (4.11) only sets where the Run command starts (R ran `.RUN #7000`, not the last ORG `#7100`). Checked in TASM 4.12 in unreal-ng (`testdata/dialects/tasm412/PGTEST`) | `.PAGE n` becomes the page of the next `ORG` with a number `>= #C000` (`ORG #C000,n`, sjasmplus' device page); an ORG below `#C000` or with an expression gets no page (warning for the expression); `.RUN` becomes a comment (Info) |
 | `ORG` ends an active `PHASE`, so does another `PHASE`; `UNPHASE` without one is ignored; a `PHASE` continues into an `INCLUDE` (GS ROM: `MAIN` includes 20 files inside `PHASE`) | `ENT` before `ORG` / `DISP`; where a file starts, unknown: `IFDEF __UNREALASM_DISP` / `ENT` / `ENDIF`, the backend keeps that `DEFINE` with every `DISP` / `ENT` |
 | `INCBIN` copies whole sectors: the bytes after the file in its last sector land in memory after it, the address moves by the file's length (GS ROM: 64 bytes after `BPM` are the sector slack of `BPM.C`) | `INCBIN "<file>"`, then `INCBIN "<file>.slack"` and the address moved back (`zxasm convert` extracts both) |
 | `PUSH` / `POP` take several registers | one instruction each |
 | `NV` / `V` are the conditions PO / PE; `LX HX LY HY`; `INF`; `SLI` | `PO` / `PE`, `IXL ...`, `IN F,(C)` |
 | 4.12: `.IF expr` compiles its first part when the value is 0 (`USE_MULT8=0` selects the code) | `IF (expr)==0` |
+| 4.12: the conditionals **do not nest** (checked 2026-10-09 with `testdata/dialects/tasm412/IFNEST`): one state, which `.IF` sets from its value even inside a skipped part, `.ELSE` inverts and `.ENDIF` clears; a second `.ENDIF` changes nothing. SNAKE relies on it (`.IF RABBIT` ended by the `.ENDIF` of the `.IF` after it) | sjasmplus blocks: a `.IF` while one is open closes it first (`ENDIF`), a `.ENDIF` with none open is dropped, a `.ELSE` with none open is `IF 0`; an open block ends before `ENDM` and at the end of the file; a macro body keeps its own state |
 | 4.12: `.LOCAL` starts a region; `...name` labels belong to it; inside a macro to each expansion | `__local<n>_name`; in a macro a LOCAL block (sjasmplus `.local_name`) |
 | 4.12: macro parameters `\0`…`\9` or `/0`…`/9`; `\c \n \s \r` walk the parameter text like ALASM's `\C \N \S \R` | named parameters; walking or gluing macros expanded at their calls |
 | 4.12: a label defined with `EQU` may be reassigned with `=` | every definition of such a name becomes `=` |
@@ -107,7 +109,7 @@ shows `DW` as `LD DW ,`, a display slip of the beta; the files hold the `DW` tok
 
 | Item | Note |
 |---|---|
-| TASM 4.12 `.PAGE` / `.RUN` | kept as text: assembling into a page and running code at the start of pass 2 have no sjasmplus counterpart yet |
+| TASM 4.12 `.PAGE` without a following ORG at `#C000` and up | not attached (TASM would switch the page for the code that follows); `.RUN` has no counterpart (a comment) |
 | TASM 4.12's manual | it sits compressed in `tasm.ovl` (HyperText); the facts above come from the articles, the binaries and the oracles |
 | `INCBIN` slack of a file filling whole sectors | the `.slack` file is empty: sjasmplus warns, the bytes are right |
 | TASM 2.0 | the codec reads it (plain text); its dialect is TASM 3's |

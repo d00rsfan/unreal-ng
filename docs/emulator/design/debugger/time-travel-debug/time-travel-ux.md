@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft for review |
+| **Status** | Design (2026-07-19). The panel as built is `unreal-qt/src/widgets/ttdwidget.*`, on the engine (`TimeTravelController`). The engine keeps a checkpoint for every frame and never thins, so the thinning tiers, the density strip and `budget_mb` below were not built; a history limit drops whole segments instead (parent TDD §0) |
 | **Version** | 1.0 |
 | **Last updated** | 2026-07-19 |
 | **Scope** | Qt debugger UI (unreal-qt) |
@@ -110,21 +110,38 @@ While detached (position < end):
 - State-editing controls (memory poke, register edit) are disabled with a tooltip "Read-only while viewing history — Resume from here to branch".
 - **Resume from here**: if the future being discarded is longer than a threshold (default 5 s), a confirmation dialog appears with a one-click escape hatch: *"Discard 543 frames of future history? [Save snapshot of 'now' first] [Discard & resume] [Cancel]"*. The snapshot option covers the branching use case rejected from the engine (TDD §4.2) at pure-UI cost.
 
-### 3.4a The write journal in the TTD panel (built, D40)
+### 3.4a The recording options and the write journal in the TTD panel (built, D40)
 
-The write journal answers "who wrote this address last" at once. It is off by default ([command-interface.md → The write journal](../../control-interfaces/command-interface.md#ttd-session-rules)). The TTD panel has three controls for it:
+The write journal answers "who wrote this address last" at once. Automation records without it by
+default ([command-interface.md → The write journal](../../control-interfaces/command-interface.md#ttd-session-rules));
+the TTD panel records with it (owner decision 2026-10-08).
+
+The recording options sit in an **Advanced** row, hidden by default and opened with the **Advanced**
+button at the right of the top row:
+
+| Control | Default | What it does |
+|---|---|---|
+| **Write journal** (check box) | on | The journal choice. A new instance gets it before anything records on it (the black box included), and Start Rec records with it. It switches at any moment, during a recording too; each on-off span becomes a segment of the session |
+| **History** (combo box) | Keep all | How much history a recording keeps: all of it, or the last 1, 2, 4, 8 or 16 GB. Beyond the limit the oldest frames are released, so a long session or the black box stays within memory |
+
+Both options, and whether the row is open, are remembered (`ttd/writeJournal`, `ttd/historyLimitBytes`,
+`ttd/advancedOpen` in the application settings). While the row is closed, a non-default choice shows in the
+status line: `| No journal`, `| Last 2 GB`.
+
+The journal on the timeline:
 
 | Control | Where | What it does |
 |---|---|---|
-| **Journal** (toggle button) | the top row, next to Clear | Switches the write journal on or off, before a recording and during it; each on-off span becomes a segment of the session |
 | The journal band | along the bottom edge of the timeline scrubber | The spans the journal covers, in the highlight color. A search for a write inside a band answers at once; outside it replays one frame |
-| **Build Journal** (menu button) | the scrubber row | Builds the journal by replaying frames: *Whole session*, *From the start to here*, *From here to the end*. A progress dialog shows the frames done and can cancel (what was built is kept). Disabled while the journal covers the whole session |
+| **Build Journal** (menu button) | the scrubber row, only for a session the journal does not cover whole (recorded without it, switched off on the way, a loaded `.ttd` without one) | Builds the journal by replaying frames: *Whole session*, *From the start to here*, *From here to the end*. A progress dialog shows the frames done and can cancel (what was built is kept) |
 
-The status line says `Journal: whole session` or `Journal: N span(s)`; its tooltip explains the band. Implementation: `unreal-qt/src/widgets/ttdwidget.cpp`, the band in `widgets/journalspanslider.cpp` (tested by `unreal-qt-tests`, `JournalSpanSlider_Test`).
+The status line says `Journal: whole session` or `Journal: N span(s)`; its tooltip explains the band.
+Implementation: `unreal-qt/src/widgets/ttdwidget.cpp`, the band in `widgets/journalspanslider.cpp`; tested by
+`unreal-qt-tests` (`TtdWidget_Test`, `JournalSpanSlider_Test`).
 
 ### 3.5 Session Invalidation Feedback
 
-When a session-invalidating event occurs (TDD §4.2 — reset, snapshot load, disk write in v1, speed change), the timeline clears and a non-modal toast explains *why*: `TTD history cleared: disk write at frame 13,001 (see docs)`. The previous session's bookmarks are offered for export before clearing. Silent history loss is forbidden (Principle 2).
+When a session-invalidating event occurs (TDD §4.2 — reset, snapshot load, disk write in v1, speed change; on the engine a reset or a snapshot load ends the recording and keeps the history browsable, and disk writes do not end it, TDD §4.2), the timeline clears and a non-modal toast explains *why*: `TTD history cleared: disk write at frame 13,001 (see docs)`. The previous session's bookmarks are offered for export before clearing. Silent history loss is forbidden (Principle 2).
 
 ---
 
@@ -331,7 +348,7 @@ Hold Backspace ~1.5 s watching the HUD, release just before the jump, replay the
 ## 11. Implementation Notes for unreal-qt
 
 - New widgets under `unreal-qt/src/debugger/widgets/`: `timelinewidget` (lanes+ruler custom-painted, QAbstractScrollArea-based), `eventinspectorwidget` (QTableView over a lazily-populated model backed by journal queries), `framecomparewidget` (two framebuffer views + diff shader in QPainter), `rewindhud` (translucent overlay on the screen widget).
-- All engine access goes through `TTDManager` public API + `GetTimelineSummary()` (TDD §10.2) — widgets never touch stores directly (mirrors how existing widgets consume tracker pointers).
+- All engine access goes through `TTDManager` public API + `GetTimelineSummary()` (TDD §10.2; built: `TimeTravelController`, whose observers read `GetPublishedSessionInfo()`) — widgets never touch stores directly (mirrors how existing widgets consume tracker pointers).
 - Seek requests from UI marshal through the existing pause discipline; the timeline widget owns a single-slot "pending seek" to implement coalescing (§3.2).
 - Lane rendering budget: the summary struct delivers per-frame aggregates (write count, paging-OUT count, input count, marks) — O(visible pixels) redraw, no journal iteration on paint.
 - Event Inspector pages journal queries in chunks (e.g., 1,000 rows) to keep multi-second replay-backed queries responsive.

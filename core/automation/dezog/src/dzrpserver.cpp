@@ -1,4 +1,6 @@
 #include "dzrpserver.h"
+
+#include "dezogcondition.h"
 #include "platform-sockets.h"
 #include <cstring>
 #include <iostream>
@@ -138,6 +140,7 @@ void Server::acceptLoop()
         char clientIp[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp));
         std::cout << "[DZRP] Client connected from " << clientIp << "\n";
+        m_debug->onClientConnected(PeerAddressOf(clientSock));
 
         {
             std::lock_guard<std::mutex> lock(m_sessionMutex);
@@ -176,6 +179,11 @@ void Server::sessionLoop(SOCKET clientSocket)
         int pollResult = waitForSocketRead(clientSocket, 100);
         if (pollResult < 0)
             break;
+        if (m_debug->controlTakenBack())
+        {
+            tellControlTakenBack();
+            return;
+        }
         if (pollResult == 0)
             continue;
 
@@ -242,6 +250,15 @@ const char* commandName(CommandId id)
         case CI::CMD_READ_MEM: return "READ_MEM";
         case CI::CMD_WRITE_MEM: return "WRITE_MEM";
         case CI::CMD_SET_SLOT: return "SET_SLOT";
+        case CI::CMD_GET_TBBLUE_REG: return "GET_TBBLUE_REG";
+        case CI::CMD_READ_BANK_MEM: return "READ_BANK_MEM";
+        case CI::CMD_WRITE_BANK_MEM: return "WRITE_BANK_MEM";
+        case CI::CMD_SET_NEXTREGS: return "SET_NEXTREGS";
+        case CI::CMD_READ_MEM_BLOCKS: return "READ_MEM_BLOCKS";
+        case CI::CMD_GET_SPRITES_PALETTE: return "GET_SPRITES_PALETTE";
+        case CI::CMD_GET_SPRITES_CLIP_WINDOW_AND_CONTROL: return "GET_SPRITES_CLIP_WINDOW_AND_CONTROL";
+        case CI::CMD_GET_SPRITES: return "GET_SPRITES";
+        case CI::CMD_GET_SPRITE_PATTERNS: return "GET_SPRITE_PATTERNS";
         case CI::CMD_SET_BORDER: return "SET_BORDER";
         case CI::CMD_READ_PORT: return "READ_PORT";
         case CI::CMD_WRITE_PORT: return "WRITE_PORT";
@@ -306,6 +323,24 @@ Response Server::handleCommand(const Command& cmd)
             return handleSetSlot(cmd);
         case CommandId::CMD_WRITE_BANK:
             return handleWriteBank(cmd);
+        case CommandId::CMD_READ_BANK_MEM:
+            return handleReadBankMem(cmd);
+        case CommandId::CMD_WRITE_BANK_MEM:
+            return handleWriteBankMem(cmd);
+        case CommandId::CMD_SET_NEXTREGS:
+            return handleSetNextRegs(cmd);
+        case CommandId::CMD_GET_TBBLUE_REG:
+            return handleGetTbblueReg(cmd);
+        case CommandId::CMD_READ_MEM_BLOCKS:
+            return handleReadMemBlocks(cmd);
+        case CommandId::CMD_GET_SPRITES_PALETTE:
+            return handleGetSpritesPalette(cmd);
+        case CommandId::CMD_GET_SPRITES_CLIP_WINDOW_AND_CONTROL:
+            return handleGetSpritesClip(cmd);
+        case CommandId::CMD_GET_SPRITES:
+            return handleGetSprites(cmd);
+        case CommandId::CMD_GET_SPRITE_PATTERNS:
+            return handleGetSpritePatterns(cmd);
         case CommandId::CMD_SET_BORDER:
             return handleSetBorder(cmd);
         case CommandId::CMD_READ_PORT:
@@ -320,6 +355,16 @@ Response Server::handleCommand(const Command& cmd)
             return handleGetHistoryInfo(cmd);
         case CommandId::CMD_GET_HISTORY_ENTRY:
             return handleGetHistoryEntry(cmd);
+        case CommandId::CMD_SET_BREAKPOINTS:
+            return handleSetBreakpoints(cmd);
+        case CommandId::CMD_RESTORE_MEM:
+            return handleRestoreMem(cmd);
+        case CommandId::CMD_LOOPBACK:
+            return handleLoopback(cmd);
+        case CommandId::CMD_EXEC_ASM:
+            return handleExecAsm(cmd);
+        case CommandId::CMD_INTERRUPT_ON_OFF:
+            return handleInterruptOnOff(cmd);
         default:
             return makeNak(cmd.seqNo);
     }
@@ -601,7 +646,16 @@ Response Server::handleAddBreakpoint(const Command& cmd)
         std::string condition = Protocol::readNulString(
             cmd.payload.data() + 3, cmd.payload.size() - 3);
 
-        bpId = m_debug->addBreakpoint(addr, bank, condition);
+        // DeZog checks the condition on every pause anyway; the core form only spares the pauses where it is
+        // false. What does not translate is set without a condition (DeZog alone decides)
+        std::string coreCondition;
+        std::string reason;
+        if (!condition.empty() && !translateCondition(condition, coreCondition, reason))
+            std::cout << "[DZRP] Condition '" << condition << "' is checked by DeZog only (" << reason << ")\n";
+        if (!coreCondition.empty())
+            bpId = m_debug->addBreakpoint(addr, bank, coreCondition);
+        if (!bpId)
+            bpId = m_debug->addBreakpoint(addr, bank, "");
         m_breakpoints[bpId] = addr;
     }
 
@@ -671,7 +725,7 @@ Response Server::handleGetSupportedCommands(const Command& cmd)
 {
     Response resp;
     resp.seqNo = cmd.seqNo;
-    resp.payload = Protocol::buildSupportedCommandsBitfield();
+    resp.payload = Protocol::buildSupportedCommandsBitfield(m_debug->getMachineType() == MachineType::ZXNEXT);
     return resp;
 }
 
@@ -709,6 +763,108 @@ Response Server::handleWriteBank(const Command& cmd)
     resp.payload.push_back(0);  // No error
     resp.payload.push_back(0);  // Empty message
 
+    return resp;
+}
+
+/// CMD_READ_BANK_MEM: bank(1) + offset(2) + size(2) -> the bytes (a Next 8K bank; the offset wraps inside it)
+Response Server::handleReadBankMem(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    if (cmd.payload.size() >= 5)
+    {
+        const uint16_t offset = Protocol::readU16LE(cmd.payload.data() + 1);
+        const uint16_t size = Protocol::readU16LE(cmd.payload.data() + 3);
+        resp.payload = m_debug->readBankMemory(cmd.payload[0], offset, size);
+    }
+    return resp;
+}
+
+/// CMD_WRITE_BANK_MEM: bank(1) + offset(2) + data... -> empty
+Response Server::handleWriteBankMem(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    if (cmd.payload.size() >= 3)
+    {
+        const uint16_t offset = Protocol::readU16LE(cmd.payload.data() + 1);
+        std::vector<uint8_t> data(cmd.payload.begin() + 3, cmd.payload.end());
+        m_debug->writeBankMemory(cmd.payload[0], offset, data);
+    }
+    return resp;
+}
+
+/// CMD_SET_NEXTREGS: (register, value) pairs, in order -> empty
+Response Server::handleSetNextRegs(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    for (size_t i = 0; i + 1 < cmd.payload.size(); i += 2)
+        m_debug->writeNextReg(cmd.payload[i], cmd.payload[i + 1]);
+    return resp;
+}
+
+/// CMD_GET_TBBLUE_REG: register(1) -> value(1)
+Response Server::handleGetTbblueReg(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    resp.payload.push_back(cmd.payload.empty() ? 0 : m_debug->readNextReg(cmd.payload[0]));
+    return resp;
+}
+
+/// CMD_READ_MEM_BLOCKS: length(4, unused) + { addr(2) + size(2) }... -> the blocks one after the other (the 64K address space)
+Response Server::handleReadMemBlocks(const Command& cmd)
+{
+    constexpr size_t kLengthField = 4;
+    constexpr size_t kBlockEntry = 4;
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    for (size_t i = kLengthField; i + kBlockEntry <= cmd.payload.size(); i += kBlockEntry)
+    {
+        const uint16_t addr = Protocol::readU16LE(cmd.payload.data() + i);
+        const uint16_t size = Protocol::readU16LE(cmd.payload.data() + i + 2);
+        const std::vector<uint8_t> block = m_debug->readMemory(addr, size);
+        resp.payload.insert(resp.payload.end(), block.begin(), block.end());
+    }
+    return resp;
+}
+
+/// CMD_GET_SPRITES_PALETTE: palette(1, 0 / 1) -> 256 x (colour, 9th-bit byte)
+Response Server::handleGetSpritesPalette(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    resp.payload = m_debug->getSpritesPalette(cmd.payload.empty() ? 0 : (cmd.payload[0] & 1));
+    return resp;
+}
+
+/// CMD_GET_SPRITES_CLIP_WINDOW_AND_CONTROL: -> xl, xr, yt, yb, NR #15
+Response Server::handleGetSpritesClip(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    resp.payload = m_debug->getSpritesClipWindowAndControl();
+    return resp;
+}
+
+/// CMD_GET_SPRITES: index(1) + count(1) -> count x 5 attribute bytes
+Response Server::handleGetSprites(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    if (cmd.payload.size() >= 2)
+        resp.payload = m_debug->getSprites(cmd.payload[0], cmd.payload[1]);
+    return resp;
+}
+
+/// CMD_GET_SPRITE_PATTERNS: index(1) + count(1) -> count x 256 pattern bytes
+Response Server::handleGetSpritePatterns(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    if (cmd.payload.size() >= 2)
+        resp.payload = m_debug->getSpritePatterns(cmd.payload[0], cmd.payload[1]);
     return resp;
 }
 
@@ -779,6 +935,16 @@ Response Server::handleWriteState(const Command& cmd)
     return resp;
 }
 
+void Server::tellControlTakenBack()
+{
+    const IDebugInterface::Registers regs = m_debug->getRegisters();
+    notifyPause(
+        BreakReason::OTHER, regs.pc, 0,
+        "revoked_by_user: the user took control back (at the GUI or from a companion); this debug session has ended. "
+        "Do not reconnect without asking the user.");
+    std::cout << "[DZRP] The user took control back: closing the session\n";
+}
+
 void Server::notifyPause(BreakReason reason, uint16_t addr, uint8_t bank,
                          const std::string& message)
 {
@@ -816,6 +982,60 @@ void Server::notifyPause(BreakReason reason, uint16_t addr, uint8_t bank,
             return;
         totalSent += static_cast<size_t>(sent);
     }
+}
+
+/// CMD_SET_BREAKPOINTS: long addresses (3 bytes each) -> the byte at each. dezogif patches an RST there and answers
+/// the byte it replaced; the breakpoints here are the emulator's own, so nothing is patched and the byte is the
+/// memory's (dzrpbufferremote.ts sendDzrpCmdSetBreakpoints)
+Response Server::handleSetBreakpoints(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    for (size_t i = 0; i + 3 <= cmd.payload.size(); i += 3)
+    {
+        const uint16_t addr = Protocol::readU16LE(cmd.payload.data() + i);
+        const std::vector<uint8_t> byte = m_debug->readMemory(addr, 1);
+        resp.payload.push_back(byte.empty() ? 0 : byte[0]);
+    }
+    return resp;
+}
+
+/// CMD_RESTORE_MEM: puts back the bytes CMD_SET_BREAKPOINTS replaced. Nothing was replaced (see above): writing the
+/// bytes back would undo what the program wrote there since, so an empty ACK
+Response Server::handleRestoreMem(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    return resp;
+}
+
+/// CMD_LOOPBACK: the payload back (a transport test)
+Response Server::handleLoopback(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    resp.payload = cmd.payload;
+    return resp;
+}
+
+/// CMD_EXEC_ASM: error(1) + F A C B E D L H. Running code sent by the debugger is not supported: error 1, zeros
+Response Server::handleExecAsm(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    resp.payload.assign(9, 0);
+    resp.payload[0] = 1;
+    return resp;
+}
+
+/// CMD_INTERRUPT_ON_OFF: on(1) -> an empty ACK
+Response Server::handleInterruptOnOff(const Command& cmd)
+{
+    Response resp;
+    resp.seqNo = cmd.seqNo;
+    if (!cmd.payload.empty())
+        m_debug->setInterrupts(cmd.payload[0] != 0);
+    return resp;
 }
 
 } // namespace dzrp

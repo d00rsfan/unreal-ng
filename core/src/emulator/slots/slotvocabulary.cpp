@@ -33,6 +33,9 @@ constexpr FunctionInfo kFunctions[] = {
     { "rtc", "real-time clock", "per machine (ZX-Evo `#BFF7 #DFF7 #EFF7`)" },
     { "palette", "Profi v5 palette", "`#xx7E`" },
     { "fdc.upd765", "+3 floppy controller", "`#2FFD`, `#3FFD`" },
+    { "fuller-ay", "Fuller Box AY (register `#3F`, data `#5F`)", "`#3F`, `#5F`" },
+    { "fuller-joystick", "Fuller joystick", "`#7F`" },
+    { "amx-mouse", "AMX mouse (Z80 PIO, IM 2 per mickey; buttons `#DF`)", "`#1F`, `#3F`, `#5F`, `#7F`, `#DF`" },
 };
 static_assert(sizeof(kFunctions) / sizeof(kFunctions[0]) == static_cast<std::size_t>(Function::Count));
 
@@ -187,5 +190,19 @@ EnumInfo Describe(BuiltInKind value) { return Lookup(kBuiltInKinds, value); }
 EnumInfo Describe(Opt value) { return Lookup(kOpts, value); }
 EnumInfo Describe(OptionKind value) { return Lookup(kOptionKinds, value); }
 EnumInfo Describe(Outcome value) { return Lookup(kOutcomes, value); }
+
+std::string PlainLabel(std::string_view name)
+{
+    std::string out;
+    out.reserve(name.size());
+    for (const char ch : name)
+    {
+        if (ch != '`')
+        {
+            out += ch;
+        }
+    }
+    return out;
+}
 
 } // namespace slots

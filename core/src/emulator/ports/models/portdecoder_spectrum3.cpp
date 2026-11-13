@@ -133,11 +133,10 @@ uint8_t PortDecoder_Spectrum3::DecodePortIn(uint16_t port, uint16_t pc)
         disp.decodedPort = port;
         disp.wasHandledInline = true;
     }
-    else if (IsBeta128Port(port) && !(_context->emulatorState.flags & CF_TRDOS))
+    else if (TryBeta128LowBytePortIn(port, result, disp))
     {
-        // Beta 128 FDC ports answer only while the TR-DOS ROM is paged in (as in the Pentagon decoder):
-        // outside TR-DOS the port stays undecoded and Z80::in() serves the floating bus
-        disp.wasBeta128Gated = true;
+        // Beta 128 FDC ports: low byte decode, answer only while the TR-DOS ROM is paged in (outside it the port
+        // stays undecoded and Z80::in() serves the floating bus)
     }
     else
     {
@@ -154,8 +153,7 @@ uint8_t PortDecoder_Spectrum3::DecodePortIn(uint16_t port, uint16_t pc)
     if (!key_exists(_loggingMutePorts, port))
     {
         // Determine RAM/ROM page where code executed from
-        std::string currentMemoryPage = GetPCAddressLocator(pc);
-        MLOGINFO("[In] [PC:%04X%s] Port: %02X; Value: %02X", pc, currentMemoryPage.c_str(), port, result);
+        MLOGINFO("[In] [PC:%04X%s] Port: %02X; Value: %02X", pc, GetPCAddressLocator(pc).c_str(), port, result);
     }
     /// endregion </Debug logging>
 
@@ -252,6 +250,11 @@ void PortDecoder_Spectrum3::DecodePortOut(uint16_t port, uint8_t value, uint16_t
         disp.wasDecoded = true;
     }
 
+    // Beta 128 (low byte #1F #3F #5F #7F #FF: A0=1, A1=1, so none of the arms above take it): the WD1793 and #FF
+    // take writes only while the TR-DOS ROM is paged in
+    if (!disp.wasDecoded)
+        TryBeta128LowBytePortOut(port, value, disp);
+
     /// region <Debug logging>
 
     // Check if port was not explicitly muted
@@ -260,8 +263,7 @@ void PortDecoder_Spectrum3::DecodePortOut(uint16_t port, uint8_t value, uint16_t
         if (!key_exists(_loggingMutePorts, port))
         {
             // Determine RAM/ROM page where code executed from
-            std::string currentMemoryPage = GetPCAddressLocator(pc);
-            MLOGINFO("[Out] [PC:%04X%s] Port: %02X; Value: %02X", pc, currentMemoryPage.c_str(), port, value);
+            MLOGINFO("[Out] [PC:%04X%s] Port: %02X; Value: %02X", pc, GetPCAddressLocator(pc).c_str(), port, value);
         }
     }
     /// endregion </Debug logging>
@@ -461,12 +463,12 @@ void PortDecoder_Spectrum3::UpdateModelMemoryBanks()
     memory.SetRAMPageToBank3(state.p7FFD & 0b0000'0111);
 }
 
-std::vector<ttd::PeripheralId> PortDecoder_Spectrum3::GetTTDModelStateIds() const
+std::vector<ttd::TTDDeviceType> PortDecoder_Spectrum3::GetTTDModelStateTypes() const
 {
     // #1FFD is +2A/+3-specific: not in the model-agnostic TTDChipsetState
     if (_context->pUPD765 != nullptr)
-        return { ttd::PeripheralId::Plus3Paging, ttd::PeripheralId::Upd765 };
-    return { ttd::PeripheralId::Plus3Paging };
+        return { ttd::TTDDeviceType::Plus3Paging, ttd::TTDDeviceType::Upd765 };
+    return { ttd::TTDDeviceType::Plus3Paging };
 }
 
 std::vector<std::unique_ptr<ttd::TTDSerializable>> PortDecoder_Spectrum3::CreateTTDSerializers() const

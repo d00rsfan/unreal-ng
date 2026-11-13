@@ -99,7 +99,7 @@ Snapshot overview and how loading works: [README](README.md).
 must be the running one: 16K and NTSC 48K are read as a 48K, 128Ke as a 128K, +3e as a +3, and a Scorpion on a ProfScorp or a smaller
 Pentagon on a bigger one is allowed with a warning. Any other model is refused with both named
 (*"the snapshot was saved on a Pentagon 512K, the running machine is a ZX-Spectrum 128k: create a Pentagon 512K to load it"*).
-The Qt window instead switches to the file's model first. The CPU position inside the frame is converted from "T-states since the
+The Qt window instead switches to the file's model first (choosing the file is the request). Through automation the same switch is opt-in: `switch_model=true` on the load (WebAPI, CLI `--switch`, Python, MCP `load_software`), or `[SNAPSHOT] SwitchModel=1` in the configuration makes it the default; an explicit `switch_model=false` always refuses. The switch replaces the emulator (the answer carries the new `emulator_id`). The CPU position inside the frame is converted from "T-states since the
 interrupt" to the emulator's own frame counting. The load report lists every block with its outcome: *applied*,
 *approximated* (applied as far as this machine can hold it), *ignored* or *unknown*.
 
@@ -107,10 +107,12 @@ interrupt" to the emulator's own frame counting. The load report lists every blo
 Session access: the guest's writes never reach the linked file. An embedded image is staged in a temporary file that goes with
 the medium.
 
-**Saving.** Version 1.5. RAM pages are zlib-compressed when that makes them smaller. File-backed disks and the tape are saved as links
-(relative to the snapshot's folder when inside it). Only machines that have a machine id above can be saved: the 48K, 128K, +2, +2A, +3,
-Pentagon (128 / 512 / 1024) and Scorpion. An ATM, ZX-Evo, Profi, TS-Conf or Sprinter state is refused with *"this model has no SZX
-machine id; save it as .z80 or .sna"*.
+**Saving.** Version 1.5, from the machine's 128K view (see the [README](README.md#how-a-snapshot-is-saved)). RAM pages are
+zlib-compressed when that makes them smaller. File-backed disks and the tape are saved as links (relative to the snapshot's folder
+when inside it). Only a snapshot that names a model with a machine id can be saved: the 48K, 128K, +2, +2A, +3, Pentagon
+(128 / 512 / 1024) and Scorpion, and the machines that give a 128K view: TS-Conf and the ATMs while their memory is laid out as a
+Spectrum 128K (the file says 128K), a Sprinter in a ZX mode (named by the mode: 128K, Pentagon 128, Scorpion). Other states are
+refused with the reason (*"this model has no SZX machine id; save as .z80 or .sna"*, or why there is no view).
 
 **Test material.** `testdata/loaders/szx/`: synthetic files written by libspectrum for every machine id we emulate, converted
 copies of the SNA / Z80 fixtures, and files from Spectaculator, ZXMAK2 and ZX-M8XXX. Each has a text dump of what libspectrum

@@ -2,6 +2,8 @@
 
 #include "vdac2card.h"
 
+#include "debugger/ttd/ttdserializable.h"
+
 // The card exists only in builds with the FT812 library (CMake ENABLE_VDAC2);
 // without it a VDAC2 configuration is refused at load (config.cpp)
 #ifdef ENABLE_VDAC2
@@ -9,6 +11,7 @@
 #include <eve/eve.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <type_traits>
@@ -45,7 +48,8 @@ std::string ResolveRomPath(const std::string& path)
 } // namespace
 
 Vdac2Card::Vdac2Card(EmulatorContext* context, std::function<uint32_t()> rasterInFrame)
-    : _context(context), _rasterInFrame(std::move(rasterInFrame))
+    : _context(context), _rasterInFrame(std::move(rasterInFrame)),
+      _history(context ? &context->histories : nullptr, std::string("vdac2"), "FT812 SPI transactions", 4096)
 {
     _logger = _context ? _context->pModuleLogger : nullptr;
 
@@ -373,7 +377,9 @@ void Vdac2Card::OnChipFrame()
         return;  // nothing new was drawn: the Screen keeps its last frame
 
     ConvertFrameToPicture();
-    if (Screen* screen = _context ? _context->pScreen : nullptr)
+    // Not from a throwaway TTD replay (it composes a position's picture and publishes it itself): a latch there
+    // would push frames nobody asked to see into the present queue, as MainLoop's native latch gate explains
+    if (Screen* screen = _context ? _context->pScreen : nullptr; screen && !(_context && _context->ttdReplayActive))
         screen->LatchExternalFrame();
     _latchedFrames++;
     if (_measureAlways.load())
@@ -521,6 +527,7 @@ struct CardBlob
     uint64_t edges[Vdac2Card::kMaxPendingEdges];
 };
 static_assert(std::is_trivially_copyable_v<CardBlob>, "the card blob is a plain byte image");
+
 static_assert(sizeof(CardBlob) == 8 + 8 * 4 + 8 * Vdac2Card::kMaxPendingEdges, "card blob layout drift");
 constexpr uint8_t kCardBlobVersion = 1;
 
@@ -540,6 +547,14 @@ uint64_t HashBytes(uint64_t h, const uint8_t* data, size_t size)
     return h;
 }
 }  // namespace
+
+std::vector<ttd::TTDTimeField> Vdac2Card::TtdTimeFields()
+{
+    // Measured 2026-10-09: frameBase and position advance one frame's tacts every frame at an idle machine
+    return {{static_cast<uint16_t>(offsetof(CardBlob, frameBase)), 8},
+            {static_cast<uint16_t>(offsetof(CardBlob, position)), 8},
+            {static_cast<uint16_t>(offsetof(CardBlob, nextEvent)), 8}};
+}
 
 size_t Vdac2Card::TtdStateSize() const
 {
@@ -804,6 +819,24 @@ bool Vdac2Card::StopCapture()
     return true;
 }
 
+/// A transaction's byte: the header, then the data (a read's data after its dummy byte, as MISO)
+void Vdac2Card::HistoryByte(uint8_t mosi, uint8_t miso)
+{
+    const uint32_t i = _transactionBytes++;
+    if (i < 3)
+    {
+        _transaction.header[i] = mosi;
+        return;
+    }
+    const bool read = (_transaction.header[0] >> 6) == 0;
+    if (read && i == 3)
+        return;  // the dummy byte
+    const uint32_t at = i - (read ? 4 : 3);
+    if (at < sizeof(_transaction.data))
+        _transaction.data[at] = read ? miso : mosi;
+    _transaction.length = at + 1;
+}
+
 void Vdac2Card::select(bool selected)
 {
     Synchronize();
@@ -812,6 +845,18 @@ void Vdac2Card::select(bool selected)
     EveSelect(_chip, selected ? 1 : 0);
     if (CaptureLive())
         _capture.Select(EveTotalClocks(_chip), selected);
+    if (_history.On() && !(_context && _context->ttdReplayActive)) [[unlikely]]
+    {
+        if (!selected && _transactionBytes != 0)
+            _history->Push(_transaction);
+        _transaction = {};
+        _transactionBytes = 0;
+        if (selected)
+        {
+            _transaction.frame = _context ? _context->emulatorState.frame_counter : 0;
+            _transaction.clock = EveTotalClocks(_chip);
+        }
+    }
     SampleInt(_time.position);
     PlanNextEvent();
 }
@@ -824,6 +869,8 @@ uint8_t Vdac2Card::exchange(uint8_t mosi)
     const uint8_t miso = EveExchange(_chip, mosi);
     if (CaptureLive())
         _capture.Byte(EveTotalClocks(_chip), mosi, miso);
+    if (_history.On()) [[unlikely]]
+        HistoryByte(mosi, miso);
     // A register write can raise INT_N at once (INT_EN with flags pending)
     // or release it (the REG_INT_FLAGS read)
     SampleInt(_time.position);
@@ -837,9 +884,11 @@ uint8_t Vdac2Card::exchange(uint8_t mosi)
 // VDAC2 configuration is refused at load), but the decoder's calls still
 // link against these. Nothing here runs
 Vdac2Card::Vdac2Card(EmulatorContext* context, std::function<uint32_t()> rasterInFrame)
-    : _context(context), _rasterInFrame(std::move(rasterInFrame))
+    : _context(context), _rasterInFrame(std::move(rasterInFrame)),
+      _history(context ? &context->histories : nullptr, std::string("vdac2"), "FT812 SPI transactions", 4096)
 {
 }
+void Vdac2Card::HistoryByte(uint8_t, uint8_t) {}
 Vdac2Card::~Vdac2Card() = default;
 void Vdac2Card::PowerOn() {}
 void Vdac2Card::OnFrameEnd() {}
@@ -859,6 +908,7 @@ void Vdac2Card::ReadFrameMetrics(Vdac2Control::FrameMetrics& out, bool, bool) { 
 bool Vdac2Card::PresentedFrameMetrics(Vdac2Control::FrameMetrics&) const { return false; }
 void Vdac2Card::select(bool) {}
 uint8_t Vdac2Card::exchange(uint8_t) { return 0xFF; }
+std::vector<ttd::TTDTimeField> Vdac2Card::TtdTimeFields() { return {}; }
 size_t Vdac2Card::TtdStateSize() const { return 0; }
 void Vdac2Card::TtdSaveState(uint8_t*) const {}
 bool Vdac2Card::TtdLoadState(const uint8_t*) { return false; }

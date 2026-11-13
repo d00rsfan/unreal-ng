@@ -9,9 +9,13 @@
 #include "emulator/platform.h"
 #include "emulator/sound/audio.h"
 #include "emulator/memory/memory.h"
+#include "emulator/io/z80n/nextboardissue.h"
 #include "emulator/ports/models/profiboard.h"
 #include "emulator/ports/portdecoder.h"
 #include "emulator/video/atm/atmgeometry.h"
+#include "emulator/video/displayrate.h"
+#include "emulator/video/presentpolicy.h"
+#include "emulator/video/smoothmotion.h"
 #include "emulator/io/network/networkspec.h"
 #include "emulator/io/serial/comportspec.h"
 #include "emulator/io/serial/hayesmodempeer.h"
@@ -19,6 +23,8 @@
 #include "emulator/io/serial/uart16550.h"
 #include "emulator/io/serial/esp/espmodule.h"
 #include "emulator/io/sprinter/isa/isaslotconfig.h"
+#include "emulator/io/storage/sessionwritemap.h"
+#include "emulator/media/compositemediumfactory.h"
 #include "emulator/slots/slotmanager.h"
 #include <cassert>
 #include <array>
@@ -250,6 +256,7 @@ bool Config::ParseConfig(IniFile& inimanager)
 	};
 
 	config.reset_rom = RM_SOS;
+	line[0] = '\0';  // CopyStringValue leaves the buffer as it is when the key is missing (BUGS.md 2026-10-11 #2)
 	CopyStringValue(inimanager.GetValue(misc, "RESET", nullptr), line, sizeof line); // What ROM bank to set active during reset
 	for (const auto& mapping : resetMappings)
 	{
@@ -283,6 +290,9 @@ bool Config::ParseConfig(IniFile& inimanager)
     // Populate rom files for each platform
     CopyStringValue(inimanager.GetValue(rom, "PENTAGON", nullptr), config.pent_rom_path, sizeof config.pent_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "48k", nullptr), config.zx48_rom_path, sizeof config.zx48_rom_path);
+    // The Beta 128's own TR-DOS ROM on a board whose ROM file has none (the 48K): empty = no TR-DOS
+    config.dos_rom_path[0] = '\0';
+    CopyStringValue(inimanager.GetValue(rom, "TRDOS", nullptr), config.dos_rom_path, sizeof config.dos_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "128k", nullptr), config.zx128_rom_path, sizeof config.zx128_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "PLUS3", nullptr), config.plus3_rom_path, sizeof config.plus3_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "PLUS2", nullptr), config.plus2_rom_path, sizeof config.plus2_rom_path);
@@ -332,6 +342,8 @@ bool Config::ParseConfig(IniFile& inimanager)
 	// PROFI section: battery-backed RTC cells
 	config.profi_nvram_path[0] = '\0';  // a config without the key must not inherit a previous path
 	CopyStringValue(inimanager.GetValue("PROFI", "NvramFile", nullptr), config.profi_nvram_path, sizeof config.profi_nvram_path);
+	config.smuc_nvram_path[0] = '\0';  // a config without the key must not inherit a previous path
+	CopyStringValue(inimanager.GetValue("SMUC", "NvramFile", nullptr), config.smuc_nvram_path, sizeof config.smuc_nvram_path);
 	{
 		// The board's video sync PROM (2026-10-01-profi-v3-v5 design section 5.1)
 		const char* syncProm = inimanager.GetValue("PROFI", "SyncProm", nullptr);
@@ -394,6 +406,9 @@ bool Config::ParseConfig(IniFile& inimanager)
 		config.profi_keyboard = static_cast<uint8_t>(parsed);
 	}
 
+	// SNAPSHOT section: what a load may do to the running machine (SwitchModel: automation default for an SZX saved on another model)
+	config.snapshot_switch_model = inimanager.GetLongValue("SNAPSHOT", "SwitchModel", 0) ? true : false;
+
 	// SPRINTER section (Sprinter tdd-integration §1.1): start mode, front-panel turbo, CMOS image
 	config.sprinter.fast_start = static_cast<uint8_t>(inimanager.GetLongValue("SPRINTER", "FastStart", 0) ? 1 : 0);
 	config.sprinter.turbo_allowed = static_cast<uint8_t>(inimanager.GetLongValue("SPRINTER", "Turbo", 1) ? 1 : 0);
@@ -415,7 +430,7 @@ bool Config::ParseConfig(IniFile& inimanager)
 			if (sprinterisa::ParseKind(v, kind))
 				slot.kind = static_cast<uint8_t>(kind);
 			else
-				MLOGWARNING("Config: unknown [ISA] %s=%s (NONE | ZXBUS | RAM | NE2000 | EL3C509B | SPRINTERESP | MODEM | DUAL16552), %s kept",
+				MLOGWARNING("Config: unknown [ISA] %s=%s (NONE | ZXBUS | RAM | NE2000 | EL3C509B | SPRINTERESP | MODEM | DUAL16552 | WILDSOUND), %s kept",
 				            prefix.c_str(), v, sprinterisa::KindName(static_cast<sprinterisa::CardKind>(slot.kind)));
 		}
 		const auto slotKind = static_cast<sprinterisa::CardKind>(slot.kind);
@@ -448,6 +463,13 @@ bool Config::ParseConfig(IniFile& inimanager)
 		}
 		else if (kind == sprinterisa::CardKind::Dual16552)
 			slot.irq = sprinterisa::kSerialDefaultIrqA;
+		else if (kind == sprinterisa::CardKind::WildSound)
+		{
+			// The ISA Wild Sound answers at I/O #000-#001 (what prosiak.exe uses; the board's glue is undocumented,
+			// docs/inprogress/2026-10-09-wildsound/design.md §2.1); no IRQ
+			slot.base = 0;
+			slot.irq = 0;
+		}
 		if (const char* v = inimanager.GetValue("ISA", (prefix + "Base").c_str(), nullptr))
 		{
 			uint16_t base = 0;
@@ -519,6 +541,63 @@ bool Config::ParseConfig(IniFile& inimanager)
 		}
 	}
 
+	// [SMUC] Isa: the card in the SMUC's ISA-8 slot (SMUC hardware reference §5.1, the ISA window). A UART card only:
+	// the window is ISA #200-#3FF, the firmware probes COM1
+	config.smucIsa = sprinterisa::SlotConfig{};
+	if (const char* v = inimanager.GetValue("SMUC", "Isa", nullptr))
+	{
+		sprinterisa::CardKind kind;
+		if (sprinterisa::ParseKind(v, kind) &&
+		    (kind == sprinterisa::CardKind::None || kind == sprinterisa::CardKind::Modem || kind == sprinterisa::CardKind::Dual16552))
+			config.smucIsa.kind = static_cast<uint8_t>(kind);
+		else
+			MLOGWARNING("Config: [SMUC] Isa=%s: NONE | MODEM | DUAL16552, NONE used", v);
+	}
+	if (config.smucIsa.kind == static_cast<uint8_t>(sprinterisa::CardKind::Modem))
+	{
+		config.smucIsa.base = sprinterisa::kModemDefaultBase;
+		config.smucIsa.irq = sprinterisa::kModemDefaultIrq;
+		if (const char* v = inimanager.GetValue("SMUC", "IsaBase", nullptr))
+		{
+			uint16_t base = 0;
+			if (sprinterisa::ParseModemBase(v, base))
+				config.smucIsa.base = base;
+			else
+				MLOGWARNING("Config: [SMUC] IsaBase=%s: the modem's COM base is 0x3F8 | 0x2F8 | 0x3E8 | 0x2E8, 0x3F8 used", v);
+		}
+		const auto irq = static_cast<uint8_t>(inimanager.GetLongValue("SMUC", "IsaIrq", config.smucIsa.irq) & 0x0F);
+		if (sprinterisa::ValidModemIrq(irq))
+			config.smucIsa.irq = irq;
+		else
+			MLOGWARNING("Config: [SMUC] IsaIrq=%u: the modem's IRQ is 2 | 3 | 4 | 5 | 7, 4 used", irq);
+	}
+	else if (config.smucIsa.kind == static_cast<uint8_t>(sprinterisa::CardKind::Dual16552))
+	{
+		config.smucIsa.base = sprinterisa::kSerialCom1Base;
+		config.smucIsa.irq = sprinterisa::kSerialDefaultIrqA;
+	}
+	if (const char* v = inimanager.GetValue("SMUC", "IsaPeer", nullptr))
+	{
+		ComPortSpec spec;
+		std::string error;
+		if (ComPortSpec::Parse(v, spec, error) && spec.ToString().size() < sizeof(config.smucIsa.peer))
+			std::snprintf(config.smucIsa.peer, sizeof(config.smucIsa.peer), "%s", spec.ToString().c_str());
+		else
+			MLOGWARNING("Config: [SMUC] IsaPeer=%s: %s - the card's default used", v, error.c_str());
+	}
+
+	// [SMUC] NvramInitial: relative to the config file (a shipped image beside it)
+	config.smuc_nvram_initial_path[0] = '\0';
+	if (const char* v = inimanager.GetValue("SMUC", "NvramInitial", nullptr); v && v[0] != '\0')
+	{
+		std::filesystem::path initial = FileHelper::ToFsPath(v);
+		if (initial.is_relative() && !_configFilePath.empty())
+			initial = FileHelper::ToFsPath(_configFilePath).parent_path() / initial;
+		const auto text = initial.u8string();
+		CopyStringValue(std::string(text.begin(), text.end()).c_str(), config.smuc_nvram_initial_path,
+		                sizeof config.smuc_nvram_initial_path);
+	}
+
 	// [ZC] (the Z-Controller SD card) is read by MediaConfig with the rest of the media set
     CopyStringValue(inimanager.GetValue(rom, "SCORP", nullptr), config.scorp_rom_path, sizeof config.scorp_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "PROFROM", nullptr), config.prof_rom_path, sizeof config.prof_rom_path);
@@ -536,6 +615,30 @@ bool Config::ParseConfig(IniFile& inimanager)
     CopyStringValue(inimanager.GetValue(rom, "LSY", nullptr), config.lsy_rom_path, sizeof config.lsy_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "PHOENIX", nullptr), config.phoenix_rom_path, sizeof config.phoenix_rom_path);
     CopyStringValue(inimanager.GetValue(rom, "SPRINTER", nullptr), config.sprinter_rom_path, sizeof config.sprinter_rom_path);
+    CopyStringValue(inimanager.GetValue(rom, "NEXT", nullptr), config.next_rom_path, sizeof config.next_rom_path);
+    CopyStringValue(inimanager.GetValue(rom, "NEXTBOOT", nullptr), config.next_boot_rom_path, sizeof config.next_boot_rom_path);
+    CopyStringValue(inimanager.GetValue("NEXT", "SdCard", nullptr), config.next_sd_path, sizeof config.next_sd_path);
+    {
+        // [NEXT] LayerCapture = on|off (also 1 / 0, true / false, yes / no): default on, the measured cost is under 5 % of a frame
+        const char* word = inimanager.GetValue("NEXT", "LayerCapture", "on");
+        const std::string text = word ? StringHelper::ToLower(word) : std::string("on");
+        config.next_layer_capture = (text == "off" || text == "0" || text == "false" || text == "no") ? 0 : 1;
+        if (text != "on" && text != "off" && text != "0" && text != "1" && text != "true" && text != "false" && text != "yes" && text != "no")
+            MLOGWARNING("Config: [NEXT] LayerCapture=%s is not on or off - on used", word);
+    }
+    {
+        // [NEXT] ZxnDdma = on|off: the core has the zxnDDMA blitter commands on port #6B (the variant NEXT-DDMA sets it); default off
+        const std::string word = inimanager.GetValue("NEXT", "ZxnDdma", "off");
+        config.next_zxnddma = (word == "on" || word == "1" || word == "true" || word == "yes") ? 1 : 0;
+    }
+    {
+        // [NEXT] Board = issue2|issue4|issue5 (also ks1|ks2|ks3): the PCB the core is built for (research-variants.md); default the KS2
+        const char* word = inimanager.GetValue("NEXT", "Board", "issue4");
+        NextBoardIssue issue = NextBoardIssue::Issue4;
+        if (word && !NextBoardIssueFromName(word, issue))
+            MLOGWARNING("Config: [NEXT] Board=%s is not issue2, issue4 or issue5 - issue4 used", word);
+        config.next_board_issue = static_cast<uint8_t>(issue);
+    }
 #ifdef MOD_GSZ80
     // General Sound firmware ROM ([ROM] GS). Defaults to the shipped 32 KB
     // gs105a.rom (data/rom) so a fitted card always has firmware even when a
@@ -643,7 +746,8 @@ bool Config::ParseConfig(IniFile& inimanager)
 	}
 
 	// INPUT section - Kempston joystick (joystick TDD J4, J6):
-	//   Joystick=KEMPSTON|NONE (default KEMPSTON)
+	//   Joystick=KEMPSTON|NONE (default KEMPSTON); SINCLAIR1|SINCLAIR2|CURSOR|QAOP keep Kempston and plug keyjoy.1
+	//   (ControllerConfig, below)
 	//   JoystickKeys=up:kp8,down:kp2,left:kp4,right:kp6,fire:kp0 (absent: these defaults; empty: no host keys)
 	{
 		line[0] = '\0';
@@ -653,7 +757,14 @@ bool Config::ParseConfig(IniFile& inimanager)
 		if (StringHelper::CompareCaseInsensitive(line, "NONE", strlen("NONE")) == 0)
 			config.input.joystick = 0;
 		else if (line[0] != '\0' && StringHelper::CompareCaseInsensitive(line, "KEMPSTON", strlen("KEMPSTON")) != 0)
-			MLOGWARNING("Config: unsupported [INPUT] Joystick='%s', using KEMPSTON", line);
+		{
+			// Unreal Speccy's keyboard joysticks are connector plugs (controller manager); anything else is unknown
+			std::string choice(line);
+			std::transform(choice.begin(), choice.end(), choice.begin(),
+			               [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+			if (choice != "SINCLAIR1" && choice != "SINCLAIR2" && choice != "CURSOR" && choice != "QAOP")
+				MLOGWARNING("Config: unsupported [INPUT] Joystick='%s', using KEMPSTON", line);
+		}
 
 		const char* keys = inimanager.GetValue(input, "JoystickKeys", nullptr);
 		config.input.joystickKeysConfigured = keys != nullptr;
@@ -705,7 +816,7 @@ bool Config::ParseConfig(IniFile& inimanager)
 
 	// SOUND section
 	config.sound.covoxFB = (int)inimanager.GetLongValue(sound, "CovoxFB", 0);
-	config.sound.covoxDD = (int)inimanager.GetLongValue(sound, "CovoxDD", 0);
+	config.sound.covoxDD = (int)inimanager.GetLongValue(sound, "CovoxDD", 1);
 	config.sound.sd = (int)inimanager.GetLongValue(sound, "SD", 0);
 
 	// Core audio rate: auto | 44100 | 48000 | 88200 | 96000 | 176400 | 192000
@@ -810,8 +921,24 @@ bool Config::ParseConfig(IniFile& inimanager)
 		}
 	}
 
-	// FM loudness trim in dB relative to the hardware-derived default (0 = default)
-	config.sound.tsfmFmTrimDb = inimanager.GetDoubleValue(sound, "TSFM_FmTrimDb", 0.0);
+	// YM2203 FM loudness trim in dB over the measured board level (0 = the real board). The old key TSFM_FmTrimDb
+	// counted from the MiSTer-derived baseline 7.4 dB below it (shipped as 7.4): a copied ini keeps its sound
+	constexpr double kOldFmTrimOfTheBoardDb = 7.4;  // the old key's value at the real board's level
+	if (inimanager.GetValue(sound, "TSFM_FmLevelDb", nullptr) != nullptr)
+	{
+		config.sound.tsfmFmTrimDb = inimanager.GetDoubleValue(sound, "TSFM_FmLevelDb", 0.0);
+	}
+	else if (inimanager.GetValue(sound, "TSFM_FmTrimDb", nullptr) != nullptr)
+	{
+		const double oldTrimDb = inimanager.GetDoubleValue(sound, "TSFM_FmTrimDb", 0.0);
+		config.sound.tsfmFmTrimDb = oldTrimDb - kOldFmTrimOfTheBoardDb;
+		MLOGWARNING("Config: [SOUND] TSFM_FmTrimDb=%.1f is obsolete, read as TSFM_FmLevelDb=%.1f (0 = the real board)",
+		            oldTrimDb, config.sound.tsfmFmTrimDb);
+	}
+	else
+	{
+		config.sound.tsfmFmTrimDb = 0.0;
+	}
 
 	// AY / SSG stereo layout ([AY] Stereo): abc (default), acb or mono. A
 	// missing key resets to the default; unknown values warn and keep it
@@ -1021,11 +1148,60 @@ bool Config::ParseConfig(IniFile& inimanager)
 			MLOGWARNING("Config: unsupported [SOUND] DecimatorQuality='%s', using Reference", line);
 	}
 	// VIDEO section
-	// A/V sync video delay: auto (-1) = match the audio path latency
-	// (~2 frames); 0 = lowest input latency (audio trails by the ring depth)
+	// A/V sync: every frame is shown when its sound is heard (frame presenter design, section 3); the user trims it
 	{
-		long delay = inimanager.GetLongValue(video, "AVSyncDelayFrames", -1);  // "auto" parses as 0 - use -1 default
-		config.videoPresentDelayFrames = (delay >= -1 && delay <= 3) ? (int)delay : -1;
+		// The frame-count delay it replaces: the audio clock does its job, the key is ignored
+		if (inimanager.GetValue(video, "AVSyncDelayFrames", nullptr) != nullptr)
+			MLOGWARNING("Config: [VIDEO] AVSyncDelayFrames is retired and ignored: video follows the audio clock, "
+						"[VIDEO] LipSyncOffsetMs trims it");
+		const long lipSync = inimanager.GetLongValue(video, "LipSyncOffsetMs", 0);
+		const bool inRange = lipSync >= kMinLipSyncOffsetMs && lipSync <= kMaxLipSyncOffsetMs;
+		if (!inRange)
+			MLOGWARNING("Config: unsupported [VIDEO] LipSyncOffsetMs=%ld (%d..%d), using 0", lipSync,
+						kMinLipSyncOffsetMs, kMaxLipSyncOffsetMs);
+		config.lipSyncOffsetMs = inRange ? (int)lipSync : 0;
+	}
+	// The native presenter's policy: auto (default) | vrr | vsync. Unknown values warn and keep auto
+	{
+		line[0] = '\0';
+		CopyStringValue(inimanager.GetValue(video, "PresentPolicy", nullptr), line, sizeof line);
+		PresentPolicy policy = PresentPolicy::Auto;
+		if (line[0] != '\0' && !ParsePresentPolicy(line, policy))
+			MLOGWARNING("Config: unsupported [VIDEO] PresentPolicy='%s', using auto", line);
+		config.presentPolicy = static_cast<uint8_t>(policy);
+	}
+	// The display's rate for the machine's: keep (default) | match. Unknown values warn and keep keep
+	{
+		line[0] = '\0';
+		CopyStringValue(inimanager.GetValue(video, "DisplayRate", nullptr), line, sizeof line);
+		DisplayRate rate = DisplayRate::Keep;
+		if (line[0] != '\0' && !ParseDisplayRate(line, rate))
+			MLOGWARNING("Config: unsupported [VIDEO] DisplayRate='%s', using keep", line);
+		config.displayRate = static_cast<uint8_t>(rate);
+	}
+	// Smooth motion on a fixed display: off (default) | blend | interpolate | auto (interpolate when the display neither
+	// runs VRR nor a rate fitting the machine's: View > Video Synchronization). Unknown values warn and keep off
+	{
+		config.smoothMotion = static_cast<uint8_t>(smoothmotion::Mode::Off);
+		line[0] = '\0';
+		CopyStringValue(inimanager.GetValue(video, "SmoothMotion", nullptr), line, sizeof line);
+		smoothmotion::Mode mode = smoothmotion::Mode::Off;
+		if (line[0] != '\0' && !smoothmotion::ParseMode(line, mode))
+			MLOGWARNING("Config: unsupported [VIDEO] SmoothMotion='%s', using off", line);
+		config.smoothMotion = static_cast<uint8_t>(mode);
+	}
+	// The screen's effects on the GPU (default) or the CPU
+	{
+		config.effectsOnCpu = false;
+		line[0] = '\0';
+		CopyStringValue(inimanager.GetValue(video, "EffectsDevice", nullptr), line, sizeof line);
+		const auto is = [&line](const char* name) {
+			return StringHelper::CompareCaseInsensitive(line, name, strlen(name)) == 0 && line[strlen(name)] == '\0';
+		};
+		if (is("cpu"))
+			config.effectsOnCpu = true;
+		else if (line[0] != '\0' && !is("gpu"))
+			MLOGWARNING("Config: unsupported [VIDEO] EffectsDevice='%s', using gpu", line);
 	}
 
 	// Media set: [MEDIA] + legacy keys; relative paths are relative to the config file
@@ -1038,7 +1214,22 @@ bool Config::ParseConfig(IniFile& inimanager)
 		}
 		_mediaReport.clear();
 		_mediaSet = MediaConfig::FromIni(inimanager, configFolder, &_mediaReport);
+		const MediaSettings settings = MediaConfig::SettingsFromIni(inimanager, configFolder, &_mediaReport);
+		SessionSettings session;  // the defaults where the config says nothing
+		session.memoryLimit = settings.sessionMemoryLimit.value_or(session.memoryLimit);
+		session.arenaBytes = settings.sessionArenaBytes.value_or(session.arenaBytes);
+		session.flushSeconds = settings.sessionFlushSeconds.value_or(session.flushSeconds);
+		session.syncSeconds = settings.sessionSyncSeconds.value_or(session.syncSeconds);
+		session.journal = settings.sessionJournal.value_or(session.journal);
+		session.ioThreads = settings.sessionIoThreads.value_or(session.ioThreads);
+		session.spillFolder = settings.spillFolder.value_or(std::string());
+		SessionWriteMap::SetDefaults(session);
+		CompositeMediumFactory::SetDefaultExtentBudget(settings.extentBudget.value_or(CompositeMediumFactory::kDefaultExtentBudget));
 	}
+
+	// Connector plugs: [CONTROLLERS] + the legacy [INPUT] Joystick= keyboard joysticks
+	_controllerReport.clear();
+	_controllerSet = controllers::ControllerConfig::FromIni(inimanager, &_controllerReport);
 
 	// Emulated model
 	CopyStringValue(inimanager.GetValue(misc, "HIMEM", "PENTAGON"), line, sizeof line);
@@ -1152,6 +1343,28 @@ bool Config::ParseConfig(IniFile& inimanager)
 		{
 			MLOGWARNING("Config: [NETWORK] ComPort=%s: %s - no COM port", config.network.comPort, error.c_str());
 			config.network.comPort[0] = '\0';
+		}
+	}
+	config.network.comPort2[0] = '\0';
+	CopyStringValue(inimanager.GetValue(network, "ComPort2", nullptr), config.network.comPort2, sizeof config.network.comPort2);
+	{
+		ComPortSpec spec;
+		std::string error;
+		if (!ComPortSpec::Parse(config.network.comPort2, spec, error))
+		{
+			MLOGWARNING("Config: [NETWORK] ComPort2=%s: %s - no second COM port", config.network.comPort2, error.c_str());
+			config.network.comPort2[0] = '\0';
+		}
+	}
+	config.network.comPortJoy[0] = '\0';
+	CopyStringValue(inimanager.GetValue(network, "ComPortJoy", nullptr), config.network.comPortJoy, sizeof config.network.comPortJoy);
+	{
+		ComPortSpec spec;
+		std::string error;
+		if (!ComPortSpec::Parse(config.network.comPortJoy, spec, error))
+		{
+			MLOGWARNING("Config: [NETWORK] ComPortJoy=%s: %s - nothing on the joystick connector", config.network.comPortJoy, error.c_str());
+			config.network.comPortJoy[0] = '\0';
 		}
 	}
 	config.network.comModemLines = (inimanager.GetLongValue(network, "ComModemLines", 0) != 0) ? 1 : 0;
@@ -1485,6 +1698,7 @@ std::string Config::GetConfigFolderForModel(MEM_MODEL model, uint32_t ramSizeKB)
 		case MM_PLUS2:       return "spectrum2";
 		case MM_PLUS2A:      return "spectrum2a";
 		case MM_TSL:         return "ts-conf";
+		case MM_NEXT:        return "next";
 		default:
 			break;
 	}
@@ -1495,6 +1709,17 @@ std::string Config::GetConfigFolderForModel(MEM_MODEL model, uint32_t ramSizeKB)
 	std::transform(folder.begin(), folder.end(), folder.begin(),
 	               [](unsigned char c) { return (char)std::tolower(c); });
 	return folder;
+}
+
+uint32_t Config::EffectiveRamSize(MEM_MODEL model, uint32_t requestedKb, std::string& note)
+{
+    constexpr uint32_t kFourMegabytes = 4096, kTwoMegabytes = 2048;
+    if (model == MM_NEXT && requestedKb == kFourMegabytes)
+    {
+        note = "ZX Next with 4096 KB: this core addresses 2048 KB (8-bit MMU pages of 8 KB), created with 2048 KB";
+        return kTwoMegabytes;
+    }
+    return requestedKb;
 }
 
 bool Config::IsModelCreatable(const TMemModel& model)
@@ -1652,6 +1877,7 @@ void Config::ApplyModelTimingDefaults(CONFIG& config, bool canonicalGeometry)
 
         case MM_SPECTRUM128:
         case MM_PLUS2:
+        case MM_NEXT:  // the bare personality runs the 128K frame
             config.intstart = 1845;
             config.intlen   = 36;   // ZX-128K ULA has 72-HC INT = 36 T-states
             break;
@@ -1666,7 +1892,8 @@ void Config::ApplyModelTimingDefaults(CONFIG& config, bool canonicalGeometry)
 
         case MM_SCORP:
         case MM_PROFSCORP:
-            // Scorpion ZS-256: Sinclair-matching 312 x 224T frame, INT at the ZX48
+        case MM_GMX:
+            // Scorpion ZS-256 (the GMX card keeps the host frame in its Scorpion scheme): Sinclair-matching 312 x 224T frame, INT at the ZX48
             // position (hardware-reference 6; Xpeccy and ZXMAK2: 14336T to paper).
             // Frame/t_line values read from another model's INI must not leak in.
             config.frame    = 69888;   // 224 * 312
@@ -1732,9 +1959,12 @@ void Config::ApplyModelTimingDefaults(CONFIG& config, bool canonicalGeometry)
     if (canonicalGeometry)
     {
         // The Scorpion boards' Even M1 wait (z80.cpp) is part of the model, like its frame: only there, and only
-        // with the SC15.1 logic firmware ([MISC] ScorpionTurboLogic)
+        // with the SC15.1 logic firmware ([MISC] ScorpionTurboLogic). Not on the GMX: the fitting disconnects the
+        // host logic's WAIT line, the card's own logic waits in turbo instead (GMX design 2.6)
         config.even_M1 = ((config.mem_model == MM_SCORP || config.mem_model == MM_PROFSCORP) &&
-                          config.scorpionTurboLogic == ScorpionTurboLogic::SC151) ? 1 : 0;
+                          config.scorpionTurboLogic == ScorpionTurboLogic::SC151) ? EVEN_M1_NORMAL : 0;
+        if (config.mem_model == MM_GMX)
+            config.even_M1 = EVEN_M1_TURBO;
 
         switch (config.mem_model)
         {
@@ -1748,6 +1978,7 @@ void Config::ApplyModelTimingDefaults(CONFIG& config, bool canonicalGeometry)
             case MM_PLUS2:
             case MM_PLUS2A:
             case MM_PLUS3:
+            case MM_NEXT:
                 config.frame = 70908;   // 228 * 311
                 config.t_line = 228;
                 config.intstart = 1845;
@@ -1759,6 +1990,7 @@ void Config::ApplyModelTimingDefaults(CONFIG& config, bool canonicalGeometry)
                 break;
             case MM_SCORP:
             case MM_PROFSCORP:
+            case MM_GMX:
                 config.frame = 69888;   // 224 * 312
                 config.t_line = 224;
                 config.intstart = 1815;

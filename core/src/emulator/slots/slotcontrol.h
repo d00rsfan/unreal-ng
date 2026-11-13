@@ -56,7 +56,8 @@ struct SlotControlRequest
 {
     std::string verb;               ///< list, catalog, matrix, plug, remove, set, gs, network
     std::string emulatorId;         ///< the instance; "" = the selected one
-    std::string slot;               ///< plug: "zxbus.2", "zxbus.next", "ay-socket" ("" = the planner's choice)
+    /// plug: "zxbus.2", "zxbus.next", "ay-socket" ("" = the planner's choice); catalog: plan every card into this slot
+    std::string slot;
     std::string card;               ///< plug: card id; gs: the personality (gs, gs-lw, neogs or the GS names z80, lw, ngs)
     /// plug / set: "dip=ym,saa gsRam=2m" (space-separated name=value, comma list for a set option; "none" = empty).
     /// set merges them over the slot's current options
@@ -69,7 +70,8 @@ struct SlotControlRequest
     /// network: the settings, key = value as NetworkManager::ParseChange takes them ("card" = "zxnetusb,zxwifi",
     /// "hosts" = "a=10.0.2.7", ...)
     std::vector<std::pair<std::string, std::string>> settings;
-    /// Start the restarted machine when the old one ran (every automation surface); the Qt window starts it itself
+    /// Give the restarted machine the old one's run state (running, or started and paused: ModelSwitch::StartAsBefore) on
+    /// every automation surface; the Qt window does it itself
     bool startWhenRunning = true;
     /// Called with the old machine stopped, before it is destroyed (a GUI unbinds its views here)
     std::function<void(Emulator& old)> beforeRelease;
@@ -85,7 +87,7 @@ struct SlotControlReply
     /// Verb-specific fields, merged into the envelope: the report (list), cards (catalog), tables (matrix), plan /
     /// restart / media (changes)
     StateNode body = StateNode::Object();
-    /// Applied: the restarted machine (created; started when the old one ran and startWhenRunning)
+    /// Applied: the restarted machine (created; with startWhenRunning running or started paused as the old one)
     std::shared_ptr<Emulator> emulator;
 
     bool Ok() const
@@ -107,8 +109,15 @@ public:
 
     static const std::vector<std::string>& Verbs();
 
-    /// The machine's card catalog (verb catalog) for a slot set; the card nodes the catalog lists
-    static StateNode Catalog(const SlotManager::Result& current);
+    /// The machine's card catalog (verb catalog) for a slot set; the card nodes the catalog lists. `slot` empty: each
+    /// card's `thisMachine` is the plan of a plug where the planner puts it; else the plan of a plug into that slot
+    /// (a card of another bus refused, the card there now `inSlot`), what a picker for one slot offers
+    static StateNode Catalog(const SlotManager::Result& current, const std::string& slot = {});
+    /// How to fit `card` on this machine, for a message that says a function is missing (the joystick input on a 48K):
+    /// "fit the `kempston` card: slots plug edge.1 kempston (MCP emulator_manage slots_plug, WebAPI POST
+    /// /emulator/{id}/slots/edge.1/plug); the machine restarts". A fit that needs the override says so and why; ""
+    /// when the card cannot be fitted here (refused) or there is no machine
+    static std::string PlugHint(const SlotManager::Result& current, std::string_view card);
     /// A change plan as the surfaces show it (also a refused one): the plan engine's plan, the refusal, the new
     /// [SLOTS] lines
     static StateNode PlanValue(const SlotManager::ChangePlan& plan);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "debugger/targets/gscardtarget.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/platforms/tsconf/tsconfstate.h"
 
@@ -193,6 +194,25 @@ void TsConfInterrupts::ThawFramePulse(uint32_t t)
     }
 }
 
+uint32_t TsConfInterrupts::NextAssertT(uint32_t t)
+{
+    // After IsIntAsserted(t) said no: the events up to t are taken, nothing is latched
+    const uint8_t mask = _ts.regs[TsConfReg::IntMask];
+    if (VdosFrozen() || _ts.intPending || _lineSource || (mask & TsConfInt::WaitPort))
+        return t;
+
+    // An event at raster tact r latches at the first boundary whose raster reaches it (CatchUp)
+    const uint32_t from = _ts.intLastRaster;
+    uint32_t next = kFrameTacts;
+    const uint32_t hs = _ts.regs[TsConfReg::HsInt];
+    const uint32_t vs = _ts.regs[TsConfReg::VsIntL] | ((_ts.regs[TsConfReg::VsIntH] & 0x01u) << 8);
+    if ((mask & TsConfInt::Frame) && hs < kLineTacts && vs < kLines && vs * kLineTacts + hs >= from)
+        next = vs * kLineTacts + hs;
+    if (mask & TsConfInt::Line)
+        next = std::min(next, (from + kLineTacts - 1) / kLineTacts * kLineTacts);
+    return next < kFrameTacts ? next * Multiplier() : UINT32_MAX;
+}
+
 uint8_t TsConfInterrupts::AcknowledgeInterrupt(uint32_t t)
 {
     static constexpr struct
@@ -219,9 +239,13 @@ uint8_t TsConfInterrupts::AcknowledgeInterrupt(uint32_t t)
         {
             _ts.intPending &= static_cast<uint8_t>(~kPriority[sel].bit);
             _ts.intSel = sel;
+            if (_context->machineEventWatch) [[unlikely]]
+                GSReportHostEvent(_context, GSCardEvent::CpuInt, sel, kPriority[sel].vector);
             return kPriority[sel].vector;
         }
     }
+    if (_context->machineEventWatch) [[unlikely]]
+        GSReportHostEvent(_context, GSCardEvent::CpuInt, 0xFE, kPriority[_ts.intSel & 0x03].vector);
     return kPriority[_ts.intSel & 0x03].vector;  // nothing left: int_sel keeps its last source (no else branch)
 }
 
@@ -235,6 +259,24 @@ void TsConfInterrupts::OnWait(uint32_t ttBefore, uint32_t ticks)
     const uint32_t multiplier = Multiplier();
     const uint32_t t0 = ttBefore >> 8;                                  // CPU clocks, the stall's start
     const uint32_t t1 = static_cast<uint32_t>((static_cast<uint64_t>(ttBefore) + ticks + 255) >> 8);  // its end
+
+    // The common stall: no frame pulse is latched and the frame event is not in the rasters this stall evaluates. Then nothing
+    // below touches the pulse, and the two catch-ups latch what one to the stall's end latches (a line end between the start and
+    // the end is found by either)
+    if (!(_ts.intPending & TsConfInt::Frame) && !_lineSource) [[likely]]
+    {
+        const uint32_t from = _ts.intLastRaster;
+        const uint32_t to = std::min<uint32_t>(t1 / multiplier, kFrameTacts - 1);
+        const uint32_t hs = _ts.regs[TsConfReg::HsInt];
+        const uint32_t vs = _ts.regs[TsConfReg::VsIntL] | ((_ts.regs[TsConfReg::VsIntH] & 0x01u) << 8);
+        const uint32_t frameEvent = vs * kLineTacts + hs;
+        const bool eventInside = hs < kLineTacts && vs < kLines && frameEvent >= from && frameEvent <= to;
+        if (!eventInside)
+        {
+            CatchUp(to);
+            return;
+        }
+    }
 
     // Events up to the stall's start are latched; is the pulse running at it?
     CatchUp(RasterAt(t0));

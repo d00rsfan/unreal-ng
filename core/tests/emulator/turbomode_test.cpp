@@ -73,10 +73,6 @@ protected:
 
         _mainLoop = reinterpret_cast<MainLoop_CUT*>(_context->pMainLoop);
         ASSERT_NE(_mainLoop, nullptr);
-
-        // Low-latency presentation so the presented frame equals the last
-        // latch - the decimation cadence becomes directly observable
-        _screen->SetPresentDelayFrames(0);
     }
 
     void TearDown() override
@@ -295,7 +291,6 @@ TEST_F(TurboMode_Test, RenderedTurboFrameMatchesNormalMode)
     reference->GetContext()->pFeatureManager->setFeature(Features::kScreenHQ, true);  // same renderer as the fixture
     Screen* referenceScreen = reference->GetContext()->pScreen;
     ASSERT_NE(referenceScreen, nullptr);
-    referenceScreen->SetPresentDelayFrames(0);
     auto* referenceLoop = reinterpret_cast<MainLoop_CUT*>(reference->GetContext()->pMainLoop);
     ASSERT_NE(referenceLoop, nullptr);
 
@@ -345,6 +340,30 @@ TEST_F(TurboMode_Test, TurboDisengageRestoresPerFrameRendering)
     {
         EXPECT_NE(hashes[i], hashes[i - 1]) << "Frame " << i << " after turbo disengage did not refresh the presented image";
     }
+}
+
+TEST_F(TurboMode_Test, DirectRunAfterAPauseInsideASkippedTurboFrameRendersAgain)
+{
+    // A pause parks the loop inside RunFrame's CPU cycle. In a skipped turbo frame (turbo tape warping a load)
+    // that left the screen's skip flag set, and the direct runs after it (run_frames over MCP) latched frame
+    // after frame with the old pixels: screenshots showed the boot screen while the machine ran a program
+    _emulator->EnableTurboMode();
+    RunFramesAndCollectHashes(2);           // frame 1 of the decimation cycle: a skipped one starts now
+    _screen->SetTurboRenderSkip(true);      // the state a park inside that frame's CPU cycle leaves
+    _emulator->DisableTurboMode();          // the load ended: turbo tape stood down
+
+    std::vector<uint64_t> hashes;
+    const uint8_t borderColors[] = {2, 4, 1};
+    for (uint8_t color : borderColors)
+    {
+        _screen->SetBorderColor(color);
+        _emulator->RunNFrames(1);
+        hashes.push_back(PresentedHash());
+    }
+
+    // The frame the pause interrupted may stay skipped; the frames after it draw again
+    EXPECT_FALSE(_screen->IsTurboRenderSkip());
+    EXPECT_NE(hashes[2], hashes[1]) << "Direct-run frames after the pause did not refresh the presented image";
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +423,9 @@ TEST_F(TurboMode_Test, TurboSuppressesSoundSynthesisAndResumesAfter)
     EXPECT_TRUE(sound.isSynthesisSuppressed());
     EXPECT_TRUE(sound.getBeeper().isSynthesisSuppressed());
     if (sound.getCovox())
+    {
         EXPECT_TRUE(sound.getCovox()->isSynthesisSuppressed());
+    }
 
     // Turbo with audio requested (recording use case): synthesis stays on
     _emulator->DisableTurboMode();

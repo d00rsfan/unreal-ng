@@ -1,12 +1,17 @@
 #include "devicescreen.h"
-#include "crtfilter.h"
+#include "emulator/remotecontrolguard.h"
+#include "crtbeammodel.h"
+#include "crtrenderer.h"
 
 #include <QDebug>
+#include <QScreen>
+#include <QTimer>
 #include <QFocusEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QWheelEvent>
+#include <algorithm>
 #include <cmath>
 
 #include "emulator/emulator.h"
@@ -15,6 +20,9 @@
 #include "emulator/keyboardmanager.h"
 #include "emulator/mousecapturecontroller.h"
 #include "ui_devicescreen.h"
+/// The picture without CRT effects (CRTRenderer's plain nearest scale)
+static const CRTProfileParams kPlainParams = CRTProfileParams::None();
+
 static inline bool isFloatsEqual(float x, float y, float epsilon = 0.01f)
 {
     bool result = false;
@@ -38,12 +46,15 @@ DeviceScreen::~DeviceScreen()
     delete ui;
 }
 
-void DeviceScreen::init(uint16_t width, uint16_t height, void* buffer)
+void DeviceScreen::init(uint16_t width, uint16_t height, void* buffer, float aspect)
 {
     detach();
 
-    // Note: the widget's aspect ratio is fixed (352x288) regardless of the framebuffer size;
-    // larger (overscan) framebuffers are scaled into the same frame
+    // Note: the widget's aspect ratio is the CRT frame's 352x288 regardless of the framebuffer size;
+    // larger (overscan) framebuffers are scaled into the same frame. A video card's picture brings its own
+    ratio = aspect > 0.0f ? aspect : kNativeRatio;
+    _baseRatio = ratio;
+    _frameGeometry = PictureGeometry{};
 
     devicePixelsRect = QRectF(0.0, 0.0, width, height);
     // RGBX8888: same byte layout as RGBA8888, but alpha is IGNORED (treated as
@@ -72,6 +83,7 @@ void DeviceScreen::detach()
             devicePixels = nullptr;
         }
         _frameSource = nullptr;
+        _nextFrameSource = nullptr;
     }
     _latchedFrame = QImage();
 
@@ -87,6 +99,76 @@ void DeviceScreen::detach()
     update();
 }
 
+void DeviceScreen::setFrameSource(ScreenFrames source)
+{
+    _displayRate = source.displayRate;
+    smoothmotion::Mode mode = source.smooth;
+    const QByteArray forced = qgetenv("UNREAL_SMOOTH_MOTION");
+    if (!forced.isEmpty() && !smoothmotion::ParseMode(forced.constData(), mode))
+        qWarning() << "DeviceScreen: UNREAL_SMOOTH_MOTION=" << forced << "is not off | blend | interpolate | auto";
+    {
+        std::lock_guard<std::mutex> lock(_frameSourceMutex);
+        _frameSource = std::move(source.at);
+        _nextFrameSource = std::move(source.next);
+    }
+    _smoothAuto = mode == smoothmotion::Mode::Auto;
+    _sync = VideoSync::Off;
+    _syncReason.clear();
+    _smooth.Reset();
+    _smooth.SetMode(mode);
+    _smoothShown = {};
+    updateVideoSync();
+}
+
+void DeviceScreen::updateVideoSync()
+{
+    if (!_smoothAuto)
+    {
+        _sync = VideoSync::Off;
+        _syncReason.clear();
+        return;
+    }
+    const QScreen* display = screen();
+    const double displayHz = display ? display->refreshRate() : 0.0;
+    const double machineHz = _frameRate.Hz();
+    const VideoSync sync = PickVideoSync(false, displayHz, machineHz, _sync);
+    _syncReason = "no VRR and no display rate switch on the software screen (gpu on has them)";
+    if (sync == VideoSync::Interpolate && machineHz <= 0.0)
+        _syncReason += "; the machine's frame rate is not steady yet";
+    if (sync == _sync)
+        return;
+    _sync = sync;
+    _smooth.Reset();
+    _smoothShown = {};
+}
+
+WindowPresentStats DeviceScreen::presentStats() const
+{
+    WindowPresentStats out;
+    out.presenter = "software";
+    out.vrrSupport = "no";
+    out.vrrReason = "the software screen presents on the refresh grid";
+    const QScreen* display = screen();
+    out.minRefreshHz = out.maxRefreshHz = display ? display->refreshRate() : 0.0;
+    FillSmoothStats(_smooth, smoothActive(), false, out);
+    out.sync = VideoSyncName(_sync);
+    out.syncReason = _syncReason;
+    out.machineHz = _frameRate.Hz();
+    out.clock = FrameClockSourceName(_shownClock);
+    if (_displayRate == DisplayRate::Match)
+    {
+        out.displayState = "unchanged";
+        out.displayReason = "the software screen does not switch the display's mode (gpu on does)";
+    }
+    return out;
+}
+
+bool DeviceScreen::smoothActive() const
+{
+    return _smooth.GetMode() != smoothmotion::Mode::Off && _nextFrameSource && !_temporalEnabled &&
+           (!_smoothAuto || _sync == VideoSync::Interpolate);
+}
+
 void DeviceScreen::clearFrameSource()
 {
     // Runs on the MessageCenter worker inside the pre-free drain window:
@@ -94,6 +176,7 @@ void DeviceScreen::clearFrameSource()
     // touches only owned memory. No Qt calls here (cross-thread safe).
     std::lock_guard<std::mutex> lock(_frameSourceMutex);
     _frameSource = nullptr;
+    _nextFrameSource = nullptr;
     if (devicePixels)
     {
         delete devicePixels;
@@ -129,8 +212,6 @@ void DeviceScreen::paintEvent(QPaintEvent* event)
     // Source rectangle with optional viewport cropping - applies to BOTH
     // paint paths (the tear-free latched frame and the legacy live buffer
     // share the same framebuffer geometry)
-    const QRectF sourceRect = displaySourceRect();
-
     // Destination is always the full widget - clip to dirty region for efficiency.
     // Using event->rect() as destination would squeeze the entire source into
     // a partial rectangle when sibling widgets (HUD overlay) trigger partial repaints.
@@ -144,6 +225,7 @@ void DeviceScreen::paintEvent(QPaintEvent* event)
     // read on owned memory.
     QImage legacyCopy;
     QImage* drawImage = nullptr;
+    PictureGeometry geometry;
     {
         std::lock_guard<std::mutex> lock(_frameSourceMutex);
 
@@ -154,10 +236,59 @@ void DeviceScreen::paintEvent(QPaintEvent* event)
         // Draw into the widget's FULL rect - QPainter clips to event->rect()
         // automatically. Targeting event->rect() squeezed the whole framebuffer
         // into partial dirty rects (move/scroll damage), stretching the image.
+        const int64_t now = SteadyNowNs();
+        PresentFrameInfo info;
         if (_frameSource && !_latchedFrame.isNull() &&
-            _frameSource(_latchedFrame.bits(), static_cast<size_t>(_latchedFrame.sizeInBytes())))
+            _frameSource(now, _latchedFrame.bits(), static_cast<size_t>(_latchedFrame.sizeInBytes()), &info))
         {
             drawImage = &_latchedFrame;
+            geometry = info.geometry;  // the geometry latched with the frame: the picture view cuts by it
+            _shownClock = info.source;
+            if (_smoothAuto)
+            {
+                if (info.serial != 0 && info.serial != _meteredSerial && info.targetNs > 0)
+                {
+                    _meteredSerial = info.serial;
+                    // A turbo frame (timed by its latch) says nothing about the machine's rate
+                    if (info.source == FrameClockSource::Latch)
+                        _frameRate.PushUnpaced();
+                    else
+                        _frameRate.Push(info.targetNs, info.periodNs);
+                }
+                updateVideoSync();
+            }
+            const bool smooth = smoothActive();
+            if (smooth)
+            {
+                // Each frame once, in order (the screen holds a few)
+                if (_nextFrame.size() != _latchedFrame.size())
+                    _nextFrame = QImage(_latchedFrame.size(), QImage::Format_RGBX8888);
+                for (size_t k = 0; k < smoothmotion::SmoothMotion::kFrames; k++)
+                {
+                    PresentFrameInfo next;
+                    if (!_nextFrameSource(_smooth.LastSerial(), _nextFrame.bits(),
+                                          static_cast<size_t>(_nextFrame.sizeInBytes()), &next) ||
+                        next.serial == 0)
+                        break;
+                    _smooth.Push(next.serial, next.targetNs, reinterpret_cast<const uint32_t*>(_nextFrame.constBits()),
+                                 _nextFrame.width(), _nextFrame.height());
+                }
+            }
+            // The next frame is due later than this paint: a repaint at its time (frames by time, no vsync here).
+            // Smooth motion: a repaint a refresh on, the picture moves in between
+            if (info.nextSerial != 0 && !_repaintScheduled)
+            {
+                _repaintScheduled = true;
+                const QScreen* display = screen();
+                const double hz = display && display->refreshRate() >= 20.0 ? display->refreshRate() : 60.0;
+                const int64_t waitMs =
+                    smooth ? std::max<int64_t>(1, static_cast<int64_t>(1000.0 / hz))
+                           : std::clamp<int64_t>((info.nextTargetNs - now + 999'999) / 1'000'000, 1, 100);
+                QTimer::singleShot(static_cast<int>(waitMs), this, [this] {
+                    _repaintScheduled = false;
+                    refresh();
+                });
+            }
         }
         // A frame source is installed: never fall back to devicePixels. It wraps the emulator's framebuffer, which is
         // freed and reallocated when the guest switches video mode (Profi 352x288 <-> 512x240 hi-res, ATM, AlCo)
@@ -171,6 +302,30 @@ void DeviceScreen::paintEvent(QPaintEvent* event)
 
     if (!drawImage || drawImage->isNull())
         return;
+
+    // Smooth motion: the picture for now, drawn again only when it is another one
+    if (drawImage == &_latchedFrame && smoothActive() && _smooth.Width() == drawImage->width() &&
+        _smooth.Height() == drawImage->height())
+    {
+        const smoothmotion::SmoothMotion::Result plan = _smooth.Plan(SteadyNowNs());
+        if (_smoothFrame.size() != drawImage->size())
+        {
+            _smoothFrame = QImage(drawImage->size(), QImage::Format_RGBX8888);
+            _smoothShown = {};
+        }
+        if (plan.kind != smoothmotion::SmoothMotion::Kind::None &&
+            (plan == _smoothShown || _smooth.Draw(plan, reinterpret_cast<uint32_t*>(_smoothFrame.bits()))))
+        {
+            _smoothShown = plan;
+            drawImage = &_smoothFrame;
+        }
+    }
+    if (_pictureView != PictureView::Mode::Full)
+    {
+        _frameGeometry = geometry;
+        applyPictureViewRatio();
+    }
+    const QRectF sourceRect = displaySourceRect();
 
     // Temporal blending: push frame to history and use blended result
     if (_temporalEnabled)
@@ -194,45 +349,53 @@ void DeviceScreen::paintEvent(QPaintEvent* event)
         }
     }
 
-    // CRT effects: apply SIMD-accelerated filter at OUTPUT resolution
-    // Effects like scanlines need output-resolution precision for fine lines
-    if (_crtEnabled && _crtFilter && _crtParams.profile != CRTProfile::None)
+    // CRTRenderer (or a CRTBeamModel for a shader model) at device pixels, drawn 1:1, with or without CRT effects: the
+    // GPU screen composes the same picture from the same tables, so the two backends match bit for bit
     {
-        int outWidth = destRect.width();
-        int outHeight = destRect.height();
+        const CRTProfileParams& params = _crtEnabled ? _crtParams : kPlainParams;
+        const bool model = CRTBeamModel::isModel(params.profile);
+        if (!_crtRenderer)
+            _crtRenderer = std::make_unique<CRTRenderer>();
+        if (model && !_crtModel)
+            _crtModel = std::make_unique<CRTBeamModel>();
+        const qreal dpr = devicePixelRatioF();
+        CRTRenderer::Layout layout;
+        layout.outWidth = std::max(1, static_cast<int>(std::lround(destRect.width() * dpr)));
+        layout.outHeight = std::max(1, static_cast<int>(std::lround(destRect.height() * dpr)));
+        layout.source = sourceRect.toRect().intersected(drawImage->rect());
+        layout.frameWidth = drawImage->width();
+        layout.frameHeight = drawImage->height();
+        if (layout.source.isEmpty())
+            return;
 
-        // Reinitialize CRT buffer if output size changed
-        if (_crtFrame.width() != outWidth || _crtFrame.height() != outHeight)
+        if (model)
         {
-            _crtFrame = QImage(outWidth, outHeight, QImage::Format_RGBA8888);
+            _crtModel->setLayout(layout, params.profile);
+            _crtModel->prepare(drawImage->constBits(), static_cast<int>(drawImage->bytesPerLine()));
         }
+        else
+        {
+            _crtRenderer->setLayout(layout, params);
+            _crtRenderer->grade(drawImage->constBits(), static_cast<int>(drawImage->bytesPerLine()), params);
+        }
+        // Opaque in the backing store's byte order: the 1:1 draw is a copy, no conversion, no blending (RGB32 is
+        // B G R 0xFF bytes on little-endian; an image with alpha would be blended pixel by pixel)
+        constexpr bool kBgra = Q_BYTE_ORDER == Q_LITTLE_ENDIAN;
+        constexpr QImage::Format kFormat = kBgra ? QImage::Format_RGB32 : QImage::Format_RGBX8888;
+        if (_crtFrame.width() != layout.outWidth || _crtFrame.height() != layout.outHeight ||
+            _crtFrame.format() != kFormat)
+            _crtFrame = QImage(layout.outWidth, layout.outHeight, kFormat);
+        if (model)
+            _crtModel->compose(_crtFrame.bits(), static_cast<int>(_crtFrame.bytesPerLine()), kBgra);
+        else
+            _crtRenderer->compose(_crtFrame.bits(), static_cast<int>(_crtFrame.bytesPerLine()), kBgra);
+        _crtFrame.setDevicePixelRatio(dpr);
 
-        // Get source dimensions for scale-aware effects
-        QRect srcRect = sourceRect.toRect();
-        int srcWidth = srcRect.width();
-        int srcHeight = srcRect.height();
-
-        // Scale source to output size first - use nearest-neighbor for crisp pixels
-        QImage scaled = drawImage->copy(srcRect).scaled(
-            outWidth, outHeight, Qt::IgnoreAspectRatio, Qt::FastTransformation);
-        scaled = scaled.convertToFormat(QImage::Format_RGBA8888);
-
-        // Apply CRT filter at output resolution with source dimensions for scale-aware effects
-        _crtFilter->apply(scaled.bits(), _crtFrame.bits(), outWidth, outHeight,
-                          srcWidth, srcHeight, _crtParams);
-
-        // Draw directly - already at output size
 #if QT_VERSION >= QT_VERSION_CHECK(5, 13, 0)
         painter.setRenderHint(QPainter::LosslessImageRendering);
 #endif
-        painter.drawImage(destRect, _crtFrame);
-        return;
+        painter.drawImage(destRect.topLeft(), _crtFrame);
     }
-
-#if QT_VERSION >= QT_VERSION_CHECK(5, 13, 0)
-    painter.setRenderHint(QPainter::LosslessImageRendering);
-#endif
-    painter.drawImage(destRect, *drawImage, sourceRect);
 }
 
 void DeviceScreen::setTemporalBlendingEnabled(bool enabled)
@@ -249,6 +412,7 @@ void DeviceScreen::setTemporalBlendingEnabled(bool enabled)
 void DeviceScreen::setTemporalHistorySize(int frames)
 {
     _frameHistory.setHistorySize(frames);
+    setTemporalWeightMode(_temporalWeightMode);  // a new size starts with equal weights: the mode chosen stays
 }
 
 void DeviceScreen::setTemporalWeightMode(int mode)
@@ -257,17 +421,18 @@ void DeviceScreen::setTemporalWeightMode(int mode)
     if (mode == 0)
         _frameHistory.setEqualWeights();
     else
-        _frameHistory.setExponentialWeights(0.5f);
+        _frameHistory.setExponentialWeights(_temporalDecay);
+}
+
+void DeviceScreen::setTemporalDecay(float decay)
+{
+    _temporalDecay = std::clamp(decay, 0.1f, 0.9f);
+    setTemporalWeightMode(_temporalWeightMode);
 }
 
 void DeviceScreen::setCRTEffectsEnabled(bool enabled)
 {
     _crtEnabled = enabled;
-
-    if (enabled && !_crtFilter)
-    {
-        _crtFilter = std::make_unique<CRTFilter>();
-    }
 
     // Don't auto-select profile - respect current profile selection
     // If profile is None, no effects will be applied even if enabled
@@ -280,11 +445,12 @@ void DeviceScreen::setCRTProfile(CRTProfile profile)
     _crtParams = CRTProfileParams::FromProfile(profile);
     _crtEnabled = (profile != CRTProfile::None);
 
-    if (_crtEnabled && !_crtFilter)
-    {
-        _crtFilter = std::make_unique<CRTFilter>();
-    }
+    update();
+}
 
+void DeviceScreen::setCRTParams(const CRTProfileParams& params)
+{
+    _crtParams = params;
     update();
 }
 
@@ -293,16 +459,44 @@ void DeviceScreen::setCRTProfile(const CRTProfileParams& params)
     _crtParams = params;
     _crtEnabled = (params.profile != CRTProfile::None);
 
-    if (_crtEnabled && !_crtFilter)
-    {
-        _crtFilter = std::make_unique<CRTFilter>();
-    }
-
     update();
+}
+
+void DeviceScreen::setPictureView(PictureView::Mode mode)
+{
+    if (mode == _pictureView)
+        return;
+    _pictureView = mode;
+    _frameHistory.clear();
+    applyPictureViewRatio();
+    update();
+}
+
+void DeviceScreen::applyPictureViewRatio()
+{
+    float wanted = _baseRatio;
+    if (_pictureView != PictureView::Mode::Full && !devicePixelsRect.isEmpty())
+    {
+        const PictureView::Cut cut = PictureView::CutOf(_frameGeometry, static_cast<uint16_t>(devicePixelsRect.width()),
+                                                        static_cast<uint16_t>(devicePixelsRect.height()), _pictureView);
+        if (cut.aspect > 0.0)
+            wanted = static_cast<float>(cut.aspect);
+    }
+    if (wanted != ratio)
+    {
+        ratio = wanted;
+        fitToParent();  // the widget's shape is the picture's
+    }
 }
 
 QRectF DeviceScreen::displaySourceRect() const
 {
+    if (_pictureView != PictureView::Mode::Full && !devicePixelsRect.isEmpty())
+    {
+        const PictureView::Cut cut = PictureView::CutOf(_frameGeometry, static_cast<uint16_t>(devicePixelsRect.width()),
+                                                        static_cast<uint16_t>(devicePixelsRect.height()), _pictureView);
+        return QRectF(cut.source.x, cut.source.y, cut.source.width, cut.source.height);
+    }
     QRectF sourceRect = devicePixelsRect;
     if (_hasViewport)
     {
@@ -319,10 +513,11 @@ QRectF DeviceScreen::displaySourceRect() const
 QImage DeviceScreen::grabFramebuffer()
 {
     QImage frame;
-    if (_frameSource && !_latchedFrame.isNull() &&
-        _frameSource(_latchedFrame.bits(), static_cast<size_t>(_latchedFrame.sizeInBytes())))
+    QImage grabbed(_latchedFrame.size(), _latchedFrame.format());
+    if (_frameSource && !grabbed.isNull() &&
+        _frameSource(SteadyNowNs(), grabbed.bits(), static_cast<size_t>(grabbed.sizeInBytes()), nullptr))
     {
-        frame = _latchedFrame;  // Tear-free latched frame (shared bits; copied below)
+        frame = grabbed;  // Tear-free latched frame, the one on screen now
     }
     else if (!_frameSource && devicePixels != nullptr)
     {
@@ -349,8 +544,9 @@ void DeviceScreen::setEmulator(std::shared_ptr<Emulator> emulator)
 
 bool DeviceScreen::event(QEvent* event)
 {
-    // A PC-keyboard machine owns the bare F-keys while the view has focus: accepting the
-    // ShortcutOverride keeps the menu's F-key shortcuts from firing, the key press comes here.
+    // The machine owns Ctrl combinations (Symbol Shift) and, with a PC keyboard, Alt combinations and the bare
+    // F-keys while the view has focus: accepting the ShortcutOverride keeps the shortcut from firing, the key
+    // press comes here.
     // Leased: automation may be removing the instance on another thread
     if (event->type() == QEvent::ShortcutOverride)
     {
@@ -366,7 +562,7 @@ bool DeviceScreen::event(QEvent* event)
 
 void DeviceScreen::keyPressEvent(QKeyEvent* event)
 {
-    if (event->key() == Qt::Key_F && (event->modifiers() & (Qt::ControlModifier | Qt::MetaModifier)))
+    if (KeyboardManager::isFullScreenKey(event))
     {
         event->ignore();
         return;
@@ -379,6 +575,10 @@ void DeviceScreen::keyPressEvent(QKeyEvent* event)
         return;
 
     // Don't react on auto-repeat
+    // An automation session holds the machine: no keys from the GUI (releases still go: nothing stays held)
+    if (RemoteControlGuard::InputBlocked(_emulator.get()))
+        return;
+
     if (!event->isAutoRepeat())
     {
         // Two messages: the ZX key for the matrix, the physical key for a PS/2 machine
@@ -389,7 +589,7 @@ void DeviceScreen::keyPressEvent(QKeyEvent* event)
 
 void DeviceScreen::keyReleaseEvent(QKeyEvent* event)
 {
-    if (event->key() == Qt::Key_F && (event->modifiers() & (Qt::ControlModifier | Qt::MetaModifier)))
+    if (KeyboardManager::isFullScreenKey(event))
     {
         event->ignore();
         return;
@@ -411,6 +611,12 @@ void DeviceScreen::keyReleaseEvent(QKeyEvent* event)
 
 void DeviceScreen::mousePressEvent(QMouseEvent* event)
 {
+    // An automation session holds the machine: no capture, no clicks from the GUI
+    if (RemoteControlGuard::InputBlocked(_emulator.get()))
+    {
+        event->accept();
+        return;
+    }
     if (_mouseCapture && _mouseCapture->handleMousePress(event))
         event->accept();
     else
@@ -499,17 +705,20 @@ void DeviceScreen::fitToParent()
     if (pw < 1 || ph < 1 || ratio <= 0)
         return;
 
+    // The fit DeviceScreenGLWindow::drawnPictureSize() draws: both backends show the picture at the same size
+    const double windowW = pw;
+    const double windowH = ph;
     int newWidth;
     int newHeight;
-    if (static_cast<float>(ph) * ratio <= static_cast<float>(pw))
+    if (windowW / windowH > ratio)
     {
         newHeight = ph;
-        newWidth = static_cast<int>(static_cast<float>(ph) * ratio);
+        newWidth = static_cast<int>(windowH * ratio);
     }
     else
     {
         newWidth = pw;
-        newHeight = static_cast<int>(static_cast<float>(pw) / ratio);
+        newHeight = static_cast<int>(windowW / ratio);
     }
 
     if (newWidth < 1 || newHeight < 1)
@@ -524,7 +733,12 @@ void DeviceScreen::fitToParent()
 
 void DeviceScreen::resizeEvent(QResizeEvent* event)
 {
-    conformToAspectRatio();
+    // Fitted from the parent, not shrunk from the current size: conforming a size already conformed shrinks it again
+    // by a pixel (the rounding of width / ratio), and every resize event walked the picture smaller
+    if (parentWidget())
+        fitToParent();
+    else
+        conformToAspectRatio();
     QWidget::resizeEvent(event);
 
     update();

@@ -1,7 +1,8 @@
 # Recipe: ZX-bus Slots (fit a card, plan, apply, model switch)
 
 The cards on a machine's buses - General Sound / NeoGS, TurboSound FM in the AY socket, MoonSound, Covox /
-SounDrive, the network cards, the ZX-MultiSound - are **slot cards**: each sits in a slot of a bus (`zxbus.1`,
+SounDrive, the network cards, the ZX-MultiSound, and on the Sinclair edge the Kempston joystick interface, the
+Fuller Box and the AMX mouse - are **slot cards**: each sits in a slot of a bus (`zxbus.1`,
 `edge.1`, `ay-socket`), the emulator checks that they fit together, and a change is planned before it is made. Use
 this recipe to see what a machine has, to fit a card for a test, and to read what a change would remove. Verified
 2026-10-05 against branch `zx-bus-slots` (MCP, WebAPI, CLI, Lua). User guide:
@@ -89,6 +90,9 @@ The slot ids of a machine: `inspect_state slots` lists its buses; `<bus>.next` m
 `auto` (or no `slot`) lets the planner choose. `slots_catalog` says for each card whether it `fits`, `needs-replace`
 (and which cards it would remove) or is `refused` here, and with which fit: `real`, `adapter` (behind a bus adapter),
 `unrealistic` (the bus lacks a signal the card needs; allowed with the replace flag, and every report says so).
+`slots_catalog {"slot": "zxbus.1"}` (WebAPI `?slot=`) answers the same for a plug into that one slot: the cards of
+another bus are `refused`, the card in it now has `thisMachine.inSlot`. Show `label` (plain text), not `name`
+(markdown: "Covox `#FB`").
 
 ## WebAPI
 
@@ -116,6 +120,77 @@ The reply of every change: `status` (`applied`, `dry-run`, `refused`, `recording
 `bad-request`), `message`, `plan` (`removed[]` with each card's `options` and `undo` - the plug that puts it back -,
 `shadowed[]`, `lostFunctions[]`, `media[]`, `resultingSlots[]`, `slotsSection[]`, `lines[]`), `restart`
 (`restarted`, `previousEmulatorId`, `emulatorId`, `started`) and `media` (`attached`, `detached`, `closed`).
+
+## A Kempston joystick on a 48K / 128K / +2 / +2A / +3 (edge card)
+
+These machines have no Kempston decode; the interface is the edge card `kempston` (options `decode=a7a6a5` default,
+issue 4; `decode=a5`, early boards). Without it the joystick input calls warn and name this plug.
+
+```text
+emulator_manage {"action":"create","model":"48K","slots":{"edge.1":"kempston"}}
+emulator_manage {"action":"slots_plug","slot":"edge.next","card":"kempston"}              # running machine: restarts
+#   slots: applied
+#     plug kempston -> edge.1: allowed, fit real
+#   restarted: emulator <old> -> <new> (running)
+joystick_input  {"action":"set","buttons":"up+fire"}                                     # IN #1F reads 0x18
+emulator_manage {"action":"slots_plug","slot":"cpu-socket.next","card":"kempston","replace_if_incompatible":true}  # ATM450 / ATM710: unrealistic
+```
+
+```bash
+curl -s "$BASE/emulator/$EMU_ID/slots/catalog" | jq '.cards[] | select(.id=="kempston") | .thisMachine'
+EMU_ID=$(curl -s -X POST "$BASE/emulator/$EMU_ID/slots/edge.next/plug" -H 'Content-Type: application/json' \
+     -d '{"card":"kempston"}' | jq -r .restart.emulatorId)
+curl -s "$BASE/emulator/$EMU_ID/joystick" | jq '{wired, fit}'                             # wired: true
+```
+
+CLI `slots plug edge.next kempston`; Lua / Python `slots_plug("edge.next", "kempston")` (the surfaces' slot verbs).
+Machines with a board decode (Pentagon, Scorpion, ZX-Evo, TS-Conf, Profi, Sprinter, Next) refuse it: their built-in
+holds `kempston-joystick`. In TR-DOS (`CF_TRDOS`) the card sees no cycle: `#1F` is the WD1793 (Beta 128 passes /IORQ
+on only outside DOS, MAME beta128.cpp). TTD carries it as `edge.1.kempston` (type 69) plus the machine's
+`kempstonjoystick` blob.
+
+## The Sprinter's ISA slots (SL-8)
+
+The ISA slots are the board's own: their cards come from `[ISA] SlotN` (or the create option `"sprinter"`), and the
+report lists them apart from the slot set. The ZX-bus adapter in one hosts a ZX-bus; the General Sound card of
+`[SLOTS] isa.N` sits on it.
+
+```bash
+ID=$(curl -s -X POST "$BASE/emulator/start" -H 'Content-Type: application/json' -d '{"model":"SPRINTER"}' | jq -r .id)
+curl -s "$BASE/emulator/$ID/slots" | jq -c '.machineSlots[]'
+# {"bus":"isa","card":"zxbus","details":"","hostedCard":"neogs","hostsBus":"isa.1.zxbus","name":"ISA to ZX-bus adapter","slot":"isa.1","source":"[ISA] Slot1"}
+# {"bus":"isa","card":"ne2000","details":"RTL8019AS, #300, IRQ 3","name":"NE2000 Ethernet","slot":"isa.2","source":"[ISA] Slot2"}
+curl -s "$BASE/emulator/$ID/slots" | jq -c '(.buses[] | {id, kind, host}), (.slots[] | {slot, card, bus, busKind, host})'
+# {"id":"ay-socket","kind":"ay-socket","host":null}
+# {"id":"isa","kind":"isa8","host":null}
+# {"id":"isa.1.zxbus","kind":"zxbus","host":"isa.1"}
+# {"slot":"ay-socket","card":"ay","bus":"ay-socket","busKind":"ay-socket","host":null}
+# {"slot":"isa.1","card":"neogs","bus":"isa.1.zxbus","busKind":"zxbus","host":"isa.1"}
+
+# A General Sound card where the slot holds the NE2000: refused, the reason names [ISA]
+curl -s -X POST "$BASE/emulator/$ID/slots/isa.2/plug" -H 'Content-Type: application/json' \
+     -d '{"card":"gs","adapter":"sprinter-isa-zxbus","replaceIfIncompatible":true,"dryRun":true}' | jq -r .message
+# refused: isa.2 = gs cannot be fitted: isa.2 holds NE2000 Ethernet ([ISA] Slot2), not the ZX-bus adapter a ZX-bus card needs: [ISA] Slot2=ZXBUS
+```
+
+MCP: `inspect_state` aspect `slots` says `isa.1 = neogs [ram=2m] on isa.1.zxbus (behind sprinter-isa-zxbus)` and adds
+`machine slot isa.1 = zxbus (ISA to ZX-bus adapter, [ISA] Slot1) hosts isa.1.zxbus: neogs`; Lua / Python
+`slots_state().machineSlots`; Qt Machine > Slots a read-only "Board Slots" list (`isa.1` ISA to ZX-bus adapter, hosts
+`isa.1.zxbus: neogs`; `isa.2` NE2000) above the expansion slots, where the card reads `isa.1: NeoGS (on isa.1.zxbus)`. CLI
+`slots` (checked live 2026-10-06 with the WebAPI, MCP and Lua lines above):
+
+```text
+buses:
+  ay-socket  ay-socket, 1 slot(s), arbitration None
+  isa  isa8, 2 slot(s), arbitration None
+  isa.1.zxbus  zxbus, 1 slot(s), arbitration None - hosted by the card in isa.1
+machine slots (the board's own cards):
+  isa.1 = zxbus (ISA to ZX-bus adapter) from [ISA] Slot1 - hosts isa.1.zxbus: neogs
+  isa.2 = ne2000 (NE2000 Ethernet, RTL8019AS, #300, IRQ 3) from [ISA] Slot2
+slots:
+  ay-socket = ay  fit real, active
+  isa.1 = neogs [ram=2m] behind sprinter-isa-zxbus (on isa.1.zxbus)  fit unrealistic, active
+```
 
 ## CLI
 
@@ -145,8 +220,13 @@ curl -s -X POST "$BASE/emulator/start" -H 'Content-Type: application/json' \
 
 - **The id changes.** Every applied change (and `gs_switch_personality`) is a new emulator; calls with the old id
   answer 404. Take `restart.emulatorId` from the reply (MCP `target: "auto"` resolves the single instance).
-- **Refused while TTD records** (`status: "recording"`: `Cannot change the slot set while TTD is recording session #1,
-  started at frame 1: ...`): stop the recording first. A dry run says so too.
+- **A TTD recording ends with the change** (the application's time travel, the engine): the machine is a new
+  instance, the old recording stops (`last_stop_reason` `machine-change`).
+- **Sprinter:** `isa.1` / `isa.2` take a General Sound card (`gs`, `gs-lw`, `neogs`) behind `sprinter-isa-zxbus` only
+  where `[ISA] SlotN=ZXBUS` fits the ZX-bus adapter; the ISA cards themselves are `[ISA]` settings, listed in the
+  report's `machineSlots` (see below).
+- **Firmware choices survive a restart**: `avr_firmware` / `kbc_firmware` set through the network settings stay, as
+  the network settings do.
 - **Conflicting cards refuse a new machine**: `create` with `{"zxbus.1":"gs","zxbus.2":"neogs"}` answers 400 `the
   [SLOTS] cards conflict, the machine is not created (Q8): zxbus.2 = neogs and zxbus.1 = gs: shares gs (D1: ...)`.
 - **Unsaved media of a removed card** (the NeoGS SD card `sd.ngs` with writes): the change is refused until it says

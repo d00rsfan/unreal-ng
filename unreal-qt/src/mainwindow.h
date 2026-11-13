@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QDragEnterEvent>
+#include <QElapsedTimer>
 #include <QDragLeaveEvent>
 #include <QDropEvent>
 #include <QEvent>
@@ -14,7 +15,10 @@
 #include <QSettings>
 #include <QTimer>
 #include <functional>
+#include <atomic>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -26,9 +30,9 @@
 #include "emulator/emulatorbinding.h"
 #include "emulator/emulatormanager.h"
 #include "emulator/zxpoly/zxpolygroup.h"
-#include "emulator/guiemulatorcontext.h"
 #include "emulator/media/mediatargets.h"
 #include "emulator/soundmanager.h"
+#include "emulator/state/statenode.h"
 #include "logviewer/logwindow.h"
 #include "menumanager.h"
 #include "common/displayrefreshrate.h"
@@ -42,6 +46,7 @@
 #include "ui/intparametersdialog.h"
 #include "ui_mainwindow.h"
 #include "widgets/devicescreenwrapper.h"
+#include "hud/core/hudtheme.h"
 
 #ifdef ENABLE_AUTOMATION
 // Avoid name conflicts between Python and Qt "slot"
@@ -52,8 +57,17 @@
 
 class AudioSettingsWidget;
 class MidiActivityWindow;
+class HostControllers;
+class SurfaceTargets;
+class ControllersDialog;
+class ControllerToast;
+class GuiActions;
 class SlotChangeController;
 class SlotsWindow;
+class NextLayersWindow;
+class HandheldMenu;
+class HandheldPad;
+class OsdKeyboardWindow;
 class HudOverlayWrapper;
 class HudModel;
 class TtdWidget;
@@ -62,6 +76,11 @@ class VideoRecordingWidget;
 class RecordingWidget;
 #endif
 class DockingManager;
+
+namespace guicontrol
+{
+class Host;
+}
 
 QT_BEGIN_NAMESPACE
 namespace Ui
@@ -95,6 +114,30 @@ public:
     /// A file named on the command line. zxpolyModel: machine of a ZX-Poly group
     /// (skips the model question); a .trd/.scl with it boots as a ZX-Poly disk
     void openFromCommandLine(const QString& filePath, const QString& zxpolyModel);
+    /// The headless runner (--script without a file): the machine the Machine menu picks, as Start does
+    void startEmulatorIfNone() { handleStartEmulator(); }
+    /// The GUI control plane (docs/inprogress/2026-11-07-gui-control-plane): the host, the main window and the
+    /// debugger as `window` nodes. tcpPort: -1 none (the environment may still turn it on), 0 any free port
+    void startGuiControl(int tcpPort, const QString& tcpBind);
+
+    /// A machine of this model and RAM when none runs (Steam Deck Game Mode: a Pentagon 128K)
+    void startEmulatorIfNone(const std::string& model, uint32_t ramKb)
+    {
+        if (_emulator)
+            return;
+        _nextEmulatorModel = model;
+        _nextEmulatorRamKb = ramKb;
+        toggleEmulatorStartStop();
+        _nextEmulatorModel.clear();
+        _nextEmulatorRamKb = 128;
+    }
+    /// The headless runner's end: closes as the window's close does, without the unsaved media question (the media
+    /// policy decides, as for an unattended open)
+    void closeUnattended()
+    {
+        _unattendedClose = true;
+        close();
+    }
     virtual ~MainWindow() override;
 
     // Disable object copy
@@ -102,6 +145,12 @@ public:
     // Public screen refresh helper (called by TtdWidget on scrub)
     void refreshViewport();
     std::shared_ptr<Emulator> activeEmulator() const { return _emulator; }
+
+    /// The window recording (the picture as the window draws it: CRT shaders, temporal processing), for the recording
+    /// panel. Same recorder the automation planes use; the recorder is made on first use
+    class WindowRecorder* windowRecorder();
+    /// The screen the window recording draws (the window's current one: switching the GPU re-creates it)
+    class DeviceScreenWrapper* windowRecorderScreen() const { return _screenWrapper; }
 
     // region <Slots>
 private slots:
@@ -115,11 +164,17 @@ private slots:
 #endif
     void handleMessageScreenRefresh(int id, Message* message);
     void handleVideoModeChanged(int id, Message* message);
+    void handleSystemReset(int id, Message* message);
+    void handleMediaChangesState(int id, Message* message);
     void handleFileOpenRequest(int id, Message* message);
     void handleEmulatorStateChanged(int id, Message* message);
     void handleEmulatorInstanceDestroyed(int id, Message* message);
     void handleEmulatorInstanceCreated(int id, Message* message);
     void handleEmulatorSelectionChanged(int id, Message* message);
+    /// An automation session took, released or lost control of an emulator (any thread): the guard re-reads it
+    void handleRunControlChanged(int id, Message* message);
+    /// The toolbar's Take Back Control and the HUD's REMOTE indicator follow the guard
+    void updateRemoteControlUi();
     void openFileDialog();
     void openSnapshotDialog();
     void openZXPolyDialog();
@@ -129,13 +184,14 @@ private slots:
     void openSpecificFile(const QString& filepath);
     /// Open a file by type. mountOnly: a disk is mounted without the TR-DOS autostart (Shift+drop)
     void loadFile(const QString& filePath, bool mountOnly = false, LoadOrigin origin = LoadOrigin::Interactive);
-    void saveFileDialog();
-    void saveFileDialogZ80();
+    /// Save a snapshot: the dialog offers the formats this machine can be saved in now, `preferred` ("szx", "z80", "sna") first
+    void saveSnapshotDialog(const QString& preferred);
     void saveDiskDialog();
     void saveDiskAsTRDDialog();
     void saveDiskAsSCLDialog();
     void saveDiskAsUDIDialog();
-    void resetEmulator();
+    void resetEmulator();      // Soft: the reset button
+    void hardResetEmulator();  // Hard: a power cycle (the ZX Next boots its firmware again)
     void requestMni();  // Machine -> MNI: NMI + service monitor (plain NMI on other models)
     void handleFullScreenShortcut();
 
@@ -155,6 +211,17 @@ private slots:
     void handleFrontPanelCpmToggled(bool on);
     void handleStepIn();
     void handleStepOver();
+    /// Step out / run to the cursor: the actions run.step_out / run.to_cursor (the disassembly's cursor row as its addr)
+    /// on the instance's actions worker
+    void handleStepOut();
+    void handleRunToCursor();
+    void submitGuiAction(const char* id, StateNode params = StateNode::Object());
+    // Debug menu: breakpoints and the debugger's panes
+    void handleToggleBreakpoint();
+    void handleClearAllBreakpoints();
+    void handleShowBreakpoints();
+    void handleShowRegisters();
+    void handleShowMemory();
     void handleToolBarToggled(bool visible);
     void handleScaleRequested(int scale);
     void handleScreenshotRequested();
@@ -162,16 +229,40 @@ private slots:
     void handleStatusBarToggled(bool visible);
     void handleHudOverlayToggled(bool visible);
     void handleGpuAccelerationToggled(bool enabled);
+    /// The screen made anew on the GPU or the software one (the picture's settings carry over); `force`: also when it
+    /// already runs there (the GPU changed under it)
+    void rebuildScreen(bool gpu, bool force);
+    /// The GPU asked again on a session, display or adapter change (mainwindow_display.cpp): the screen follows it
+    /// without a restart, View > GPU Acceleration stays the user's wish
+    void watchDisplayChanges();
+    void unwatchDisplayChanges();
+    void scheduleGpuRecheck(const char* why);
+    void recheckGpu();
     void handleCrtEffectsToggled(bool enabled);
     void handleCrtProfileChanged(int profileIndex);
+    void handleCrtShaderChanged(const QString& name);
+    static int crtProfileIndex(CRTProfile profile);  ///< the entry of View > CRT Profile
     void handleTemporalBlendingToggled(bool enabled);
+    /// View > Video Synchronization: the shown instance's [VIDEO] settings (ApplyVideoSync), kept in View/VideoSync
+    void handleVideoSyncToggled(bool on);
+    /// Tools > Video Synchronization: the window with the step in effect, live
+    void handleVideoSyncWindowRequested();
     void handleDebuggerToggled(bool visible);
+    void handleExternalDebuggerRequested(const QString& program);
     void handleDebuggerVisibilityChanged(bool visible);
     void handleLogWindowToggled(bool visible);
     void handleTapeManagerToggled(bool visible);
     void handleMediaPanelToggled(bool visible);
     void handleNetworkWindowToggled(bool visible);
     void handleSlotsWindowToggled(bool visible);
+    void handleNextLayersToggled(bool visible);
+    void handleOsdKeyboardToggled(bool visible);
+    /// Handheld mode: a pad's UI verb (HandheldPad::Verb) to the menu or the on-screen keyboard
+    void handleHandheldVerb(int verb);
+    /// Handheld mode: the UI takes the pads while the menu or the keyboard is up
+    void updateHandheldGrab();
+    /// Handheld mode: the on-screen keyboard drawn over the game by the screen (again after the screen is remade)
+    void installHandheldOverlay();
     void handleMidiActivityToggled(bool visible);
     void handleTrafficWindowToggled(bool visible);
     void handleFt812DebugToggled(bool visible);
@@ -199,6 +290,8 @@ private slots:
     void handleRestartRequested();
 #ifdef ENABLE_RECORDING
     void handleVideoRecordingRequested();
+    /// Debug > Time Travel: the black box setting changed (saved already); applied to the bound instance
+    void handleBlackBoxSettingChanged();
     void handleVideoRecordingToggled(bool visible);
     void handleQuickRecord(const QString& presetName);
 #endif
@@ -215,6 +308,7 @@ protected:
     void resizeEvent(QResizeEvent* event) override;
     void moveEvent(QMoveEvent* event) override;
     void changeEvent(QEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
 
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dragLeaveEvent(QDragLeaveEvent* event) override;
@@ -231,10 +325,50 @@ protected:
     /// Resize the window so the emulator screen is shown at an integer scale of its
     /// native (viewport) size, plus menu / toolbar / status bar chrome
     void fitWindowToScreen(int scale);
+    /// Native size of the picture now shown (framebuffer cropped by the viewport); 352x288 before any machine
+    QSize pictureNativeSize() const;
+    /// Resizes the window to the picture at the remembered zoom factor (aspect ratio kept); no-op after a manual resize
+    void refitWindowToPicture();
+    /// Offers the screen to the automation's screenshot source "window" and display settings (WindowView): after every
+    /// new screen wrapper
+    void registerWindowView();
+    /// The View menu's display settings (GPU, CRT, temporal blending) for the automation. GUI thread
+    WindowDisplaySettings windowDisplaySettings() const;
+    /// The present part of the settings (the emulator, smooth motion, the policy, the display rate, the presenter)
+    void fillPresentSettings(WindowDisplaySettings& s) const;
+    /// Apply an automation change (validated by the core) through the View menu's handlers, menu checks in step. GUI thread
+    void applyWindowDisplay(const WindowDisplayChange& change);
+    /// The active CRT profile's parameters: a libretro preset's own, the built-in profile's (basic, a custom shader's
+    /// uniforms), none for the beam models. GUI thread
+    CrtParameters crtParameters() const;
+    /// Apply an automation change of them (names validated by the core): reset, values, steps. GUI thread
+    void applyCrtParameters(const CrtParameterChange& change);
+    /// Hand the settings to the core's published copy (WindowView::Publish: the readouts and the toggles), and keep
+    /// them in View/* - at once, or coalesced after a burst of changes
+    void publishWindowDisplay();
+    void schedulePublishWindowDisplay();
+    /// The View menu's changes, the side windows and the window state all publish (once, from the constructor)
+    void connectWindowDisplayPublishing();
+    void publishIfPresentChanged();
+    /// QSettings View/*: GPU, CRT profile / shader and its values, blending, scale, HUD and theme (not overscan: the machine's).
+    /// UNREAL_QT_VIEW_SETTINGS=off: neither read nor written
+    void saveViewSettings() const;
+    void restoreViewSettings();
+    /// NC_VIDEO_VIEWPORT_CHANGED: the screen crops as the machine's viewport (a change from the WebAPI, an action)
+    void handleVideoViewportChanged(int id, Message* message);
+    void applyHudTheme(HudThemeId theme);
+    void setFullScreen(bool on);
+    /// Menu bar, toolbar, status bar and margins around the screen: the window minus the content frame, measured on a laid-out window
+    QSize windowChrome();
+    /// The smallest the screen may get is the picture at 1x: a pixel is never squeezed; follows every video mode
+    void updateScreenMinimumSize();
 
     /// Switch the emulator's debug instrumentation (debug memory interface, breakpoint
     /// dispatch) on or off - it follows the debugger window's visibility
     void applyDebugInstrumentation(bool enabled);
+    /// The debug mode of the adopted emulator is on because the debugger window asked for it: only then does
+    /// hiding the window switch it off (an automation client's debug mode, a profiler session, stay)
+    bool _debugInstrumentationByUi = false;
 
     /// Query the refresh rate of the display this window is on and hand it to the
     /// emulator as the upper bound for turbo-mode rendering (re-run on screen change)
@@ -242,6 +376,11 @@ protected:
     void adjust(QEvent* event, const QPoint& delta = QPoint{});
 
 private:
+    /// UNREAL_QT_STRESS_WINDOWS: a comma-separated list of debugger, ttd, media, network, slots, traffic, midi, tape,
+    /// log (or all), opened for the sanitizer stress. Unknown names are logged and skipped
+    void openStressWindows(const QString& list);
+    /// The TTD panel, the tool bar and the recording panel drop their reference to the unbound instance
+    void releasePanelHolders();
     /// A medium (floppy, tape, hard disk, card, CD) into the slot the core's plan
     /// names (media-drop-targets design §4-§6): `slot` when the user picked one,
     /// else the plan's default, else the slot chooser (the call ends there and
@@ -262,12 +401,15 @@ private:
     QRect dropArea() const;
     /// File > Insert Medium...: a file, then the slot chooser with every slot that takes it
     void insertMediumDialog();
+    /// Run > Reset / Hard Reset: the reset button (soft) or a power cycle (hard)
+    void doReset(bool hard);
 
     /// The slot chooser / drop zones / refusal over the screen
     class DropTargetOverlay* _dropOverlay = nullptr;
     QTimer _dropHoldTimer;  ///< 1.5 s hold before the drop zones appear
     QString _dragPath;      ///< the file being dragged over the window
     bool _dragActive = false;
+    bool _unattendedClose = false;  // closeUnattended: no question on the way out
     /// The placement waiting for the chooser's answer
     struct PendingPlacement
     {
@@ -290,6 +432,11 @@ private:
     // Subscribe/unsubscribe from per-emulator-instance events
     void subscribeToPerEmulatorEvents();
     void unsubscribeFromPerEmulatorEvents();
+    /// The title's unsaved mark ([*]): some medium of this window's emulator has unsaved changes
+    void updateUnsavedMediaMark();
+    /// Before the emulator goes: media whose changes the policy leaves to the user (writes.save: ask, or changes
+    /// that would be lost) get a question. False: the user cancelled, the emulator stays (D-8)
+    bool confirmUnsavedMedia();
 
     // Bind audio callback to emulator (audio device runs continuously)
     void bindEmulatorAudio(std::shared_ptr<Emulator> emulator);
@@ -373,7 +520,19 @@ private:
     LogWindow* logWindow = nullptr;
     TapeManagerWindow* tapeManagerWindow = nullptr;
     MediaPanelWindow* mediaPanelWindow = nullptr;
+    SurfaceTargets* _surfaceTargets = nullptr;           // this window as a view of TargetState (Stream Deck targeting)
+    HostControllers* _hostControllers = nullptr;        // host game controllers: service, profiles, player connectors
+    ControllersDialog* _controllersDialog = nullptr;    // Tools -> Controllers
+    ControllerToast* _controllerToast = nullptr;        // the auto-profile toast (port reads)
+    std::unique_ptr<guicontrol::Host> _guiHost;          // the GUI control plane's host (startGuiControl)
+    std::unique_ptr<GuiActions> _guiActions;            // the GUI host actions in the core registry; device events
     NetworkWindow* networkWindow = nullptr;
+    NextLayersWindow* _nextLayersWindow = nullptr;          // View -> Next Layers (per-layer capture view)
+    class WindowRecorder* _windowRecorder = nullptr;      // the window recording (WindowView), made on first use
+    HandheldPad* _handheldPad = nullptr;                   // handheld mode only: the pads as the UI reads them
+    std::shared_ptr<std::atomic<bool>> _handheldPadAlive;  // the input tap's posts find the window gone
+    HandheldMenu* _handheldMenu = nullptr;                 // handheld mode only: the controller menu (handheld.menu)
+    OsdKeyboardWindow* _osdKeyboardWindow = nullptr;        // View -> On-screen Keyboard, unrealqt.osd_keyboard
     SlotsWindow* _slotsWindow = nullptr;                   // Machine -> Slots (ZX-bus slots)
     MidiActivityWindow* _midiActivityWindow = nullptr;     // Tools -> MIDI Activity
     SlotChangeController* _slotChangeController = nullptr;   // plan, confirm, restart, Undo (every slot change)
@@ -385,11 +544,14 @@ private:
     bool _autostartDisks = true;      // TR-DOS disk autostart on open (persisted in settings)
     std::string _nextEmulatorModel;   // Model for the next auto-started emulator (empty = default); consumed once
     uint32_t _nextEmulatorRamKb = 128;  // Its RAM size in KB; reset with the model
+    std::string _pickedModel;         // Machine chosen in the Machine menu while none runs (empty = default); stays until changed
+    uint32_t _pickedRamKb = 128;      // Its RAM size in KB
     bool _hudOverlayVisible = false;  // Session-only HUD visibility state (default off)
     QMutex lockMutex;
     QMutex _audioMutex;              // Protects audio operations from race conditions
     bool _audioInitialized = false;  // Tracks if audio device is initialized
     bool _audioStarted = false;       // Tracks if audio device is started (on-demand)
+    std::string _audioBoundId;        // The emulator the host audio was last bound to (a rebind keeps its mute state)
 
 #ifdef ENABLE_AUTOMATION
     Automation* _automation = nullptr;
@@ -398,8 +560,12 @@ private:
     EmulatorManager* _emulatorManager = nullptr;
     EmulatorBinding* m_binding = nullptr;  // Central state binding for UI
     AppSoundManager* _soundManager = nullptr;
-    GUIEmulatorContext* _guiContext = nullptr;
     std::shared_ptr<Emulator> _emulator = nullptr;  // TODO: Remove after full binding migration
+    /// Where the bound instance came from: the black box runs on the ones this window created
+    EmulatorOrigin _emulatorOrigin = EmulatorOrigin::Adopted;
+    /// The black box setting on the bound instance (D29): on and created here - it records the last minutes;
+    /// off - a black box it runs stops. An explicit recording is never touched
+    void applyBlackBox();
 
     /// Instances the manager announced as destroyed (NC_EMULATOR_INSTANCE_DESTROYED,
     /// recorded on the MessageCenter worker before the instance is released). An
@@ -421,6 +587,22 @@ private:
     void startZXPoly(const QString& filePath, const QString& model = QString());
     void releaseZXPolyGroup();
     bool attachScreenToZXPolyDisplay();
+    /// The resolved game profile's `video:` section into the screen's smooth motion (mapping-and-profiles.md §7.7)
+    void applyGameVideo();
+    /// The shown instance's frames handed to the screen again: its [VIDEO] SmoothMotion / EffectsDevice changed (the
+    /// automation's smooth_motion, effects_device). A ZX-Poly master's group display has no timed frames: left alone
+    void refreshFrameSource();
+    /// TimedFrameSource for the shown instance; one the window starts showing takes View > Video Synchronization
+    ScreenFrames frameSourceFor(Screen* screen, EmulatorContext* context);
+    /// View > Video Synchronization (View/VideoSync, on unless set off); none with UNREAL_QT_VIEW_SETTINGS=off: the
+    /// instances keep their [VIDEO] settings
+    std::optional<bool> _videoSync;
+    std::string _videoSyncApplied;  ///< the instance it went to last
+    bool _gpuWanted = true;              ///< View > GPU Acceleration as asked (View/Gpu); the screen runs it when it can
+    QTimer* _gpuRecheckTimer = nullptr;  ///< the GPU asked again a moment after a change (the driver follows late)
+    int _gpuRechecksLeft = 0;            ///< more asks while the GPU wanted is not there yet
+    void* _sessionNotifyWindow = nullptr;  ///< Windows: the HWND registered for session changes
+    QPointer<class VideoSyncWindow> _videoSyncWindow;  ///< Tools > Video Synchronization, made on first use
     bool _switchingModel = false;  // True while model switch is in progress (prevents notification handler interference)
 
     QPoint _lastCursorPos;
@@ -428,6 +610,18 @@ private:
 
     bool _inHandler = false;
     bool _initialFitDone = false;  // Window sized to the screen once, on first show
+    bool _userResizedWindow = false;  // The user dragged the window size: video mode changes no longer resize it
+    bool _refitPending = false;  // A refitWindowToPicture() is queued (video mode changes arrive in bursts)
+    double _zoomFactor = 2.0;  // Window zoom over the picture's native size, kept across video modes
+    int _startScale = 2;       // the zoom of the first fit (View/Scale)
+    QTimer* _publishTimer = nullptr;  // coalesces publishWindowDisplay after a burst of changes
+    QTimer* _presentWatch = nullptr;  // once a second: publishes when the way to the screen changed (video.present)
+    std::string _presentShown;        // that way as last published
+    bool _viewSettingsEnabled = true; // UNREAL_QT_VIEW_SETTINGS=off: View/* neither read nor written
+    HudThemeId _hudTheme = HudThemeId::DarkGlass;
+    QSize _chrome;  // Last sane windowChrome()
+    QElapsedTimer _fitClock;  // Time since our last programmatic resize: the window system animates it with resize events of its own
+    QSize _fitTarget;  // Window size of our last programmatic resize (tells it from the user's drag)
     DisplayRefreshInfo _displayRefresh;  // Last queried refresh characteristics of our display
 
     // Stores window geometry before going fullscreen / maximized
@@ -444,6 +638,14 @@ private:
     DockingManager* _dockingManager = nullptr;
     MenuManager* _menuManager = nullptr;
     ToolBarManager* _toolBarManager = nullptr;
+    /// Automation sessions (execution arbiter design §6a): who holds the machine, the GUI locked meanwhile
+    class RemoteControlGuard* _remoteControl = nullptr;
+    class CompanionController* _companions = nullptr;  ///< companion clients: pairing prompts, the Companions dialog
+    class StreamDeckSupervision* _streamDeckSupervision = nullptr;  ///< the Stream Deck daemon, supervised (daemon.md §7)
+    class StreamDeckDialog* _streamDeckDialog = nullptr;            ///< Tools > Stream Deck...
+    class QShortcut* _fullScreenShortcut = nullptr;
+    bool _hudShownForRemoteControl = false;
+    QString _remoteControlAnnounced;  // the session the "Remote control" toast was shown for  // the HUD was off and is shown for the session
     TtdWidget* _ttdWidget = nullptr;
     int _lastTtdWidgetHeight = 0;
     bool _adjustingTtdHeight = false;

@@ -51,7 +51,12 @@ These account for most "it won't boot" reports. Check them before suspecting the
    `save`, `export` or `discard` — this can look like "the new disk didn't take."
 5. **An empty optical/IDE drive on ZX-Evo's "D. CD boot" or "B. HDD boot" just keeps retrying**
    with nothing inserted; it is not a hang, it is waiting for media.
-6. **ROM choice is a config-file setting, not a runtime option.** Switching ROM trees (e.g. ATM3's
+6. **Each disk slot reads only certain FAT types, and the emulator refuses the others.** Sprinter and Profi IDE hard
+   disks take FAT12 / FAT16 only (Estex DSS and PQ-DOS read no FAT32), the TS-Conf SD card FAT32 only, the other
+   slots FAT16 and FAT32. A FAT32 image, folder or composite on a Sprinter or Profi disk is refused with the reason
+   instead of mounting a disk the DOS cannot see. The table:
+   [docs/features/media.md](../features/media.md#which-file-system-a-slot-takes).
+7. **ROM choice is a config-file setting, not a runtime option.** Switching ROM trees (e.g. ATM3's
    `[EVO] Fpga=legacy` for the older `rom/zxevo.rom`) requires editing `unreal.ini` and creating a
    new instance — there is no live switch.
 
@@ -59,7 +64,8 @@ These account for most "it won't boot" reports. Check them before suspecting the
 
 | Model id | Full name | Firmware / ROM | Boots from (out of the box) | Required medium format |
 |:--|:--|:--|:--|:--|
-| `48K` | ZX-Spectrum 48K | `data/rom/48.rom` | tape (`tape`); Beta-128-style FDC is decoded on every Sinclair model in this build's shipped configs, so a TR-DOS floppy in `fdd.a` also autostarts | tape: `.tap`/`.tzx`/etc.; floppy: TR-DOS TRD (see [autostart-disk.md](../../.recipe/run/autostart-disk.md)) |
+| `48K` | ZX-Spectrum 48K | `data/rom/48.rom` | tape (`tape`); no TR-DOS ROM, so a TR-DOS floppy does nothing | tape: `.tap`/`.tzx`/etc. |
+| `48K-BETA128` | ZX-Spectrum 48K + Beta 128 (variant of `48K`) | `data/rom/48.rom` + `data/rom/trdos503.rom` | tape; TR-DOS floppy `fdd.a`–`fdd.d` after `RANDOMIZE USR 15616` / `15619` (no menu, no autostart on reset), see [48k-beta128.md](../../.recipe/machines/48k-beta128.md) | TR-DOS TRD / SCL |
 | `128k` | ZX-Spectrum 128K | `data/rom/128.rom` | tape, TR-DOS floppy `fdd.a`–`fdd.d` | same as above |
 | `PLUS2` | ZX-Spectrum +2 (grey, Amstrad ROM) | `data/rom/plus2.rom` | tape, TR-DOS floppy (Beta-128 decoded the same way as other Sinclairs in this build) | same as above |
 | `PLUS2A` | ZX-Spectrum +2A (the +3 without its floppy controller) | `data/rom/plus2a.rom` | tape; no native +3 FDC (that is the point of this model) | tape |
@@ -72,7 +78,7 @@ These account for most "it won't boot" reports. Check them before suspecting the
 | `ATM3` | ZX-Evo (ATM Turbo 3, BaseConf) | `data/rom/zxevo-fe.rom` (official NedoPC BaseConf image; `[EVO] Fpga=legacy` switches to the older `data/rom/zxevo.rom`) | ERS menu: **Z.** TR-DOS floppy, **B.** IDE hard disk (NemoIDE, `[HDD] Scheme=NEMO-DIVIDE`), **D.** CD (`ide0.slave`, `CD1=1` by default), **5.** SD card (`sd.zc`, Z-Controller — NedoOS) | TR-DOS TRD; HDD: **MBR + FAT** (pitfall 1); CD: ISO 9660 with `AUTORUN.ZX` in the root; SD: **raw FAT16/FAT32, no MBR** (pitfall 1) |
 | `TSL` (alias `TSCONF`) | TS-Conf (ZX-Evo, TS-Labs configuration) | `data/rom/zxevo.rom` (TS-BIOS, page 0) | TS-BIOS boot menu: TR-DOS/Beta-128 (virtual drives), SD card `sd.zc` ("BD boot.$c"), Nemo IDE `ide0.master`/`ide0.slave` (`[HDD] Scheme=NEMO-DIVIDE`) | SD: **raw FAT16/FAT32, no MBR** (pitfall 1); a blank CMOS starts in TS-BIOS Setup, not the boot menu — see below |
 | `ZXPOLY-48K`/`-128K`/`-PENTAGON` | ZX-Poly (4 synced instances of a base model) | same ROM as the base model | same boot sources as the base model, plus `.zxp` (all 4 modules at once) and `.prom` (the ZX-Poly Test ROM) | same filesystem rules as the base model |
-| `SPRINTER` | Peters Plus Sprinter Sp2000 | **not yet implemented** — planned BIOS 3.04 (3.06 selectable) + Estex DSS | design-only: floppy (Beta-128/WD1793), IDE ×2 (HDD + ATAPI CD), PC folder | design-only, see [Sprinter](#sprinter-spринter-not-yet-implemented) below |
+| `SPRINTER` | Peters Plus Sprinter Sp2000 | **not yet implemented** — planned BIOS 3.04 (3.06 selectable) + Estex DSS | design-only: floppy (Beta-128/WD1793), IDE ×2 (HDD + ATAPI CD), PC folder | design-only, see [Sprinter](#sprinter-sprinter-not-yet-implemented) below |
 
 Sources for every ROM path: each model's `[ROM]` section in `data/configs/<config-folder>/unreal.ini`
 (config folder names, e.g. `pentagon128k`, `atm3`, `ts-conf`, do not always match the model id —
@@ -144,10 +150,16 @@ Ground truth: [.recipe/machines/profi.md](../../.recipe/machines/profi.md),
 - **Boot sources**: tape; TR-DOS floppy `fdd.a`–`fdd.d`; IDE hard disk `ide0.master`/`ide0.slave`
   (`[HDD] Scheme=PROFI`) — the SYS ROM boots straight from the hard disk when one is present.
 - **Filesystem parameters**: TR-DOS TRD for floppy. The hard disk is a **raw image** (no MBR
-  requirement documented for this board); its geometry comes from the disk's own ProfiHiDD header
+  requirement documented for the SYS ROM's own boot); its geometry comes from the disk's own ProfiHiDD header
   if present (16 heads × 16 sectors from the SYS ROM, 16×63 from Karabas-built images), or 16×16
   by default with no header at all. This is a different rule from ATM/ZX-Evo's MBR+FAT
   requirement — do not carry that assumption over to Profi.
+- **PQ-DOS on `PROFI-PLUS`** (ROM BIOS Plus 0.41h1): the hard disk is **MBR + FAT16**, and the BIOS runs the
+  **Z80 boot code in the MBR**, so a disk built without it does not start PQ-DOS
+  (`testdata/machines/profi/pqdos/pqdos-hdd-small.img`: partition 1, type `#06`, active). PQ-DOS 2023-09 sees a
+  second FAT16 partition as `D:` and **ignores a FAT32 partition**, so the Profi IDE slots take FAT12 / FAT16 only
+  (FAT32 is refused). A composite with `partitions:` carries the MBR code of its first source disk, so PQ-DOS
+  plus a host folder as `D:` works (checked by `ProfiPlusComposed_Test`).
 - **Files that must be present**: TR-DOS autostart rules as above; hard disk content is whatever
   the SYS ROM's boot loader expects (not further documented in the sources read for this page).
 
@@ -193,6 +205,12 @@ per-machine recipe — read it before automating anything ATM-specific).
   - The CD `AUTORUN.ZX` requirement is above.
   - A CP/M-mode boot (`#FF77` bit 9) is exercised by booting a CP/M disk image through the normal
     TR-DOS autostart path, not by a separate file requirement.
+- **128K programs from a floppy (`ATM710`)**: the TR-DOS cold start (the BIOS menu's "TR-DOS 48") leaves
+  `#7FFD` pages at RAM 24-31 on 256 KB and up, so such programs need the "SPECTRUM 128" way in. The disk
+  autostart does that; a hand boot through "TR-DOS 48" does not
+  ([atm710.md](../../.recipe/machines/atm/atm710.md#tr-dos-cold-start-and-128k-programs)). The `ATM450`'s cold
+  start does the same through `#FDFD = 3`, and its autostart clears it
+  ([atm450.md](../../.recipe/machines/atm/atm450.md#software-for-the-atm-turbo-2-and-the-tr-dos-cold-start)).
 
 ## TS-Conf (`TSL`, alias `TSCONF`)
 

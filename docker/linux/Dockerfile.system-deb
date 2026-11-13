@@ -5,6 +5,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     pkg-config dpkg-dev file binutils \
     qt6-base-dev qt6-5compat-dev qt6-multimedia-dev qt6-svg-dev \
     libgl-dev libssl-dev zlib1g-dev libzstd-dev liblzma-dev \
-    libjsoncpp-dev liblua5.4-dev uuid-dev \
+    libjsoncpp-dev liblua5.4-dev uuid-dev libudev-dev \
+    libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
+    libxtst-dev libxkbcommon-dev libwayland-dev libegl-dev libdecor-0-dev \
     && rm -rf /var/lib/apt/lists/*
 ENV CC=gcc-14 CXX=g++-14

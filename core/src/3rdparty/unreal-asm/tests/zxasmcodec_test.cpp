@@ -147,4 +147,20 @@ TEST(ZxasmCodec_Test, Detection)
     }
     EXPECT_LT(codec.Detect(ReadTestData("text/source-cp866-cr.asm"), {}), 60) << "plain CR text is the text codec's";
     EXPECT_EQ(codec.Detect(ReadTestData("tasm/000LOAD.$A"), {}), 0);
+    // The same bytes in a catalog entry no ZX-ASM version writes (a magazine text: type C at #C000)
+    const containers::TrdosFile file = Unwrap(kSamples[0].file);
+    CatalogHints text = file.Hints();
+    text.start = 0xC000;
+    EXPECT_LT(codec.Detect(file.data, text), 50);
+    // A 3.10+ catalog entry (type a, "sm") holding CR text with blanks no editor of ZX-ASM left uncompressed and no
+    // keyword: written by another program (isosurf.a, an ALASM source), the text codec's
+    const std::string plain = "; -isosurf-\r        MACRO   INIBITS\rBITN=0\r        ENDM\r        ORG     #6000\r";
+    const std::vector<uint8_t> bytes(plain.begin(), plain.end());
+    CatalogHints sm;
+    sm.type = 'a';
+    sm.start = 0x6D73;
+    EXPECT_LT(codec.Detect(bytes, sm), 60);
+    const DetectResult chosen = CodecRegistry::Builtin().Detect(bytes, sm);
+    ASSERT_NE(chosen.chosen, nullptr) << chosen.reason;
+    EXPECT_EQ(chosen.chosen->Info().id, "text");
 }

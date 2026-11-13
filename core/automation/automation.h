@@ -16,37 +16,16 @@ class Automation
 {
     /// region <Fields>
 protected:
-#if ENABLE_LUA_AUTOMATION
+    // Every module's pointer, whatever the ENABLE_* macros of the including unit: one layout in every translation
+    // unit (the macros differ between the modules' targets; a field under #if broke the ODR)
     AutomationLua* _lua = nullptr;
-#endif
-
-#if ENABLE_PYTHON_AUTOMATION
     AutomationPython* _python = nullptr;
-#endif
-
-#if ENABLE_WEBAPI_AUTOMATION
     AutomationWebAPI* _webAPI = nullptr;
-#endif
-
-#if ENABLE_CLI_AUTOMATION
     AutomationCLI* _cli = nullptr;
-#endif
-
-#if ENABLE_GDB_AUTOMATION
     AutomationGDB* _gdb = nullptr;
-#endif
-
-#if ENABLE_DEZOG_AUTOMATION
     AutomationDezog* _dezog = nullptr;
-#endif
-
-#if ENABLE_ZESARUX_AUTOMATION
     AutomationZesarux* _zesarux = nullptr;
-#endif
-
-#if ENABLE_MCP_AUTOMATION
     AutomationMCP* _mcp = nullptr;
-#endif
     bool _stopped = false;
     /// endregion </Fields>
 
@@ -82,14 +61,18 @@ public:
 public:
     bool start();
     void stop();
-    
-    // Videowall
-    bool SetVideowallSingleSyncMode(bool enable, const std::string& emulatorId = "");
 
     // Meyer's Singleton accessor - returns reference, automatic lifetime
     static Automation& GetInstance();
-    
-    std::string getEmulatorIdOrFirst(const std::string& providedId);
+
+    /// The port this process's WebAPI listens on: 0 when it is not up (not built, the port taken by another
+    /// emulator, stopped). What a client started from here connects to (unreal-qt's Debug > Debugger)
+    int GetWebAPIPort() const;
+
+    /// The headless runner (unreal-qt --script): the Lua interpreter is up; run a file there, its exit code
+    /// (AutomationLua::runFile). Without Lua automation: not ready, 1 with the reason
+    bool IsLuaReady();
+    int RunLuaFile(const std::string& path, std::string& error);
     
 #if ENABLE_PYTHON_AUTOMATION
     AutomationPython* getPython() { return _python; }

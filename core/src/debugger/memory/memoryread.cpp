@@ -5,6 +5,8 @@
 #include <cstdlib>
 
 #include "debugger/search/memorysearch.h"
+#include "debugger/targets/cpuview.h"
+#include "emulator/memory/devicememory.h"
 #include "emulator/emulatorcontext.h"
 #include "emulator/memory/memory.h"
 #include "emulator/platform.h"
@@ -54,6 +56,18 @@ Result Bytes(EmulatorContext* context, const std::string& space, uint32_t addres
     if (length == 0 || length > kMaxLength)
     {
         result.error = "the length must be 1 to 65536";
+        return result;
+    }
+    // A sound card CPU's view (cpuview.h): its four windows as they are paged now
+    if (space == "gs" || space == "ms")
+    {
+        const DebugCpuId cpu = space == "gs" ? DebugCpuId::GS : DebugCpuId::MultiSoundGS;
+        result.space = space;
+        result.address = address;
+        if (address > 0xFFFF)
+            result.error = "a CPU address is 0 to #FFFF";
+        else if (!CpuView::Read(context, cpu, static_cast<uint16_t>(address), length, result.bytes))
+            result.error = "cpu " + space + " not available: no card with a CPU in its slot";
         return result;
     }
     MemorySearchRequest where;
@@ -118,6 +132,26 @@ Result Bytes(EmulatorContext* context, const std::string& space, uint32_t addres
                 result.bytes.insert(result.bytes.end(), page + at % PAGE_SIZE, page + at % PAGE_SIZE + run);
                 i += run;
             }
+            return result;
+        }
+        case MemorySearchRequest::Space::Region:
+        {
+            std::string error;
+            IDeviceMemoryRegion* region = DeviceMemory::Find(context, where.region, &error);
+            if (!region)
+            {
+                result.error = "space must be cpu, ram, a page (ram5, rom2, cache0) or a memory region: " + error;
+                return result;
+            }
+            result.space = region->Name();
+            if (address >= region->Size())
+            {
+                result.error = "past the end of " + result.space;
+                return result;
+            }
+            const uint32_t n = std::min<uint32_t>(length, region->Size() - address);
+            if (!DeviceMemory::Read(context, where.region, address, n, result.bytes, error))
+                result.error = error;
             return result;
         }
     }

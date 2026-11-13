@@ -10,6 +10,7 @@
 #include <QList>
 #include <QRectF>
 #include <QTextCharFormat>
+#include <functional>
 
 #if defined(QHEXVIEW_ENABLE_DIALOGS)
 class HexFindDialog;
@@ -110,7 +111,10 @@ public Q_SLOTS:
     void setGroupLength(unsigned int l);
     void setScrollSteps(int scrollsteps);
     void setReadOnly(bool r);
+    bool isReadOnly() const { return m_readonly; }  // unreal-ng: the remote-control lock restores it
     void setAutoWidth(bool r);
+    // unreal-ng: the tooltip of the byte under the mouse comes from the host (empty: the metadata comments)
+    void setToolTipProvider(std::function<QString(qint64 offset)> provider) { m_tooltipprovider = std::move(provider); }
 
 private:
     void paint(QPainter* painter) const;
@@ -171,6 +175,7 @@ Q_SIGNALS:
 
 private:
     bool m_readonly{false}, m_writing{false}, m_autowidth{false};
+    std::function<QString(qint64)> m_tooltipprovider;
     QHexArea m_currentarea{QHexArea::Ascii};
     QList<QRectF> m_hexcolumns;
     QFontMetricsF m_fontmetrics;

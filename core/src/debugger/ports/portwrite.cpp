@@ -7,9 +7,15 @@
 #include "emulator/emulatorcontext.h"
 #include "emulator/ports/portdecoder.h"
 
+#include <functional>
+
 namespace PortWrite
 {
-Result Write(Emulator* emulator, uint16_t port, uint8_t value, const char* source)
+namespace
+{
+/// Runs `access` on the decoder as a tool edit at a coherent moment (the shared half of Write and Read)
+Result ToolPortAccess(Emulator* emulator, const char* source, uint16_t port,
+                      const std::function<void(EmulatorContext&)>& access)
 {
     Result result;
     EmulatorContext* context = emulator ? emulator->GetContext() : nullptr;
@@ -19,12 +25,13 @@ Result Write(Emulator* emulator, uint16_t port, uint8_t value, const char* sourc
         return result;
     }
 
+    std::string refused;
     const Emulator::CoherentMoment where = emulator->RunAtCoherentMoment(
         [&]() {
-            emulator->EditMemoryFromTool(source, [&]() {
+            refused = emulator->EditMemoryFromTool(Emulator::ToolEdit::Of(source, "port", port), [&]() {
                 Z80::OutOfTimeScope outOfTime(*context->pCore->GetZ80());
                 context->toolAccessActive = true;
-                context->pPortDecoder->DecodePortOut(port, value, context->pCore->GetZ80()->m1_pc);
+                access(*context);
                 context->toolAccessActive = false;
             });
         },
@@ -35,8 +42,32 @@ Result Write(Emulator* emulator, uint16_t port, uint8_t value, const char* sourc
         result.error = "no coherent moment within 500 ms (the emulator is stepping or changing state); try again";
         return result;
     }
+    if (!refused.empty())
+    {
+        result.error = refused;   // the recorded past
+        return result;
+    }
     result.ok = true;
     result.moment = Emulator::CoherentMomentName(where);
+    return result;
+}
+}  // namespace
+
+Result Write(Emulator* emulator, uint16_t port, uint8_t value, const char* source)
+{
+    return ToolPortAccess(emulator, source, port, [&](EmulatorContext& context) {
+        context.pPortDecoder->DecodePortOut(port, value, context.pCore->GetZ80()->m1_pc);
+    });
+}
+
+Result Read(Emulator* emulator, uint16_t port, uint8_t& value, const char* source)
+{
+    uint8_t read = 0xFF;
+    Result result = ToolPortAccess(emulator, source, port, [&](EmulatorContext& context) {
+        read = context.pPortDecoder->DecodePortIn(port, context.pCore->GetZ80()->m1_pc);
+    });
+    if (result.ok)
+        value = read;
     return result;
 }
 
